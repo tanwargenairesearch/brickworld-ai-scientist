@@ -157,17 +157,26 @@ class Chains:
 
 
 def search(K, B, st: dict, tok: np.ndarray, dims, rule: str, temperature: float, chains: int, cap: int, seed: int,
-           tabs: dict = None, theta: float = 0.45) -> dict:
+           tabs: dict = None, theta: float = 0.45, hashed: bool = False, y0: np.ndarray = None) -> dict:
     """The focused search of the module docstring on designs tok [n, m] int32.
     Returns labels [n, m] int32 (the design's first chain to stop, else its lowest-energy board), stopped [n] bool,
-    moves [n] (of the returned chain) and energy [n]. Every stop is checked again from recomputed fields."""
+    moves [n] (of the returned chain), energy [n] and last [n, m] (the returned chain's final labels). Every stop is
+    checked again from recomputed fields.
+    hashed: draw every random number from the counter hash of brick_cram (seed, chain, move, stream), as the Metal
+    kernel of metal_paper_search.py does, so the two can be compared move for move. y0 [n * chains, m]: first labels."""
     assert rule in RULES and (rule not in ("terms", "terms1") or tabs is not None)
     n, m = tok.shape
     inst = np.repeat(np.arange(n), chains)
     t = tok[inst]
     rng = np.random.default_rng(seed)
-    y = np.where(t >= 0, rng.integers(1, C, size=t.shape), 0).astype(np.int64)
+    if y0 is not None:
+        y = y0.astype(np.int64).copy()
+    elif hashed:
+        y = BC.init_labels(t, seed).astype(np.int64)
+    else:
+        y = np.where(t >= 0, rng.integers(1, C, size=t.shape), 0).astype(np.int64)
     ch = Chains(K, B, t, dims, y)
+    streams = (1 + np.arange(1, C))[None, :]
     r = len(inst)
     T = temperature * st["hbar"] if rule != "fixed" else 0.0
     focus_at = st["ebar"] + theta * st["hbar"]
@@ -198,16 +207,23 @@ def search(K, B, st: dict, tok: np.ndarray, dims, rule: str, temperature: float,
     alive = ~np.repeat(stopped.reshape(n, chains).any(1), chains)
     moves = np.zeros(r, np.int64)
     best, bestE = ch.y.copy(), ch.E.copy()
-    for _ in range(cap):
+    for move in range(cap):
         act = np.flatnonzero(alive)
         if len(act) == 0:
             break
         hot = (ch.e[act] > focus_at) if rule in ("tau", "terms", "terms1") else (ch.margin[act] < 0)
         cand = np.where(hot.any(1)[:, None], hot, ch.filled[act])
-        pick = np.floor(rng.random(len(act)) * cand.sum(1)).astype(np.int64)
+        if hashed:
+            pick = (BC.rnd(seed, act, move, 0) % cand.sum(1).astype(np.uint32)).astype(np.int64)
+        else:
+            pick = np.floor(rng.random(len(act)) * cand.sum(1)).astype(np.int64)
         v = (np.cumsum(cand, 1) > pick[:, None]).argmax(1)
         local = ch.g[act, v][:, 1:]
-        if T > 0:
+        if T > 0 and hashed:
+            u = (BC.rnd(seed, act[:, None], move, streams) >> np.uint32(8)).astype(np.float32) * np.float32(1.0 / 16777216.0)
+            gum = -np.log(-np.log(np.maximum(u, np.float32(1e-12))))
+            new = 1 + (-local.astype(np.float32) / np.float32(T) + gum).argmax(1)
+        elif T > 0:
             u = rng.uniform(np.finfo(float).tiny, 1.0, size=local.shape)
             new = 1 + (-local / T - np.log(-np.log(u))).argmax(1)
         else:
@@ -235,7 +251,8 @@ def search(K, B, st: dict, tok: np.ndarray, dims, rule: str, temperature: float,
     chain = np.where(done, first, lowest)
     idx = np.arange(n) * chains + chain
     labels = np.where(done[:, None], ch.y[idx], best[idx]).astype(np.int32)
-    return {"labels": labels, "stopped": done, "moves": moves[idx], "energy": np.where(done, ch.E[idx], bestE[idx])}
+    return {"labels": labels, "stopped": done, "moves": moves[idx], "energy": np.where(done, ch.E[idx], bestE[idx]),
+            "last": ch.y[idx].astype(np.int32), "last_energy": ch.E[idx]}
 
 
 def passes_rule(K, B, st: dict, tok: np.ndarray, dims, y: np.ndarray, rule: str, tabs: dict = None) -> np.ndarray:
