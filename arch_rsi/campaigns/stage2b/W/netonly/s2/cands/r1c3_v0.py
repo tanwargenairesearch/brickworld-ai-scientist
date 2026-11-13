@@ -1,0 +1,33 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+WIDTH = 46
+
+
+class Net(nn.Module):
+    def __init__(self, spec):
+        super().__init__()
+        self.c1 = nn.Conv2d(spec.in_channels, WIDTH, 3, padding=1)
+        self.c2 = nn.Conv2d(WIDTH, WIDTH, 3, padding=1)
+        self.ctx = nn.Linear(2 * WIDTH, WIDTH)
+        self.c3 = nn.Conv2d(WIDTH, WIDTH, 3, padding=1)
+        self.place_head = nn.Conv2d(WIDTH, spec.n_types, 1)
+        self.glob = nn.Sequential(nn.Linear(2 * WIDTH, 64), nn.ReLU())
+        self.done_head = nn.Linear(64, 1)
+        self.value_head = nn.Linear(64, 1)
+
+    def forward(self, obs, mask):
+        f = F.relu(self.c1(obs))
+        f = F.relu(self.c2(f))
+        c = self.ctx(torch.cat([f.mean((2, 3)), f.amax((2, 3))], dim=1))
+        f = F.relu(f + c[:, :, None, None])
+        f = F.relu(self.c3(f))
+        place = self.place_head(f).flatten(1)
+        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], dim=1))
+        logits = torch.cat([place, self.done_head(g)], dim=1)
+        return logits, self.value_head(g).squeeze(1)
+
+
+def build_policy(spec):
+    return Net(spec)

@@ -1,0 +1,70 @@
+"""The main campaign's architecture menu (144 options) written as candidate files, for the control arm:
+encoder conv|mlp x width 32|64|128 x depth 1-4 x activation relu|gelu|tanh x norm none|layernorm."""
+import itertools
+
+TEMPLATE = '''"""Menu architecture: encoder={encoder}, width={width}, depth={depth}, activation={activation}, norm={norm}."""
+import torch
+import torch.nn as nn
+
+ENCODER = "{encoder}"
+WIDTH = {width}
+DEPTH = {depth}
+ACTIVATION = "{activation}"
+NORM = "{norm}"
+
+
+def ACT():
+    return {{"relu": nn.ReLU, "gelu": nn.GELU, "tanh": nn.Tanh}}[ACTIVATION]()
+
+
+class Net(nn.Module):
+    def __init__(self, spec):
+        super().__init__()
+        self.kind = ENCODER
+        if ENCODER == "conv":
+            layers, c_in = [], spec.in_channels
+            for _ in range(DEPTH):
+                layers.append(nn.Conv2d(c_in, WIDTH, 3, padding=1))
+                if NORM == "layernorm":
+                    layers.append(nn.GroupNorm(1, WIDTH))
+                layers.append(ACT())
+                c_in = WIDTH
+            self.body = nn.Sequential(*layers)
+            self.place_head = nn.Conv2d(WIDTH, spec.n_types, 1)
+            self.glob = nn.Sequential(nn.Linear(2 * WIDTH, WIDTH), ACT())
+            self.done_head = nn.Linear(WIDTH, 1)
+            self.value_head = nn.Linear(WIDTH, 1)
+        else:
+            layers, d_in = [], spec.in_channels * spec.Y * spec.X
+            for _ in range(DEPTH):
+                layers.append(nn.Linear(d_in, WIDTH))
+                if NORM == "layernorm":
+                    layers.append(nn.LayerNorm(WIDTH))
+                layers.append(ACT())
+                d_in = WIDTH
+            self.body = nn.Sequential(*layers)
+            self.logit_head = nn.Linear(WIDTH, spec.n_actions)
+            self.value_head = nn.Linear(WIDTH, 1)
+
+    def forward(self, obs, mask):
+        if self.kind == "conv":
+            f = self.body(obs)
+            place = self.place_head(f).flatten(1)
+            g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], dim=1))
+            return torch.cat([place, self.done_head(g)], dim=1), self.value_head(g).squeeze(1)
+        f = self.body(obs.flatten(1))
+        return self.logit_head(f), self.value_head(f).squeeze(1)
+
+
+def build_policy(spec):
+    return Net(spec)
+'''
+
+AXES = {"encoder": ["conv", "mlp"], "width": [32, 64, 128], "depth": [1, 2, 3, 4],
+        "activation": ["relu", "gelu", "tanh"], "norm": ["none", "layernorm"]}
+MENU = [dict(zip(AXES, v)) for v in itertools.product(*AXES.values())]
+assert len(MENU) == 144
+
+
+def source(cfg: dict) -> str:
+    return TEMPLATE.format(**cfg)
