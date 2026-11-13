@@ -5,6 +5,7 @@ usage (project root; needs an Apple GPU):
   .venv/bin/python -I -B energy_check/run_learned.py freeze   # pick one setting by RULE, write learned_settings.json
   .venv/bin/python -I -B energy_check/run_learned.py dev      # score each dev set once with learned_settings.json
   .venv/bin/python -I -B energy_check/run_learned.py pl       # the pseudolikelihood diagnostic, on training designs
+  .venv/bin/python -I -B energy_check/run_learned.py pl_l1    # the same with the paper's L1 penalty and more updates
   .venv/bin/python -I -B energy_check/run_learned.py speed    # kernel throughput against the NumPy reference
 
 Protocol.
@@ -189,6 +190,27 @@ def cmd_pl(args):
     RC.dump({"n_train": 1000, "rows": rows}, RESULTS / "learned_pl_diagnostic.json")
 
 
+def cmd_pl_l1(args):
+    """The diagnostic of `pl` with the paper's L1 soft-threshold and with more updates. Training designs only."""
+    lab, tok = training_set(1000)
+    okK, okB = BC.true_rules()
+    cK, _ = BC.class_counts(lab, tok)
+    rows = []
+    for updates in (300, 1000):
+        for lr in (30.0, 100.0):
+            for l1 in (0.0, 1e-4, 1e-3, 1e-2):
+                K, B, seconds, loss = BC.fit(lab, tok, lr=lr, updates=updates, device="mps", l1=l1)
+                tabs = BC.search_tables(K, B, lab, tok)
+                cmp = BC.compare_with_rules(torch.from_numpy(tabs["bad8"][:4] != 0), torch.from_numpy(tabs["badB"] != 0))
+                rows.append({"lr": lr, "updates": updates, "l1": l1, "loss": loss, "gpu_fit_seconds": seconds,
+                             "tau_pair": tabs["tau_pair"], "tau_input": tabs["tau_input"],
+                             "nonzero_costs": int((K != 0).sum() + (B != 0).sum()),
+                             "seen_pair_cost_median": float(K[cK > 0].median()),
+                             "forbidden_pair_cost_median": float(K[~okK].median()), **cmp})
+                print(json.dumps(rows[-1]), flush=True)
+    RC.dump({"n_train": 1000, "rows": rows}, RESULTS / "learned_pl_l1_diagnostic.json")
+
+
 def cmd_speed(args):
     """Kernel throughput with every term flagged (no chain stops, every move does the full work), against the NumPy
     reference. The reference's time includes its set-up (first labels and flags) and its thread count is NumPy's own:
@@ -215,9 +237,10 @@ def cmd_speed(args):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["tune", "freeze", "dev", "pl", "speed"])
+    ap.add_argument("cmd", choices=["tune", "freeze", "dev", "pl", "pl_l1", "speed"])
     args = ap.parse_args()
     torch.set_num_threads(4)
     if args.cmd != "freeze":
         warm_up()
-    {"tune": cmd_tune, "freeze": cmd_freeze, "dev": cmd_dev, "pl": cmd_pl, "speed": cmd_speed}[args.cmd](args)
+    {"tune": cmd_tune, "freeze": cmd_freeze, "dev": cmd_dev, "pl": cmd_pl, "pl_l1": cmd_pl_l1,
+     "speed": cmd_speed}[args.cmd](args)

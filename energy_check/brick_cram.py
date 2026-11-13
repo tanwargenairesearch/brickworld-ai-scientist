@@ -39,9 +39,11 @@ Two fits, both from solved designs alone.
 - `fit`, the paper's objective: pseudolikelihood at the labelled solutions (the mean over filled cells of
   -log softmax(-local energy) at the cell's label, the other cells held at their labels), by full-batch SGD with
   momentum and a cosine learning rate. The runs of it made here (`run_learned.py pl`) reach a loss near 0 with no cost
-  threshold that separates the forbidden terms from the allowed ones. That is a finding about those runs and about
-  the threshold rule, not about the objective: the counting energy times 20 has loss 0 under the same objective and
-  keeps the counting energy's stopping test.
+  threshold that separates the forbidden terms from the allowed ones, with or without the paper's L1 penalty. That
+  is a finding about those runs and about the per-term threshold rule (the paper's rule for graph coloring), not
+  about the objective: the counting energy times 20 has loss 0 under the same objective and keeps the counting
+  energy's stopping test. The paper's other stopping rules (a threshold on the whole board's energy, a fixed point,
+  a local margin) were not tried.
 Neither fit runs a search or differentiates through one.
 
 Stopping test (`search_tables`). A pair term is violated when its cost is above the highest pair cost that occurs in a
@@ -197,10 +199,12 @@ def _pairs(padded, dr, dc):
     return padded[:, :Hp - dr, c0:c1], padded[:, dr:, c0 + dc:c1 + dc]
 
 
-def fit(lab, tok, lr: float, updates: int, momentum: float = 0.5, device: str = "cpu", nonneg: bool = False):
+def fit(lab, tok, lr: float, updates: int, momentum: float = 0.5, device: str = "cpu", nonneg: bool = False,
+        l1: float = 0.0):
     """Fit K and B on labelled solutions by pseudolikelihood. nonneg: project every cost to >= 0 after each step, so
-    the fit can only raise the cost of what it must rule out. Returns (K, B on the CPU, seconds of the update loop,
-    last loss)."""
+    the fit can only raise the cost of what it must rule out. l1: the paper's L1 penalty, a soft-threshold of
+    (learning rate of the step) * l1 after each step. Returns (K, B on the CPU, seconds of the update loop, the loss
+    before the last step)."""
     lab, tok = lab.to(device), tok.to(device)
     K = torch.zeros(4, C, C, device=device, requires_grad=True)
     B = torch.zeros(2, C, device=device, requires_grad=True)
@@ -217,6 +221,8 @@ def fit(lab, tok, lr: float, updates: int, momentum: float = 0.5, device: str = 
             for p, g, buf in zip((K, B), grads, bufs):
                 buf.mul_(momentum).add_(g)
                 p.sub_(lr_k * buf)
+                if l1 > 0:
+                    p.copy_(torch.sign(p) * (p.abs() - lr_k * l1).clamp(min=0.0))
                 if nonneg:
                     p.clamp_(min=0.0)
     last = float(loss.detach())

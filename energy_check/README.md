@@ -37,6 +37,23 @@ The energy approach was suggested and written by an LLM, like the networks of th
 
 "Classical Energies Learn to Reason 1,000x Faster than Looped Models" (arXiv 2611.17309) shows that Sudoku and maze benchmarks are solved by small pairwise energies, some with weights set by hand, and warns that a high score on such a benchmark shows little about reasoning. This folder applies both checks to our world. It borrows the method. No code is copied from that paper's repository.
 
+### How Part 2 differs from the paper's method
+
+| | The paper | Part 2 here | Same? |
+|---|---|---|---|
+| Energy | pair costs and input costs over one label per cell | the same form | yes |
+| Prior on the costs | set per task; for mazes, costs shared by every cell, one block per offset in a 3×3 window | that prior, in each layer | yes, the maze's |
+| Labels | the task's own answer symbols: digit, on or off, colour | 25 labels designed from the brick shapes, with an anchor | **no** |
+| Training signal | a puzzle and its solution | a design and the generator's own bricks, turned into those labels | stronger here |
+| Fit | pseudolikelihood by gradient descent from zero, with an L1 penalty on some tasks | one pass of counting | **no** |
+| Stopping test | one of four rules per task; for graph coloring, every term at most its highest value on a training solution | that rule | yes, one of the four |
+| Search | focused Gibbs: a cell whose local energy is well above its training mean; for Sudoku a falling temperature with restarts | a random cell that has a violated term; one fixed temperature | similar, simpler |
+| Wrong stops | none reported | none in any recorded run | yes |
+| Hand-set energies | also reported, for each task | Part 1 | yes |
+
+- **The two "no" rows decide how far this is an application of the paper.** The energy, the prior, the search and the stopping rule follow it. The fit doesn't, and the labels carry rules that the paper's tasks leave to the fit.
+- **The paper's fit was tried and did not work here**, with and without its L1 penalty. "The pseudolikelihood runs" below gives the numbers and what was not tried.
+
 ---
 
 ## Part 1. The hand-set energy
@@ -242,7 +259,13 @@ The paper fits its energies by pseudolikelihood. `run_learned.py pl` runs that o
 - **The threshold rule depends on how the costs are written.** Cost can be moved between pair terms and input terms without changing the loss, and that changes which terms pass a threshold. A review probe moved the count of flagged forbidden pair terms from 12 to 8 to 5 at equal loss (not in a results file).
 - **Why the runs leave the support rule unpriced (likely, untested).** Any single-cell change to a valid solution also breaks a brick. Pseudolikelihood compares only single-cell changes, so it never needs a cost on "anchor over an empty cell".
 
-Not tested: the paper's own optimiser and stopping rule, more updates, another starting point, or a fit that samples its own negatives.
+**With the paper's L1 penalty and more updates (`results/learned_pl_l1_diagnostic.json`).** Added after Part 2 was compared with the paper's recipe line by line. 16 runs: 300 or 1,000 updates, learning rate 30 or 100, L1 strength 0, 0.0001, 0.001 or 0.01.
+
+- **No run flags more than 16 of the 1,196 forbidden pair terms**, or more than 1 of the 9 forbidden input terms.
+- **L1 makes the costs sparse, as the paper reports.** 33 to 408 of the 2,750 costs stay non-zero, at a loss of 0.0001 to 0.098.
+- **Reading.** A few costs that say which label fits its neighbours are enough to satisfy pseudolikelihood. It has no need to price every forbidden pair, and descent from zero doesn't. The per-term stopping rule needs every forbidden term priced, which is what counting does.
+
+Not tested: the paper's three other stopping rules (a threshold on the whole board's energy, a fixed point of the search, a local margin), the paper's own code, another starting point, or a fit that samples its own negatives.
 
 ---
 
@@ -323,7 +346,9 @@ The starting network was trained for 131,072 practice placements. Each pick got 
 
 - **Not a like-for-like comparison.** The two suggestions were made under different rules (see "Provenance"), given different information, and the networks' budget was kept small on purpose. The gap at that budget is not a ranking of methods.
 - **Both energies are designed from the rules.** Part 1 writes them in. Part 2 learns its costs, but its labels, its input token and its build order come from the rules.
-- **Part 2's fit is counting, not gradient training.** The pseudolikelihood runs made here gave no usable stopping test. That says little about the objective: the counting energy, scaled, is one of its best solutions.
+- **Part 2's fit is counting, not the paper's training.** The pseudolikelihood runs made here, with and without the paper's L1 penalty, gave no usable stopping test under the per-term rule. That says little about the objective: the counting energy, scaled, is one of its best solutions.
+- **Part 2's labels are designed, not the task's own.** The paper's tasks are labelled with their answer symbols. Here the 25 labels and the anchor were invented to make the support rule a rule about one cell and about pairs.
+- **Part 2's scores need an Apple GPU to reproduce.** The scoring path runs the Metal kernel only. The NumPy reference makes the same moves but is not wired into the scoring commands.
 - **The count can rule out a valid design.** With 4,000 training designs, about 0.03% of fresh designs have no labelling of energy 0. With 16,000, none was found. The scored setting is the 4,000 one, as the rule chose it.
 - **Part 2 does not count bricks.** A valid tiling can exceed the world's step limit. With enough training designs this is its only failure seen on fresh designs.
 - **"Scored once" is a file check.** `dev` writes a marker before it scores and refuses to run when the marker or the result exists. The marker was added after the review; the two scored runs predate it. Nothing but the protocol stops someone deleting the files.
@@ -390,6 +415,7 @@ Two independent reviews were run on 13 November: one of the code, one of the cla
 .venv/bin/python -I -B energy_check/run_learned.py freeze
 .venv/bin/python -I -B energy_check/run_learned.py dev         # refuses while results/learned_dev.json or .started exists
 .venv/bin/python -I -B energy_check/run_learned.py pl
+.venv/bin/python -I -B energy_check/run_learned.py pl_l1
 .venv/bin/python -I -B energy_check/run_learned.py speed
 .venv/bin/python -I -B energy_check/run_fresh.py               # refuses while results/learned_fresh.json exists
 .venv/bin/python -I -B energy_check/run_fitsize.py             # refuses while results/learned_fitsize.json exists

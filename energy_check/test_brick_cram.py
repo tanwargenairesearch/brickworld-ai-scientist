@@ -247,8 +247,12 @@ def test_counted_energy_from_the_small_world_solves_a_larger_one():
 def test_pseudolikelihood_fit_lowers_its_loss():
     _, lab, tok = data(SMALL, 200, 9)
     start = float(BC.pl_loss(torch.zeros(4, BC.C, BC.C), torch.zeros(2, BC.C), lab, tok))
-    _, _, _, loss = BC.fit(lab, tok, lr=30.0, updates=40)
+    K, _, _, loss = BC.fit(lab, tok, lr=30.0, updates=40)
     assert abs(start - np.log(25)) < 1e-4 and loss < 0.2 * start
+    Ks, Bs, _, _ = BC.fit(lab, tok, lr=30.0, updates=40, l1=1e-3)     # the L1 soft-threshold makes costs exactly 0
+    assert int((Ks != 0).sum()) < int((K != 0).sum()) // 4
+    Kz, Bz, _, _ = BC.fit(lab, tok, lr=30.0, updates=5, l1=1e3)       # a threshold above every step wipes them all
+    assert not bool(Kz.any()) and not bool(Bz.any())
 
 
 if __name__ == "__main__":
