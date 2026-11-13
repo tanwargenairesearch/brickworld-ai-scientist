@@ -41,7 +41,7 @@ import brick_cram as BC  # noqa: E402
 import run_check as RC  # noqa: E402
 import run_paper_rules as RP  # noqa: E402
 import run_paper_rules_wide as RW  # noqa: E402
-from arch_rsi.stage2.designs import StreamSource, design_hash, zobrist_codes  # noqa: E402
+from brickworld.env import StreamSource, design_hash, zobrist_codes  # noqa: E402
 
 FRESH_SEED = 20261121
 N_FRESH = 4096
