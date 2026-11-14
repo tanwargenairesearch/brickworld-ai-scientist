@@ -38,12 +38,13 @@ Two fits, both from solved designs alone.
   side by side.
 - `fit`, the paper's objective: pseudolikelihood at the labelled solutions (the mean over filled cells of
   -log softmax(-local energy) at the cell's label, the other cells held at their labels), by full-batch SGD with
-  momentum and a cosine learning rate. The runs of it made here (`run_learned.py pl`) reach a loss near 0 with no cost
-  threshold that separates the forbidden terms from the allowed ones, with or without the paper's L1 penalty. That
-  is a finding about those runs and about the per-term threshold rule (the paper's rule for graph coloring), not
-  about the objective: the counting energy times 20 has loss 0 under the same objective and keeps the counting
-  energy's stopping test. The paper's other stopping rules (a threshold on the whole board's energy, a fixed point,
-  a local margin) were not tried.
+  momentum and a cosine learning rate. The runs of it in `run_learned.py pl` and `pl_l1` reach a loss near 0 with no
+  cost threshold that separates the forbidden terms from the allowed ones, with or without the paper's L1 penalty,
+  under this module's stopping test (one threshold for all pair tables; not the paper's per-table rule). That is a
+  finding about those runs and that test, not about the objective: the counting energy times 20 has loss 0 under the
+  same objective and keeps the counting energy's stopping test. This fit was later searched with each of the paper's
+  four stopping rules (`paper_rules.py`, `metal_paper_search.py`, `run_paper_rules_wide.py`); the README gives the
+  results.
 Neither fit runs a search or differentiates through one.
 
 Stopping test (`search_tables`). A pair term is violated when its cost is above the highest pair cost that occurs in a
