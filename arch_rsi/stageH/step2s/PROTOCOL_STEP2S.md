@@ -1,6 +1,9 @@
 # Step 2S: does experimenting on the world help the AI scientist find a hidden rule? (protocol)
 
-**Status:** written 14 November 2026, before Step 2's full run and before any Step 2S code or run. It's a draft for the user's approval. Nothing gets built or run until the user says so.
+**Status:**
+- **Written:** 14 November 2026, before Step 2's full run and before any Step 2S code or run.
+- **Approved:** by the user on 14 November 2026, as written, with the told arm kept.
+- **Not built or run yet.** Building waits for the user's go-ahead, and the run waits for Step 2's full-run result.
 
 **Place in the plan:**
 - This step runs after Step 2 (`../step2/PROTOCOL_STEP2.md`). The user chose a separate step over a fifth arm in Step 2.
