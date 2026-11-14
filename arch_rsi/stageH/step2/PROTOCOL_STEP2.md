@@ -201,3 +201,22 @@ Harness code computes these from each trained trial's seed-0 run, and from the s
 - **Step 3** rewrites the AI scientist's own procedure across worlds whose hidden facts differ, so only procedure can carry over.
 - **What it needs first:** at least three usable rule families. Step 1 found two, so Step 3 needs more rules calibrated first, under a new protocol.
 - **What a P1 pass would add:** the evidence-reading part of the loop works, so Step 3 would test whether the loop can improve the procedure.
+
+## Changes made while building (14 November 2026, before the dry run)
+
+The arms, readouts, pass rules, size and analysis are unchanged. These are details the protocol didn't fix:
+
+1. **Selection sentence:** 2b's task text says the pick is "tested once on a separate hidden set of designs". That isn't true in Step 2, so every arm's prompt says instead: "At the end of the search, the trial with the highest 2-seed dev success is selected (the starting architecture if none beats the starting architecture's own 2-seed score). It is then retrained with 4 new seeds and scored on the dev designs again, so a lucky seed does not help."
+2. **Noise sentence:**
+   - The scores, readouts and told arms see the start's two seed scores in the rule world, in 2b's wording.
+   - The hidden arm sees 2b's hidden-arm sentence.
+3. **Readout legend:** the readout arms get one legend paragraph (`readouts.LEGEND`) that describes the readouts and names no rule.
+4. **"The latest round":** when round r's prompt is built, the latest round means round r − 1.
+5. **Where readouts are computed:** only for the told and readouts arms, which are the only arms that see them.
+6. **Judge prompt:** it's in `run_step2.py` (`judge_prompt`). It gives the rule sentence and asks "yes", "partly" or "no".
+7. **Tests before the dry run, all passing:**
+   - prompts, 8 tests: no rule word in any harness-written text of the three arms that aren't told, and the told arm differs from the readouts arm only in its rule section;
+   - runner with fake training and fake calls, 8 tests: selection, confirmation, repairs, duplicates, the review, and a resume after a crash that repeats no call;
+   - analysis, 6 tests: the Monte Carlo p-value matches exact enumeration on a small case.
+   - A smoke test of the real GPU training, check and readout paths used 32,768-step runs and fake calls.
+8. **Manifest:** `manifest.json` hashes every Step 2 file before the dry run. The runner also checks Stage 2b's and Stage H's manifests.
