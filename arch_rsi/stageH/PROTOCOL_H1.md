@@ -198,3 +198,28 @@ A rule passes only if all four of these hold:
 - **Step 3:**
   - It rewrites its own procedure across worlds that use different members of the passing families.
   - Facts learned in one world can't carry over, so only procedure can.
+
+## Amendments before any run (14 November 2026)
+
+These were made while building Step 1, before any of the 78 runs or the four fixes' legality checks ran. The pass rules, cells, seeds, designs and budget are unchanged.
+
+1. **GPU instead of CPU (the user's instruction, 14 November):**
+   - Training, evaluation, the legality checks' greedy runs and the legality short run all run on the Mac's GPU.
+   - Two things stay on the CPU because frozen code requires it:
+     - The frozen evaluator runs only as the reference in the identity test. It is hard-coded to the CPU, and changing that would mean editing a frozen file.
+     - check_2b's small static checks run as before: the FLOP count, the parameter and shape check, and the forward/backward timing.
+   - Training on the GPU turned out to be bit-reproducible: two runs of the same spec gave identical weights. So the identity tests compare weight hashes on the GPU.
+2. **Identity test for the trainer:**
+   - It uses 32,768 steps (7 updates), not 8,192. Under Stage G's recipe, a 4,096-step batch gives fewer than 4 updates at 8,192 steps, and the frozen trainer refuses that.
+   - It also checks that the shift fix in the shift world trains to the same weights as reference A in the plain world.
+3. **Identity test for the evaluator:**
+   - It uses Stage 2c's calibration checkpoint of reference A (131,072 steps, seed 2000), read only, on H-plain's check designs.
+   - The reason: a 32,768-step checkpoint builds nothing, so it can't show that two evaluators agree.
+4. **The legality short run:**
+   - It's train_h.py with the frozen recipe. Any RECIPE block in the file is replaced by w2b.FROZEN_AS_BLOCK.
+   - At reference A's FLOP ratio (1.0433), the fixed-FLOP budget gives 7 updates of 1,024 steps. That's the same count the frozen CPU trainer gives.
+5. **Design sets:** besides W_s's dev designs, the four sets also exclude W_s's 256 check designs.
+6. **Limits and reruns:**
+   - The 900 s limit is a timeout on each training process, and evaluation has its own 600 s limit.
+   - A run cut short because the runner itself stopped is redone from scratch. It doesn't count as a failed attempt.
+7. **Order:** the code, the design sets and this protocol are hashed into `manifest.json` and committed before the first run.
