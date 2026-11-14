@@ -11,6 +11,8 @@ Every build was made in the frozen `BrickWorld` and scored by the frozen checker
 
 **The two misses of Part 2.** One tiling needs one brick more than the world's step limit. One design cannot be solved under the 4,000-design fit at all: the count wrongly rules out a pair of labels that the design needs. With 16,000 training designs, no such design was found among 16,384 fresh ones, for three training samples.
 
+**The paper's own fit, tested afterwards.** Part 2 follows the paper's energy and search but fits by counting. The paper's fit (pseudolikelihood) was then tried with each of the paper's four stopping rules. Three of the rules stop on wrong boards most of the time. The graph-coloring rule with a lightly trained fit made no wrong stop on 16,384 fresh designs and finished 69% of them; counting finished 99.9% of the same designs. That setting was picked with hindsight. See "The paper's fit with each of the paper's stopping rules".
+
 This folder was reviewed critically on the same day, and corrected. "What the review changed", near the end, lists the findings.
 
 **What it means.** Once the rules are known, deciding which bricks go where is an easy constraint puzzle, whether the rules are written down or read off solved examples. A high exact-build rate in this world is therefore not evidence of reasoning.
@@ -52,7 +54,7 @@ The energy approach was suggested and written by an LLM, like the networks of th
 | Hand-set energies | also reported, for each task | Part 1 | yes |
 
 - **The two "no" rows decide how far this is an application of the paper.** The energy, the prior, the search and the stopping rule follow it. The fit doesn't, and the labels carry rules that the paper's tasks leave to the fit.
-- **The paper's fit was tried and did not work here**, with and without its L1 penalty. "The pseudolikelihood runs" below gives the numbers and what was not tried.
+- **The paper's fit was tried with each of its four stopping rules.** Three stop on wrong boards. Its graph-coloring rule, with a lightly trained fit, made no wrong stop on 16,384 fresh designs and finished 69% of them. "The paper's fit with each of the paper's stopping rules" below gives the numbers and what was not tried.
 
 ---
 
@@ -265,7 +267,68 @@ The paper fits its energies by pseudolikelihood. `run_learned.py pl` runs that o
 - **L1 makes the costs sparse, as the paper reports.** 33 to 408 of the 2,750 costs stay non-zero, at a loss of 0.0001 to 0.098.
 - **Reading.** A few costs that say which label fits its neighbours are enough to satisfy pseudolikelihood. It has no need to price every forbidden pair, and descent from zero doesn't. The per-term stopping rule needs every forbidden term priced, which is what counting does.
 
-Not tested: the paper's three other stopping rules (a threshold on the whole board's energy, a fixed point of the search, a local margin), the paper's own code, another starting point, or a fit that samples its own negatives.
+These two diagnostics look at one stopping rule only, and at cost tables, not at searches. The next section runs the searches, with all of the paper's rules.
+
+### The paper's fit with each of the paper's stopping rules (post hoc)
+
+Added on 13 and 14 November, after Part 2 was scored. Each plan was committed before its run (`bbd878c8`, `59a7725a`, `197bdd18`). No dev or final design is read: settings are chosen on tuning designs and results come from fresh designs.
+
+**What was run.** The paper's fit (`brick_cram.fit`: pseudolikelihood by gradient descent from zero, momentum 0.5, cosine schedule, optional L1), on the same 4,000 training designs and the same 25 labels. The paper's inference statistics, stopping rules and focused search were written from its App. C and its public code: `paper_rules.py` in NumPy, and `metal_paper_search.py`, a Metal kernel tested to make the same moves. No code was copied.
+
+| Rule | The paper uses it for | A chain stops when |
+|---|---|---|
+| `tau` | Sudoku | the board's energy is at most the highest energy of a training solution |
+| `terms` | graph coloring | every cost term is at most the highest value its table takes on a training solution |
+| `local` | N-Queens | every cell prefers its label by at least the smallest margin of a training solution |
+| `fixed` | mazes | no single-cell change lowers the energy |
+| `terms1` | not the paper's | as `terms`, with one threshold for all pair tables: the rule of Part 2 |
+
+**Wider test (`run_paper_rules_wide.py`, GPU).** 36 fits: learning rate 30, 100 or 300; 30, 100, 300 or 1,000 updates; L1 strength 0, 0.0001 or 0.001. Three of them were unusable (no positive cost was left). Four temperatures. Per rule, the setting that finished the most of 512 tuning designs was scored once on 16,384 fresh designs, 4,096 per world (`results/paper_rules_wide_fresh.json`):
+
+| Rule | Chosen fit: learning rate, updates, L1 | Temperature | Stopped and built exactly | Stopped on a wrong board | Valid, over the step limit | Not stopped |
+|---|---|---|---|---|---|---|
+| `tau` | 100, 30, 0.001 | 3 | 43 | 16,340 | 0 | 1 |
+| `terms` | 30, 100, 0.0001 | 3 | 12,375 | 982 | 2 | 3,025 |
+| `local` | 30, 1,000, 0 | 3 | 6,931 | 9,408 | 1 | 44 |
+| `fixed` | 100, 1,000, 0 | 0 | 5,287 | 11,095 | 2 | 0 |
+| `terms1` | 30, 300, 0 | 3 | 645 | 14,981 | 0 | 758 |
+| Counted fit, `terms1`, same kernel | | 0.6 | 16,379 | 0 | 1 | 4 |
+
+Temperatures are in units of the fit's mean positive pair cost, as in the paper. A stop counts only if it also holds when the labels are judged again in float64; none failed that.
+
+**First test (`run_paper_rules.py`, CPU).** Two fits and three temperatures, 256 tuning designs, then 1,024 fresh designs (`results/paper_rules_fresh.json`). The same picture: `tau` 2 built, 1,022 wrong stops; `terms` 440, 336, and 248 not stopped; `local` 292, 732; `fixed` 319, 705; `terms1` 3, 953, and 68 not stopped; counted fit 1,024, 0.
+
+**What the wrong stops look like (`diagnose_paper_rules.py`, the 512 tuning designs).**
+
+| Rule | Wrong stops | Break a pair rule only | Break an input rule only | Break both | Median share of cells that break a rule |
+|---|---|---|---|---|---|
+| `tau` | 509 | 197 | 0 | 312 | 88% |
+| `terms` | 32 | 32 | 0 | 0 | 20% |
+| `local` | 310 | 6 | 252 | 52 | 10% |
+| `fixed` | 340 | 42 | 131 | 167 | 15% |
+
+- **`tau` stops almost at once.** A threshold on the whole board's energy is passed by boards on which most cells are wrong.
+- **`local` and `fixed` mostly miss the support rule.** Most of their wrong stops only have a brick whose support piece hangs over an empty cell. This fits the likely cause given above: pseudolikelihood compares single-cell changes, and no single-cell change of a valid solution tests that rule alone.
+- **A screen showed part of this before any search (`results/paper_rules_screen.json`).** Of 1,024 true solutions with one label made wrong, `tau` accepted 1,005, `terms1` 845 and `terms` 170. `local` and `fixed` rejected all of them, and still stop on boards with more than one wrong label.
+
+**One setting made no wrong stop (`run_paper_rules_safe.py`).** The wider test's tuning table holds 16 settings with no wrong stop on the 512 tuning designs and at least one correct stop. All 16 use the `terms` rule, learning rate 30 and at most 300 updates. The choice rule fixed beforehand did not pick them, because they finish fewer designs. The best of them (learning rate 30, 100 updates, no L1, temperature 3) was scored once on 16,384 new fresh designs (`results/paper_rules_safe.json`):
+
+| | Stopped and built exactly | Stopped on a wrong board | Valid, over the step limit | Not stopped |
+|---|---|---|---|---|
+| Pseudolikelihood fit, `terms` rule | 11,354 (69.3%) | 0 | 5 | 5,025 |
+| Counted fit, same kernel, same designs | 16,375 (99.9%) | 0 | 6 | 3 |
+
+- **Picked with hindsight.** The setting was chosen after the wider test's results were read. The fresh designs were new, and the plan was committed before the run.
+- **Its stop is not a proof.** Its test flags 820 pair terms, all of them among the 1,342 the counted fit flags, and all 9 forbidden input terms. It leaves 376 of the 1,196 forbidden pair terms unflagged. No wrong stop was seen in 16,896 designs.
+- **Many unfinished designs were right anyway.** For 3,307 of the 5,025 designs that never stopped, the lowest-energy board the search saw builds the design exactly. The search could not certify them.
+
+**Reading.**
+
+- **The paper's fit gives a stop that can be trusted here, under one of its four rules and with light training.** It finishes about two thirds of the designs. Counting finishes all but a handful.
+- **No setting of `tau`, `local`, `fixed` or `terms1` was free of wrong stops** on the tuning designs, among 33 usable fits and 4 temperatures.
+- **With counted costs the paper's focused search is the search of Part 2.** Every training cell then has local energy 0, so "well above the training mean" means "has a violated term". On the design of the search video the two stop on the same board after the same 110 moves.
+
+Not tested: the paper's other training methods (it also reports contrastive divergence), other label designs, an annealed temperature with restarts, a fit started from the counted costs, and the paper's own code.
 
 ---
 
@@ -346,14 +409,15 @@ The starting network was trained for 131,072 practice placements. Each pick got 
 
 - **Not a like-for-like comparison.** The two suggestions were made under different rules (see "Provenance"), given different information, and the networks' budget was kept small on purpose. The gap at that budget is not a ranking of methods.
 - **Both energies are designed from the rules.** Part 1 writes them in. Part 2 learns its costs, but its labels, its input token and its build order come from the rules.
-- **Part 2's fit is counting, not the paper's training.** The pseudolikelihood runs made here, with and without the paper's L1 penalty, gave no usable stopping test under the per-term rule. That says little about the objective: the counting energy, scaled, is one of its best solutions.
+- **Part 2's fit is counting, not the paper's training.** The paper's fit was tested afterwards. Under three of the paper's four stopping rules it stops on wrong boards. Under the graph-coloring rule, lightly trained, it made no wrong stop and finished 69% of 16,384 fresh designs. That says little about the objective: the counting energy, scaled, is one of its best solutions.
+- **The tests of the paper's fit are post hoc.** They were added after Part 2 was scored, and the setting with no wrong stop was picked after earlier results were read. Each plan was committed before its run, and each result comes from designs not used to choose a setting.
 - **Part 2's labels are designed, not the task's own.** The paper's tasks are labelled with their answer symbols. Here the 25 labels and the anchor were invented to make the support rule a rule about one cell and about pairs.
 - **Part 2's scores need an Apple GPU to reproduce.** The scoring path runs the Metal kernel only. The NumPy reference makes the same moves but is not wired into the scoring commands.
 - **The count can rule out a valid design.** With 4,000 training designs, about 0.03% of fresh designs have no labelling of energy 0. With 16,000, none was found. The scored setting is the 4,000 one, as the rule chose it.
 - **Part 2 does not count bricks.** A valid tiling can exceed the world's step limit. With enough training designs this is its only failure seen on fresh designs.
 - **"Scored once" is a file check.** `dev` writes a marker before it scores and refuses to run when the marker or the result exists. The marker was added after the review; the two scored runs predate it. Nothing but the protocol stops someone deleting the files.
 - **Dev designs were replayed.** `verify_replay.py` and the video script run the frozen search again on dev designs, with the frozen settings, and require the same moves, bricks and outcomes as the record. They select nothing.
-- **Not under version control.** `learned_tune.json` is rewritten by every `tune` run, so the number of tuning runs made before the rule was fixed cannot be shown. Exploratory runs on training and tuning designs were made while the method was being written, among them the switch from pseudolikelihood to counting. To my knowledge none touched a dev design; the files cannot show that. Two source files were last edited seconds after the scored run. `verify_replay.py` shows that the code now on disk reproduces that run for all 2,048 designs.
+- **Not under version control when Parts 1 to 3 were run.** The repository was created afterwards (first commit `8407f737`). `learned_tune.json` is rewritten by every `tune` run, so the number of tuning runs made before the rule was fixed cannot be shown. Exploratory runs on training and tuning designs were made while the method was being written, among them the switch from pseudolikelihood to counting. To my knowledge none touched a dev design; the files cannot show that. Two source files were last edited seconds after the scored run. `verify_replay.py` shows that the code now on disk reproduces that run for all 2,048 designs.
 - **Part 1's support rule is a mask, not a pairwise cost.** It needs up to four cells of the layer below at once.
 - **The placement order is hand-written in both parts.** The energy decides which bricks; a fixed rule decides when.
 - **One scored fit.** The dev score is one fit and one search seed. The two checks on fresh designs, with other seeds, refits and fit sizes, were added afterwards.
@@ -402,6 +466,13 @@ Two independent reviews were run on 13 November: one of the code, one of the cla
 - **Wording.** The script stops if a banned word appears in any string it draws.
 - **Stills.** `video/stills/` holds one or two frames of each scene, and `video/cover.png` the eight designs.
 
+`video/energy_search.mp4` (1920×1080, 244 s, no sound) explains the search of Part 2 and shows it step by step on one design. It is an illustration too.
+
+- **Scenes.** The task as a labelling puzzle; the 25 labels; the costs and how they were counted; the random start; the first and the last move in detail, with the cost and the chance of each label; all 110 moves in both layers; the stop, the bricks read off and the build; why the stop can be trusted; the paper's fit with each of its stopping rules; the GPU kernel; what this shows and doesn't.
+- **Design.** The middle one of the 256 tuning designs of the 10×10×6 world when sorted by number of cells. A tuning design, so that the runs with the paper's fit touch no dev design. The rule was fixed before the search was looked at.
+- **Search shown.** The frozen fit and settings on this design alone. The script steps the reference search one move at a time and stops unless its states equal the reference's, the chain shown ends where the Metal kernel ends, and the counted fit's run through the paper's search ends on the same board.
+- **Numbers.** Every measured number on screen is read from a results file and saved to `video/search_data.json`. Stills are in `video/search_stills/`.
+
 ## Reproduce
 
 ```bash
@@ -421,14 +492,24 @@ Two independent reviews were run on 13 November: one of the code, one of the cla
 .venv/bin/python -I -B energy_check/run_fitsize.py             # refuses while results/learned_fitsize.json exists
 .venv/bin/python -I -B energy_check/verify_replay.py           # replays the scored dev run; writes nothing
 
+.venv/bin/python -I -B energy_check/test_paper_rules.py
+.venv/bin/python -I -B energy_check/test_metal_paper_search.py              # needs an Apple GPU
+.venv/bin/python -I -B energy_check/run_paper_rules.py fit                  # then screen, tune, freeze, fresh (CPU)
+.venv/bin/python -I -B energy_check/run_paper_rules_wide.py fit             # then tune, freeze, fresh (GPU, about 20 minutes)
+.venv/bin/python -I -B energy_check/diagnose_paper_rules.py
+.venv/bin/python -I -B energy_check/run_paper_rules_safe.py                 # refuses while results/paper_rules_safe.json exists
+
 .venv/bin/python -I -B energy_check/video/make_compare_video.py collect   # needs an Apple GPU, for a few seconds
 .venv/bin/python -I -B energy_check/video/make_compare_video.py stills
 .venv/bin/python -I -B energy_check/video/make_compare_video.py video
+.venv/bin/python -I -B energy_check/video/make_search_video.py collect    # needs an Apple GPU, for a few seconds
+.venv/bin/python -I -B energy_check/video/make_search_video.py stills
+.venv/bin/python -I -B energy_check/video/make_search_video.py video
 ```
 
 No frozen file was edited. After the last run, 37 of the 39 hashes in `arch_rsi/campaigns/stage2b/manifest.json` were recomputed and all match. The other 2 are the final splits, which were not opened; their modification dates are 8 and 9 November.
 
-Tests: 9 in `test_brick_energy.py` and 13 in `test_brick_cram.py`, all passing after the fixes.
+Tests: 9 in `test_brick_energy.py`, 13 in `test_brick_cram.py`, 5 in `test_paper_rules.py` and 4 in `test_metal_paper_search.py`, all passing.
 
 ## A numerical trap worth knowing
 
