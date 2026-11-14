@@ -220,3 +220,24 @@ The arms, readouts, pass rules, size and analysis are unchanged. These are detai
    - analysis, 6 tests: the Monte Carlo p-value matches exact enumeration on a small case.
    - A smoke test of the real GPU training, check and readout paths used 32,768-step runs and fake calls.
 8. **Manifest:** `manifest.json` hashes every Step 2 file before the dry run. The runner also checks Stage 2b's and Stage H's manifests.
+
+## Changes after the dry run (14 November 2026, before the full run)
+
+The dry run (8 searches, one per arm and world, real calls) is excluded from the analysis. The arms, readouts, pass rules, size and analysis are unchanged.
+
+1. **The diagnosis judge reads every round's analysis, not only the last.**
+   - **Why:** in the dry run both readouts searches stated the rule exactly in round 1 ("each row is shifted around by X/2 columns"; a brick at column x "fills observed columns X-dx-x to X-1-x"), but their last analyses were about the training recipe. The judge, given only the last analysis, answered "partly" for both.
+   - **Now:** it gets the analysis of rounds 1–4 in order, plus the pick's name and hypothesis, and is asked whether the text states the rule anywhere. Its evidence names the round.
+   - **Effect:** the judge stays descriptive. It never changes a score, P1, P2 or the check.
+   - The dry run's first verdicts are kept in `campaigns/step2_dry/judge_v1.json` and `judge_v1/`.
+2. **Cost and time, measured in the dry run:**
+   - **Search calls:** 32 calls, $11.26 notional, about $0.35 each against 2b's $0.22. Even the arms without readouts wrote longer replies.
+   - **Review and judge calls:** about $0.045 and $0.018 each.
+   - **So the full run:** about 384 search calls, roughly $135, plus about $6 for review and judge, about $141 notional. That's above the $90–130 estimate.
+   - **Training:** 220 runs averaged 74 s. At four at once, 2,700 runs take about 14 h, within the 13–16 h allowed.
+3. **Launch-refusal test:** it now points the runner at an empty folder, because `LAUNCH_APPROVED.md` exists for the full run.
+4. **Dry-run outcome, for the record only** (confirmed mean over seeds 5001–5004):
+   - told the rule: shift 91.2% (first found in round 3), mirror 88.0% (round 1);
+   - readouts: shift 91.7%, mirror 94.7% (both round 1);
+   - scores only and scores hidden: 0.0% in both worlds, all 12 trials of each search at 0;
+   - review: all 4 non-start picks compliant.

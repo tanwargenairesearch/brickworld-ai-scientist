@@ -88,11 +88,13 @@ class Fake(RS.Step2):
         if system == RS.REV.SYSTEM:
             val = {"verdict": "violation" if "FIX_MIRROR" in prompt else "compliant", "rule": "x", "evidence": "y"}
         else:
+            JUDGE_PROMPTS[str(log_path)] = prompt
             val = {"verdict": "yes" if "told" in str(log_path) else "no", "evidence": "z"}
         log_path.write_text(json.dumps({"usage": {"notional_cost_usd": 0.05}}))
         return val, {}
 
 
+JUDGE_PROMPTS = {}
 RS.PRESETS["fake"] = dict(RS.BASE, n_searches=2, campaign="unused", needs_launch=False, search_workers=6)
 TMP = Path(tempfile.mkdtemp())
 F = Fake(TMP / "c", "fake")
@@ -157,6 +159,15 @@ def analysis_and_costs():
 
 
 @test
+def judge_sees_every_round_analysis():
+    assert len(JUDGE_PROMPTS) == 16, len(JUDGE_PROMPTS)
+    for path, prompt in JUDGE_PROMPTS.items():
+        arm = Path(path).stem.split("_")[1]
+        for r in range(1, 5):
+            assert f"### Round {r}\nanalysis {arm} r{r}" in prompt, (path, r)
+
+
+@test
 def resume_after_a_crash_repeats_no_call():
     G = Fake(TMP / "r", "fake")
     G.cfg = dict(G.cfg, n_searches=1)
@@ -178,12 +189,14 @@ def resume_after_a_crash_repeats_no_call():
 
 @test
 def full_run_refuses_without_launch_approval():
-    assert not (C.STEP2 / "LAUNCH_APPROVED.md").exists()
+    real, C.STEP2 = C.STEP2, TMP                           # an empty folder, whatever the real one holds
     try:
         RS.Step2(TMP / "x", "step2").run()
         assert False, "ran without approval"
     except SystemExit as e:
         assert "LAUNCH_APPROVED" in str(e)
+    finally:
+        C.STEP2 = real
 
 
 if __name__ == "__main__":

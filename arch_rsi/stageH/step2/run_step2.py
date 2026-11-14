@@ -46,24 +46,26 @@ JUDGE_SCHEMA = {"type": "object", "properties": {"verdict": {"type": "string", "
                 "required": ["verdict", "evidence"], "additionalProperties": False}
 
 
-def judge_prompt(world: str, analysis: str, name: str, hypothesis: str) -> str:
+def judge_prompt(world: str, analyses: list, name: str, hypothesis: str) -> str:
+    rounds = "\n\n".join(f"### Round {r}\n{a}" for r, a in enumerate(analyses, 1))
     return f"""A simulated brick world had this hidden rule:
 {P.RULE_TEXT[world]}
 
-Below is what an AI scientist wrote at the end of a search in that world: its last analysis, and the name and
-hypothesis of the trial it ended with. Does the text state the rule?
+Below is what an AI scientist wrote during a search in that world: its analysis at every round, in order, and the
+name and hypothesis of the trial it ended with. Does the text, anywhere, state the rule?
 - "yes": it states the rule's substance (what is changed and how).
 - "partly": it identifies the right kind of change but not its specifics.
 - "no": anything else.
 
-## Last analysis
-{analysis}
+## Analysis at each round
+{rounds}
 
 ## Trial it ended with
 name: {name}
 hypothesis: {hypothesis}
 
-Return a JSON object: "verdict" ("yes", "partly" or "no") and "evidence" (at most 80 words, quoting the text)."""
+Return a JSON object: "verdict" ("yes", "partly" or "no") and "evidence" (at most 80 words, quoting the text and
+naming the round it comes from)."""
 
 
 def judge_validate(o) -> dict:
@@ -359,7 +361,9 @@ class Step2:
         out = {}
         for e in entries:
             key = f"{e['world']}/{e['arm']}/s{e['search']}"
-            val, _ = self.call_simple(JUDGE_SYSTEM, judge_prompt(e["world"], e["last_analysis"], e["name"], e["hypothesis"]),
+            st = json.loads((self.dir / e["world"] / e["arm"] / f"s{e['search']}" / "state.json").read_text())
+            analyses = [st.get("analyses", {}).get(str(r), "") for r in range(1, self.cfg["R"] + 1)]
+            val, _ = self.call_simple(JUDGE_SYSTEM, judge_prompt(e["world"], analyses, e["name"], e["hypothesis"]),
                                       JUDGE_SCHEMA, judge_validate, self.dir / "judge" / f"{key.replace('/', '_')}.json")
             out[key] = val
         f.write_text(json.dumps(out, indent=1))
