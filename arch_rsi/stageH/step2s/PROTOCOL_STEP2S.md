@@ -3,7 +3,8 @@
 **Status:**
 - **Written:** 14 November 2026, before Step 2's full run and before any Step 2S code or run.
 - **Approved:** by the user on 14 November 2026, as written, with the told arm kept.
-- **Not built or run yet.** Building waits for the user's go-ahead, and the run waits for Step 2's full-run result.
+- **Built:** 14 November 2026, on the user's go-ahead ("Yes, then"), after Step 2's full run had started with its code frozen at commit 3165e149. Tested with fake training and a fake model; nothing has run. The code is frozen by `manifest.json`; see "Build notes" at the end.
+- **Not run yet.** The dry run waits for Step 2's full-run result, which sets the worlds, and then for the user's go-ahead. The full run needs the user's approval of the dry run (`LAUNCH_APPROVED.md`).
 
 **Place in the plan:**
 - This step runs after Step 2 (`../step2/PROTOCOL_STEP2.md`). The user chose a separate step over a fifth arm in Step 2.
@@ -159,3 +160,33 @@ This is dig.bench's creative mode one level up:
 
 - **If P1S passes:** probing is a skill the loop has. Step 3 can let the AI scientist rewrite how it probes across worlds whose rules differ.
 - **If it fails:** the next question is whether better-chosen experiments would help. That would come from rewriting the procedure, which is again Step 3.
+
+## Build notes (14 November 2026, before any run)
+
+These settle details the protocol above left open. None changes an arm, a world rule, a test or an ending.
+- **Files:** `s2s_common.py` (settings and the world rule), `make_probe_designs.py`, `probes_2s.py`, `prompts_2s.py`,
+  `run_step2s.py`, `analyze_step2s.py`, three test files, `targets/probe.pt` and `make_manifest2s.py`.
+- **Probe designs:** made once with seed 4747, with 37, 23, 35 and 30 cells. Excluded: Stage H's held-out hashes (dev
+  and check designs) and Step 2's two diagnostic designs. A test checks none equals a dev, check or diagnostic design.
+- **Probe reply:** `{"probes": [...]}`, at most 3, each with `design` (1 to 4), `purpose` (at most 40 words) and
+  `placements` (1 to 16, each `brick`, `row`, `col`). A malformed reply is retried with the reason, as proposals are.
+- **Where the sandbox sits in the prompts:**
+  - The probe call is the base prompt up to "## What to return", then "## Sandbox" (the sandbox text above, how probes
+    work, earlier probes) and the probe reply format.
+  - The proposal call is the base prompt with "## Sandbox results" inserted before "## What to return". Repairs use
+    that prompt too.
+  - "The last round's probes in full" is read as: at each call, the most recent round's probes in full (for the
+    proposal call, this round's), earlier rounds' as requests only.
+- **Base prompts:** sandbox and scores use Step 2's scores-only prompt unchanged. Told with sandbox uses Step 2's told
+  task text (the exact rule sentence) with the scores-only feedback. No arm sees readouts.
+- **What a probe returns:** each placement's reward is the training reward, as in Step 2's traces. An illegal placement
+  fills nothing and ends the probe.
+- **Reuse, not copies:** Step 2's runner class is subclassed. One method, `search()`, is copied and changed in three
+  marked places; a test shows that for the scores arm it writes the same prompts and the same state as Step 2's. Step 2's
+  call counter would have counted saved probe results as calls, so `analyze_step2s.call_costs` skips those files.
+- **No call is repeated on a resume:** a saved reply is validated again and reused, but only for the same prompt.
+- **The start** (reference A) is trained again in this campaign, by Step 2's code, as the cost section counts.
+- **Probes on the GPU** run one at a time; each is a few world steps.
+- **Disclosure:** while building, I saw Step 2's process list and the files its run had created, and its session reported
+  that the start scored 0.0 on every seed in the shifted world, as in Stage H1. No Step 2 search result was read. The
+  tests never read Step 2's results: they use a made-up file.
