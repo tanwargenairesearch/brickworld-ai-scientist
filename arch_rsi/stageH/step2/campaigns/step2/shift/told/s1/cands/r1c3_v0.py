@@ -1,0 +1,88 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+RECIPE = {"ppo_epochs": 2, "ent_coef": 0.02}
+
+STEM = 48
+COL = 48
+WIDTH = 40
+PROJ = 32
+HID = 32
+
+
+class CircRow(nn.Module):
+    def __init__(self, cin, cout, X):
+        super().__init__()
+        self.X = int(X)
+        self.conv = nn.Conv2d(cin, cout, (1, self.X))
+
+    def forward(self, x):
+        xp = torch.cat([x, x[..., :self.X - 1]], dim=3)
+        return self.conv(xp)
+
+
+class CircCol(nn.Module):
+    def __init__(self, cin, cout, Y):
+        super().__init__()
+        self.Y = int(Y)
+        self.conv = nn.Conv2d(cin, cout, (self.Y, 1))
+
+    def forward(self, x):
+        xp = torch.cat([x, x[:, :, :self.Y - 1, :]], dim=2)
+        return self.conv(xp)
+
+
+class PoolHead(nn.Module):
+    def __init__(self, c, footprints, proj, hid):
+        super().__init__()
+        self.fps = [(int(a), int(b)) for a, b in footprints]
+        self.proj = nn.Conv2d(c, proj, 1)
+        self.mix = nn.ModuleList([nn.Conv2d(3 * proj, hid, 1) for _ in self.fps])
+        self.outs = nn.ModuleList([nn.Conv2d(hid, 1, 1) for _ in self.fps])
+
+    def forward(self, f):
+        p = self.proj(f)
+        res = []
+        for (dy, dx), mix, out in zip(self.fps, self.mix, self.outs):
+            if dy * dx == 1:
+                mx, mn, av = p, p, p
+            else:
+                q = F.pad(p, (0, dx - 1, 0, dy - 1))
+                mx = F.max_pool2d(q, (dy, dx), stride=1)
+                mn = -F.max_pool2d(-q, (dy, dx), stride=1)
+                av = F.avg_pool2d(q, (dy, dx), stride=1)
+            h = F.relu(mix(torch.cat([mx, mn, av], dim=1)))
+            res.append(out(h))
+        return torch.cat(res, dim=1).flatten(1)
+
+
+class Net(nn.Module):
+    def __init__(self, spec):
+        super().__init__()
+        self.stem = nn.Sequential(
+            CircRow(spec.in_channels, STEM, spec.X), nn.ReLU(),
+            nn.Conv2d(STEM, COL, 1), nn.ReLU())
+        self.c1 = nn.Conv2d(COL, WIDTH, 3, padding=1)
+        self.row = CircRow(WIDTH, WIDTH, spec.X)
+        self.col = CircCol(WIDTH, WIDTH, spec.Y)
+        self.c2 = nn.Conv2d(WIDTH, WIDTH, 3, padding=1)
+        self.head = PoolHead(WIDTH, spec.footprints, PROJ, HID)
+        self.glob = nn.Sequential(nn.Linear(2 * WIDTH, 64), nn.ReLU())
+        self.done_head = nn.Linear(64, 1)
+        self.value_head = nn.Linear(64, 1)
+
+    def forward(self, obs, mask):
+        s = self.stem(obs)
+        x = F.relu(self.c1(s))
+        x = F.relu(x + self.row(x))
+        x = F.relu(x + self.col(x))
+        f = F.relu(x + self.c2(x))
+        place = self.head(f)
+        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], dim=1))
+        logits = torch.cat([place, self.done_head(g)], dim=1)
+        return logits, self.value_head(g).squeeze(1)
+
+
+def build_policy(spec):
+    return Net(spec)
