@@ -279,3 +279,51 @@ Each power figure is at α = 0.0125, the first Holm step.
 4. **The readouts check arm:** keep it (proposed; 12 searches, about 2 h). It's what lets a null result say something. Or drop it.
 5. **Controls:** facts-only and no-logs (proposed), or 2c's shuffled control as well (about 3.5 h more).
 6. **Lineages and generations:** 2 lineages × 3 rewrites, with 7 searches per generation, one per meta-training world (proposed, 2c's shape), or 1 lineage, which halves meta-training but leaves claims resting on one lineage.
+
+## Changes made while building (15 November 2026, before any run)
+
+None changes a decision, a test, a threshold or an ending.
+
+1. **Readouts in the held-out worlds:** `readouts_3.py` imports Step 2's `readouts.py` unchanged and only rebinds its rule class to Step 3a's, so H5 and H6 work.
+   - On the GPU, it reproduces Step 2's saved readouts in the shift world exactly.
+   - In H5 the observed target height map is the design's rolled 4 rows, and in H6 every untrained placement fills cells 4 columns right of the chosen anchor. So each new rule's evidence shows, as Step 2 checked for its worlds (`test_identity_3.py`).
+2. **Training, scoring and checks** run Step 3a's `train_3a.py`, `eval_3a.py` and `check_3a.py`. The three runner methods are Step 2's with only the script paths changed (`test_run_step3.py`).
+3. **The start** trains seeds 0–2 in every world, covering any header, plus 5001–5004. A search with n seeds per candidate sees the start's first n seeds, rounded as in Step 2.
+4. **Seed counts in the prompt:** with 1 or 3 seeds per candidate, the two task-text sentences that name the seed count are changed to match. With 2 seeds the prompt is Step 2's exactly, and g0's search writes the same prompts and state as Step 2's (`test_run_step3.py`).
+5. **The rewrite prompt** is 2c's with:
+   - this step's header, its bounds and the 4-seed retraining;
+   - one line saying the searches see scores only;
+   - "brick worlds that may each differ from their description in ways you have not seen";
+   - a first line in the logs saying each search ran in a labelled world.
+   The no-logs rewrite has "None are given for this revision." in place of both the earlier-generations table and the logs. The facts-only restriction is 2c's word for word (`test_prompts3.py`).
+6. **The facts-only check** is 2c's own function, called with this step's header parser. On 2c's programs it returns exactly 2c's answers (`test_prog3.py`).
+7. **The diagnosis judge** gets a rule sentence for H5 and H6 in Step 2's style. Only the judge sees these.
+8. **Schedule:** meta-training and meta-test searches use separate pools, up to 14 and 6 searches at a time. They share the 4 GPU slots, so the generations, which must run one after another, don't queue behind the meta-test.
+9. **The program review** uses 2c's prompt and schema, imported unchanged.
+10. **Ending C's choice** is filled as "added facts", "the act of rewriting", or "added facts or the act of rewriting", by which of P2 and P3 failed.
+11. **Separation in code:** a rewrite refuses to read any search that isn't from meta-training, and the tests check that no rewrite prompt contains held-out text.
+12. **The manifest** also hashes the Stage 2c files Step 3 imports (`prog2c.py`, `review_2c.py`) and `g0r.md`.
+
+## Build status (15 November 2026)
+
+**Built:** in `arch_rsi/stageH/step3/`:
+- `s3common.py`, `prog3.py`, `prompts3.py`, `readouts_3.py`;
+- `run_step3.py`, `analyze_step3.py`;
+- `make_report_tables3.py`, `make_manifest3.py`.
+
+**Tests, all passing:**
+
+| Test | Checks | GPU |
+|---|---|---|
+| `test_prog3.py` | 5 | no |
+| `test_prompts3.py` | 8 | no |
+| `test_run_step3.py` | 11, with fake training and a fake model: the whole flow, keep and reject, the parent-header fallback, a shared final arm, separation, no rule named in any harness prompt, and resume after two crashes without repeating a call | no |
+| `test_analyze_step3.py` | 7: every ending, P4 untested, a violation | no |
+| `test_identity_3.py` | 3, reading saved runs only | yes |
+
+No model has been called and nothing has been trained for Step 3.
+
+**Next:** the dry run (`--preset step3_dry`), after the user's go-ahead.
+- **Size:** 1 lineage; 2 generations of 1 search, in H2; and one meta-test search per arm, in H1.
+- **Cost:** about 240 training runs, roughly 1–1.5 h, and about 40 calls.
+- **Then:** the full run needs the user's approval of the dry run, recorded in `LAUNCH_APPROVED.md`.
