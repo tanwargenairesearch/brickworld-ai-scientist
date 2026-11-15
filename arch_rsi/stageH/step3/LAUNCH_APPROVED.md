@@ -1,0 +1,23 @@
+# Step 3 full run: launch approved
+
+- **When:** 15 November 2026, at about 14:15 GMT, after the user read the dry run's review.
+- **The user's words:** "Approve, launch"
+- **What was approved:** the full Step 3 run, preset `step3`, as fixed in `PROTOCOL_STEP3.md` with its six default decisions:
+  - 2 lineages × 3 rewrites, each generation searching the 7 training worlds;
+  - 24 searches per meta-test arm over shift, rowshift and handshift, plus 12 check searches.
+- **No code changed after the dry run.** The 17 files in Step 3's manifest are the files the dry run used.
+- **Step 3 manifest at approval:** sha256 of manifest.json = `98061d6ddb7a119c27c9d11e34660b4a5af38bb9c17bf0412b2d19a90519dad4`.
+- **Expected size, from the dry run:**
+  - about 5,300 training runs: 66 s each with four at once, so about 25–30 h on the Mac's GPU;
+  - about 1,200 calls, about $350 notional ($0.38 per search call, about $1.80 per search, up to 188 searches).
+- **What the dry run showed** (`campaigns/step3_dry`, 58 min, 189 training runs, $13.48 notional; excluded from the analysis):
+  - Frozen hashes unchanged before and after.
+  - Search prompts carry no world: g0's and g1's first prompts are byte-identical in mirror and shift.
+  - Rewrite prompts show "world 1" only and no meta-test result; the no-logs prompt shows no searches.
+  - All three rewrites were valid on the first attempt; g1 changed the header to 4 × 6 × 1.
+  - g1 was not kept (0 against 0), so final was g0 and P4 entered Holm at p 1, as the protocol says.
+  - The check search found the shift fix (94.3% confirmed).
+  - Reviews: 2 picks compliant, 4 programs with no rule-breaking advice, 5 searches judged.
+- **Noted for the report, no code change:**
+  - g1 scored 11.8% in shift with a deeper plain network and no fix. So the primary mean can rise without the rule being found; the per-world counts at 38.3% and the judge's verdicts separate the two.
+  - The judge gave "partly" to every search that only guessed at a spatial mismatch. Only "yes" counts as stating the rule.
