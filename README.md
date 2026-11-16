@@ -29,7 +29,7 @@ Step 3's departures are in `arch_rsi/stageH/step3/RUN_NOTES.md`. Lineage B's fin
 - `arch_rsi/campaigns/`: Stage 1's and 2b's records, including reference A (`stage1/confirm/1c9c0e6b521fc0bb/candidate.py`), where every Stage H search starts.
 - Step 2: each search in `arch_rsi/stageH/step2/campaigns/step2/<world>/<arm>/s<i>/` keeps `round_<r>.json` (the exact prompt, reply, rejected attempts and notional cost), its repair calls, every network written (`cands/`) and the run scores (`trials/`).
 - Step 3: `arch_rsi/stageH/step3/campaigns/step3/programs/<A|B>/` keeps every program (`g0.md`–`g3.md`, `facts.md`, `nologs.md`) and rewrite call (`call_*.json`, with rejected attempts in `call_*.failed.json`). Its searches are in `meta/` and `test/`, laid out like Step 2's.
-- `energy_check/` (the AI scientist's second suggestion, prompted by Prefrontal's CRAM paper), `physics/` (an exploratory check), `site/` and `docs/` (the article), and `tools/release/` (which made this history). The root holds the first experiment.
+- `energy_check/` (the AI scientist's second suggestion, prompted by Prefrontal's CRAM paper), `physics/` (an exploratory check), and `site/` and `docs/` (the article). The root holds the first experiment.
 
 ## What the published history leaves out, and why
 
