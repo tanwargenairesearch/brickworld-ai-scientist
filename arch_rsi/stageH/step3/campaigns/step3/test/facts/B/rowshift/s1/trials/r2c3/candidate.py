@@ -1,0 +1,103 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+STEM = 64
+COL = 48
+WIDTH = 40
+LAYOUTS = [(0, 0, 0, 0), (0, 0, 0, 1), (0, 0, 1, 0), (0, 0, 1, 1),
+           (0, 1, 0, 0), (0, 1, 0, 1), (0, 1, 1, 0), (0, 1, 1, 1),
+           (1, 0, 0, 0), (1, 0, 0, 1), (1, 0, 1, 0), (1, 0, 1, 1),
+           (1, 1, 0, 0), (1, 1, 0, 1), (1, 1, 1, 0), (1, 1, 1, 1)]
+
+
+def to_grid(m, B, T, Y, X, lay):
+    order, tr, fy, fx = lay
+    if order == 0:
+        if tr:
+            a = m.reshape(B, T, X, Y).transpose(2, 3)
+        else:
+            a = m.reshape(B, T, Y, X)
+    else:
+        if tr:
+            a = m.reshape(B, X, Y, T).permute(0, 3, 2, 1)
+        else:
+            a = m.reshape(B, Y, X, T).permute(0, 3, 1, 2)
+    if fy:
+        a = a.flip(2)
+    if fx:
+        a = a.flip(3)
+    return a
+
+
+def from_grid(a, B, lay):
+    order, tr, fy, fx = lay
+    if fx:
+        a = a.flip(3)
+    if fy:
+        a = a.flip(2)
+    if order == 0:
+        if tr:
+            a = a.transpose(2, 3)
+    else:
+        if tr:
+            a = a.permute(0, 3, 2, 1)
+        else:
+            a = a.permute(0, 2, 3, 1)
+    return a.reshape(B, -1)
+
+
+class Net(nn.Module):
+    def __init__(self, spec):
+        super().__init__()
+        self.T = int(spec.n_types)
+        self.Y = int(spec.Y)
+        self.X = int(spec.X)
+        self.n_place = int(spec.n_place)
+        self.layouts = list(LAYOUTS)
+        L = len(self.layouts)
+        cin = spec.in_channels + L * self.T + 2
+        self.stem = nn.Sequential(
+            nn.Conv2d(cin, STEM, 1), nn.ReLU(),
+            nn.Conv2d(STEM, COL, 1), nn.ReLU())
+        self.c1 = nn.Conv2d(COL, WIDTH, 3, padding=1)
+        self.c2 = nn.Conv2d(WIDTH, WIDTH, 3, padding=1)
+        self.mid = nn.Sequential(nn.Linear(2 * WIDTH, WIDTH), nn.ReLU())
+        self.c3 = nn.Conv2d(WIDTH, WIDTH, 3, padding=1)
+        self.out = nn.Conv2d(WIDTH, L * self.T, 1)
+        self.glob = nn.Sequential(nn.Linear(2 * WIDTH, 64), nn.ReLU())
+        self.done_head = nn.Linear(64, 1)
+        self.act_head = nn.Linear(64, int(spec.n_actions))
+        nn.init.orthogonal_(self.act_head.weight, gain=0.01)
+        nn.init.zeros_(self.act_head.bias)
+        self.value_head = nn.Linear(64, 1)
+
+    def forward(self, obs, mask):
+        B = obs.shape[0]
+        T, Y, X = self.T, self.Y, self.X
+        m = mask[:, :self.n_place].float()
+        ins = [obs]
+        for lay in self.layouts:
+            ins.append(to_grid(m, B, T, Y, X, lay))
+        yy = torch.linspace(-1.0, 1.0, Y, device=obs.device).view(1, 1, Y, 1).expand(B, 1, Y, X)
+        xx = torch.linspace(-1.0, 1.0, X, device=obs.device).view(1, 1, 1, X).expand(B, 1, Y, X)
+        ins.append(yy)
+        ins.append(xx)
+        s = self.stem(torch.cat(ins, dim=1))
+        h = F.relu(self.c1(s))
+        h = F.relu(h + self.c2(h))
+        gm = self.mid(torch.cat([h.mean((2, 3)), h.amax((2, 3))], dim=1))
+        h = h + gm[:, :, None, None]
+        h = F.relu(h + self.c3(h))
+        o = self.out(h)
+        place = None
+        for k, lay in enumerate(self.layouts):
+            a = from_grid(o[:, k * T:(k + 1) * T], B, lay)
+            place = a if place is None else place + a
+        g = self.glob(torch.cat([h.mean((2, 3)), h.amax((2, 3))], dim=1))
+        logits = torch.cat([place, self.done_head(g)], dim=1) + self.act_head(g)
+        return logits, self.value_head(g).squeeze(1)
+
+
+def build_policy(spec):
+    return Net(spec)

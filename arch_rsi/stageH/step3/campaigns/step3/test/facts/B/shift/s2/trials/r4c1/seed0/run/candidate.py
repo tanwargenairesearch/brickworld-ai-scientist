@@ -1,0 +1,105 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+RECIPE = {"ppo_epochs": 3}
+
+STEM = 64
+WIDTH = 48
+PROJ = 16
+HID = 64
+GLOB = 64
+LAYOUTS = ((False, ()), (True, ()), (False, (2,)), (False, (3,)))
+
+
+def make_windows(footprints):
+    wins = []
+    for a, b in footprints:
+        for dy, dx in ((int(a), int(b)), (int(b), int(a))):
+            if dy * dx <= 1:
+                continue
+            for top in sorted(set([0, dy - 1])):
+                for left in sorted(set([0, dx - 1])):
+                    w = (dy, dx, top, left)
+                    if w not in wins:
+                        wins.append(w)
+    return wins
+
+
+class Net(nn.Module):
+    def __init__(self, spec):
+        super().__init__()
+        self.T = int(spec.n_types)
+        self.Y = int(spec.Y)
+        self.X = int(spec.X)
+        self.n_place = int(spec.n_place)
+        self.wins = make_windows(spec.footprints)
+        nl = len(LAYOUTS)
+        cin = spec.in_channels + nl * self.T + 2
+        self.stem = nn.Sequential(
+            nn.Conv2d(cin, STEM, 1), nn.ReLU(),
+            nn.Conv2d(STEM, WIDTH, 1), nn.ReLU())
+        self.c1 = nn.Conv2d(WIDTH, WIDTH, 3, padding=1)
+        self.c2 = nn.Conv2d(WIDTH, WIDTH, 3, padding=1)
+        self.proj = nn.Conv2d(WIDTH, PROJ, 1)
+        hin = WIDTH + PROJ + 2 * PROJ * len(self.wins)
+        self.mix = nn.Conv2d(hin, HID, 1)
+        self.out = nn.Conv2d(HID, nl * self.T, 1)
+        nn.init.normal_(self.out.weight, std=0.01)
+        nn.init.zeros_(self.out.bias)
+        self.glob = nn.Sequential(nn.Linear(2 * WIDTH, GLOB), nn.ReLU())
+        self.done_head = nn.Linear(GLOB, 1)
+        self.value_head = nn.Linear(GLOB, 1)
+
+    def lay(self, m, tr, fl):
+        b = m.shape[0]
+        if tr:
+            v = m.reshape(b, self.T, self.X, self.Y).transpose(2, 3)
+        else:
+            v = m.reshape(b, self.T, self.Y, self.X)
+        if len(fl) > 0:
+            v = v.flip(fl)
+        return v
+
+    def unlay(self, o, tr, fl):
+        b = o.shape[0]
+        if len(fl) > 0:
+            o = o.flip(fl)
+        if tr:
+            o = o.transpose(2, 3)
+        return o.reshape(b, -1)
+
+    def forward(self, obs, mask):
+        b = obs.shape[0]
+        m = mask[:, :self.n_place].to(obs.dtype)
+        chans = [obs]
+        for tr, fl in LAYOUTS:
+            chans.append(self.lay(m, tr, fl))
+        ys = torch.linspace(-1.0, 1.0, self.Y, device=obs.device, dtype=obs.dtype)
+        xs = torch.linspace(-1.0, 1.0, self.X, device=obs.device, dtype=obs.dtype)
+        chans.append(ys.view(1, 1, self.Y, 1).expand(b, 1, self.Y, self.X))
+        chans.append(xs.view(1, 1, 1, self.X).expand(b, 1, self.Y, self.X))
+        h = self.stem(torch.cat(chans, dim=1))
+        x = F.relu(h + self.c1(h))
+        f = F.relu(x + self.c2(x))
+        p = self.proj(f)
+        feats = [f, p]
+        for dy, dx, top, left in self.wins:
+            pads = (left, dx - 1 - left, top, dy - 1 - top)
+            mx = F.max_pool2d(F.pad(p, pads), (dy, dx), stride=1)
+            mn = -F.max_pool2d(F.pad(-p, pads), (dy, dx), stride=1)
+            feats.append(mx)
+            feats.append(mn)
+        hh = F.relu(self.mix(torch.cat(feats, dim=1)))
+        o = self.out(hh)
+        place = None
+        for k, (tr, fl) in enumerate(LAYOUTS):
+            q = self.unlay(o[:, k * self.T:(k + 1) * self.T], tr, fl)
+            place = q if place is None else place + q
+        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], dim=1))
+        logits = torch.cat([place, self.done_head(g)], dim=1)
+        return logits, self.value_head(g).squeeze(1)
+
+
+def build_policy(spec):
+    return Net(spec)

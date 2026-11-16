@@ -1,0 +1,59 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+RECIPE = {"ppo_epochs": 1, "gamma": 0.99, "gae_lambda": 0.95, "ent_coef": 0.01}
+
+STEM = 48
+W = 32
+RED = 16
+NBLK = 2
+GLOB = 64
+
+
+class Block(nn.Module):
+    def __init__(self, c):
+        super().__init__()
+        self.n1 = nn.GroupNorm(4, c)
+        self.c1 = nn.Conv2d(c, c, 3, padding=1)
+        self.n2 = nn.GroupNorm(4, c)
+        self.c2 = nn.Conv2d(c, c, 3, padding=1)
+
+    def forward(self, x):
+        h = self.c1(F.relu(self.n1(x)))
+        h = self.c2(F.relu(self.n2(h)))
+        return x + h
+
+
+class Net(nn.Module):
+    def __init__(self, spec):
+        super().__init__()
+        self.nt = int(spec.n_types)
+        self.Y = int(spec.Y)
+        self.X = int(spec.X)
+        self.npl = int(spec.n_place)
+        cin = spec.in_channels + self.nt
+        self.stem = nn.Sequential(
+            nn.Conv2d(cin, STEM, 1), nn.ReLU(),
+            nn.Conv2d(STEM, W, 1))
+        self.blocks = nn.Sequential(*[Block(W) for _ in range(NBLK)])
+        self.norm = nn.GroupNorm(4, W)
+        self.red = nn.Conv2d(W, RED, 1)
+        self.flat = nn.Linear(RED * self.Y * self.X, int(spec.n_actions))
+        nn.init.normal_(self.flat.weight, std=0.01)
+        nn.init.zeros_(self.flat.bias)
+        self.value = nn.Sequential(nn.Linear(2 * W, GLOB), nn.ReLU(), nn.Linear(GLOB, 1))
+
+    def forward(self, obs, mask):
+        B = obs.shape[0]
+        m = mask[:, :self.npl].float().reshape(B, self.nt, self.Y, self.X)
+        s = self.stem(torch.cat([obs, m], dim=1))
+        f = F.relu(self.norm(self.blocks(s)))
+        r = F.relu(self.red(f)).flatten(1)
+        logits = self.flat(r)
+        pooled = torch.cat([f.mean((2, 3)), f.amax((2, 3))], dim=1)
+        return logits, self.value(pooled).squeeze(1)
+
+
+def build_policy(spec):
+    return Net(spec)

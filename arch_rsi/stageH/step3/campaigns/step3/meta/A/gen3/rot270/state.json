@@ -1,0 +1,839 @@
+{
+ "trials": [
+  {
+   "label": "r1c1",
+   "round": 1,
+   "name": "Dihedral frames + footprint pooling",
+   "hypothesis": "Change: eight dihedral frames, each built from max, min and mean pooling over the footprint plus a small per-frame, per-type MLP. Each frame's logits are flattened in its own frame, and a scale-5 softmax mixes the frames. Why: a dihedral frame head fixed the layout mismatch in 6 of 7 earlier worlds. Refuted if both seeds stay at 0 on training and dev. That would point to a mismatch that frames alone do not cover, such as anchor offset or type order.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {\"ppo_epochs\": 2, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 32, \"gamma\": 0.97, \"gae_lambda\": 0.95, \"ent_coef\": 0.005, \"lr\": 0.0015}\n\nWIDTH = 32\nSKIP = 16\nPROJ = 16\nHID = 12\nSCALE = 5.0\nPER_TYPE = False\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    nn.init.zeros_(m.bias)\n    return m\n\n\ndef frame(x, k):\n    if k >= 4:\n        x = x.transpose(2, 3)\n    r = k % 4\n    if r == 1:\n        x = x.flip(3)\n    elif r == 2:\n        x = x.flip(2)\n    elif r == 3:\n        x = x.flip(2).flip(3)\n    return x\n\n\ndef frame_list(spec):\n    if int(spec.X) == int(spec.Y):\n        return list(range(8))\n    return [0, 1, 2, 3]\n\n\nclass Trunk(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        c = spec.in_channels\n        g = math.sqrt(2.0)\n        self.stem = nn.Sequential(ortho(nn.Conv2d(c, 64, 1), g), nn.ReLU(),\n                                  ortho(nn.Conv2d(64, 48, 1), g), nn.ReLU())\n        self.c1 = ortho(nn.Conv2d(48, WIDTH, 3, padding=1), g)\n        self.n1 = nn.GroupNorm(4, WIDTH)\n        self.c2 = ortho(nn.Conv2d(WIDTH, WIDTH, 3, padding=1), g)\n        self.n2 = nn.GroupNorm(4, WIDTH)\n        self.skip = ortho(nn.Conv2d(c, SKIP, 1), g)\n\n    def forward(self, obs):\n        s = self.stem(obs)\n        x = F.relu(self.n1(self.c1(s)))\n        f = F.relu(x + self.n2(self.c2(x)))\n        h = torch.cat([f, F.relu(self.skip(obs))], 1)\n        return f, h\n\n\nclass FrameHead(nn.Module):\n    def __init__(self, cin, spec):\n        super().__init__()\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        self.frames = frame_list(spec)\n        nf = len(self.frames)\n        T = len(self.fps)\n        self.nf = nf\n        self.T = T\n        self.proj = ortho(nn.Conv2d(cin, PROJ, 1), 1.0)\n        self.w1 = nn.Parameter(torch.randn(nf, T, 3 * PROJ, HID) * math.sqrt(2.0 / (3 * PROJ)))\n        self.b1 = nn.Parameter(torch.zeros(nf, T, HID))\n        self.w2 = nn.Parameter(torch.randn(nf, T, HID) * (0.01 / math.sqrt(HID)))\n        self.b2 = nn.Parameter(torch.zeros(nf, T))\n        if PER_TYPE:\n            self.mixw = nn.Parameter(torch.zeros(T, nf))\n        else:\n            self.mixw = nn.Parameter(torch.zeros(nf))\n\n    def forward(self, h):\n        p = self.proj(h)\n        B, P = p.shape[0], p.shape[1]\n        nf = self.nf\n        q = torch.cat([frame(p, k) for k in self.frames], 1)\n        Yp, Xp = q.shape[2], q.shape[3]\n        feats = []\n        for dy, dx in self.fps:\n            if dy * dx == 1:\n                mx, mn, av = q, q, q\n            else:\n                qq = F.pad(q, (0, dx - 1, 0, dy - 1))\n                mx = F.max_pool2d(qq, (dy, dx), stride=1)\n                mn = -F.max_pool2d(-qq, (dy, dx), stride=1)\n                av = F.avg_pool2d(qq, (dy, dx), stride=1)\n            z = torch.cat([mx.reshape(B, nf, P, Yp, Xp), mn.reshape(B, nf, P, Yp, Xp),\n                           av.reshape(B, nf, P, Yp, Xp)], 2)\n            feats.append(z)\n        z = torch.stack(feats, 2)\n        hid = torch.einsum('bftcyx,ftch->bfthyx', z, self.w1) + self.b1[None, :, :, :, None, None]\n        hid = F.relu(hid)\n        L = torch.einsum('bfthyx,fth->bftyx', hid, self.w2) + self.b2[None, :, :, None, None]\n        L = L.reshape(B, nf, self.T, Yp * Xp)\n        if PER_TYPE:\n            a = torch.softmax(SCALE * self.mixw, dim=1)\n            out = (L * a.t()[None, :, :, None]).sum(1)\n        else:\n            a = torch.softmax(SCALE * self.mixw, dim=0)\n            out = (L * a[None, :, None, None]).sum(1)\n        return out\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.trunk = Trunk(spec)\n        self.head = FrameHead(WIDTH + SKIP, spec)\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * WIDTH, 64), math.sqrt(2.0)), nn.ReLU())\n        self.tbias = ortho(nn.Linear(64, len(spec.footprints)), 0.01)\n        self.done_head = ortho(nn.Linear(64, 1), 0.01)\n        self.value_head = ortho(nn.Linear(64, 1), 1.0)\n\n    def forward(self, obs, mask):\n        f, h = self.trunk(obs)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], dim=1))\n        place = self.head(h) + self.tbias(g)[:, :, None]\n        logits = torch.cat([place.flatten(1), self.done_head(g)], dim=1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 53166,
+    "fb_ms": 123.48,
+    "flops_per_sample": 18127104,
+    "flops_ratio": 0.99,
+    "sha": "26f5e1c6e1b1fdb7",
+    "recipe": {
+     "lr": 0.0015,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "ppo_epochs": 2,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "ent_coef": 0.005,
+     "lr": 0.0015
+    },
+    "budget": {
+     "allowed_steps": 243419,
+     "n_updates": 118,
+     "batch": 2048,
+     "steps": 241664,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0204
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 8
+    },
+    "rule": "rot270"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.9541,
+    "dev_per_seed": [
+     0.9707,
+     0.9375
+    ],
+    "train_exact": 0.9194,
+    "params": 53166,
+    "flops_ratio": 0.99,
+    "train_steps": 241664,
+    "wall_s": 206.6,
+    "sha": "26f5e1c6e1b1fdb7",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r1c2",
+   "round": 1,
+   "name": "Frames x centred window x 2 orders",
+   "hypothesis": "Change: one shared centred 3x3 window conv outputs a type map for each frame. Each map is re-indexed into its frame and flattened both type-major and anchor-major, giving 16 layouts mixed by a scale-5 softmax. A gain-0.01 dense term from the global vector is added. Why: some worlds needed an anchor offset or anchor-major order on top of the frame. Refuted if both seeds score 0, or if this candidate is clearly below the pooling frame head.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {\"ppo_epochs\": 2, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 32, \"gamma\": 0.97, \"gae_lambda\": 0.95, \"ent_coef\": 0.005, \"lr\": 0.0015}\n\nWIDTH = 32\nSKIP = 16\nHHID = 48\nSCALE = 5.0\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    nn.init.zeros_(m.bias)\n    return m\n\n\ndef frame(x, k):\n    if k >= 4:\n        x = x.transpose(2, 3)\n    r = k % 4\n    if r == 1:\n        x = x.flip(3)\n    elif r == 2:\n        x = x.flip(2)\n    elif r == 3:\n        x = x.flip(2).flip(3)\n    return x\n\n\ndef frame_list(spec):\n    if int(spec.X) == int(spec.Y):\n        return list(range(8))\n    return [0, 1, 2, 3]\n\n\nclass Trunk(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        c = spec.in_channels\n        g = math.sqrt(2.0)\n        self.stem = nn.Sequential(ortho(nn.Conv2d(c, 64, 1), g), nn.ReLU(),\n                                  ortho(nn.Conv2d(64, 48, 1), g), nn.ReLU())\n        self.c1 = ortho(nn.Conv2d(48, WIDTH, 3, padding=1), g)\n        self.n1 = nn.GroupNorm(4, WIDTH)\n        self.c2 = ortho(nn.Conv2d(WIDTH, WIDTH, 3, padding=1), g)\n        self.n2 = nn.GroupNorm(4, WIDTH)\n        self.skip = ortho(nn.Conv2d(c, SKIP, 1), g)\n\n    def forward(self, obs):\n        s = self.stem(obs)\n        x = F.relu(self.n1(self.c1(s)))\n        f = F.relu(x + self.n2(self.c2(x)))\n        h = torch.cat([f, F.relu(self.skip(obs))], 1)\n        return f, h\n\n\nclass WindowHead(nn.Module):\n    def __init__(self, cin, spec):\n        super().__init__()\n        fps = [(int(a), int(b)) for a, b in spec.footprints]\n        self.T = len(fps)\n        K = max(max(a, b) for a, b in fps)\n        self.frames = frame_list(spec)\n        nf = len(self.frames)\n        self.nf = nf\n        self.pre = ortho(nn.Conv2d(cin, HHID, 1), math.sqrt(2.0))\n        self.win = ortho(nn.Conv2d(HHID, nf * self.T, 2 * K - 1, padding=K - 1), 0.01)\n        self.mixw = nn.Parameter(torch.zeros(2 * nf))\n\n    def forward(self, h):\n        m = self.win(F.relu(self.pre(h)))\n        B, Y, X = m.shape[0], m.shape[2], m.shape[3]\n        m = m.reshape(B, self.nf, self.T, Y, X)\n        outs = []\n        for i, k in enumerate(self.frames):\n            mk = frame(m[:, i], k)\n            outs.append(mk.flatten(1))\n            outs.append(mk.permute(0, 2, 3, 1).flatten(1))\n        L = torch.stack(outs, 1)\n        a = torch.softmax(SCALE * self.mixw, dim=0)\n        return (L * a[None, :, None]).sum(1)\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.trunk = Trunk(spec)\n        self.head = WindowHead(WIDTH + SKIP, spec)\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * WIDTH, 64), math.sqrt(2.0)), nn.ReLU())\n        self.dense = ortho(nn.Linear(64, spec.n_place), 0.01)\n        self.done_head = ortho(nn.Linear(64, 1), 0.01)\n        self.value_head = ortho(nn.Linear(64, 1), 1.0)\n\n    def forward(self, obs, mask):\n        f, h = self.trunk(obs)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], dim=1))\n        place = self.head(h) + self.dense(g)\n        logits = torch.cat([place, self.done_head(g)], dim=1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 65746,
+    "fb_ms": 38.05,
+    "flops_per_sample": 16896768,
+    "flops_ratio": 0.92,
+    "sha": "bda8dfc654c1fe1f",
+    "recipe": {
+     "lr": 0.0015,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "ppo_epochs": 2,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "ent_coef": 0.005,
+     "lr": 0.0015
+    },
+    "budget": {
+     "allowed_steps": 243419,
+     "n_updates": 118,
+     "batch": 2048,
+     "steps": 241664,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0115
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 8
+    },
+    "rule": "rot270"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.4648,
+    "dev_per_seed": [
+     0.5215,
+     0.4082
+    ],
+    "train_exact": 0.4529,
+    "params": 65746,
+    "flops_ratio": 0.92,
+    "train_steps": 241664,
+    "wall_s": 81.4,
+    "sha": "bda8dfc654c1fe1f",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r1c3",
+   "round": 1,
+   "name": "Identity + transposed square heads",
+   "hypothesis": "Change: two frames, identity and transpose (identity and 180-degree rotation on non-square grids). Each frame has a 2x2 square conv anchored top-left, per-type 1x1 outputs and a zero-initialised type-mixing residual. A scale-5 softmax mixes the frames, and a dense term is added. Why: this head alone won the transpose world, where dihedral frames struggled, and it covers type swaps. Refuted if it scores 0 while candidates 1 or 2 score above 0, which would mean the mismatch is not a transpose.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {\"ppo_epochs\": 2, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 32, \"gamma\": 0.97, \"gae_lambda\": 0.95, \"ent_coef\": 0.005, \"lr\": 0.0015}\n\nWIDTH = 32\nSKIP = 16\nHHID = 32\nSCALE = 5.0\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    nn.init.zeros_(m.bias)\n    return m\n\n\ndef frame(x, k):\n    if k >= 4:\n        x = x.transpose(2, 3)\n    r = k % 4\n    if r == 1:\n        x = x.flip(3)\n    elif r == 2:\n        x = x.flip(2)\n    elif r == 3:\n        x = x.flip(2).flip(3)\n    return x\n\n\nclass Trunk(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        c = spec.in_channels\n        g = math.sqrt(2.0)\n        self.stem = nn.Sequential(ortho(nn.Conv2d(c, 64, 1), g), nn.ReLU(),\n                                  ortho(nn.Conv2d(64, 48, 1), g), nn.ReLU())\n        self.c1 = ortho(nn.Conv2d(48, WIDTH, 3, padding=1), g)\n        self.n1 = nn.GroupNorm(4, WIDTH)\n        self.c2 = ortho(nn.Conv2d(WIDTH, WIDTH, 3, padding=1), g)\n        self.n2 = nn.GroupNorm(4, WIDTH)\n        self.skip = ortho(nn.Conv2d(c, SKIP, 1), g)\n\n    def forward(self, obs):\n        s = self.stem(obs)\n        x = F.relu(self.n1(self.c1(s)))\n        f = F.relu(x + self.n2(self.c2(x)))\n        h = torch.cat([f, F.relu(self.skip(obs))], 1)\n        return f, h\n\n\nclass SquareHead(nn.Module):\n    def __init__(self, cin, spec):\n        super().__init__()\n        fps = [(int(a), int(b)) for a, b in spec.footprints]\n        self.T = len(fps)\n        self.K = max(max(a, b) for a, b in fps)\n        if int(spec.X) == int(spec.Y):\n            self.frames = [0, 4]\n        else:\n            self.frames = [0, 3]\n        nf = len(self.frames)\n        self.convs = nn.ModuleList([ortho(nn.Conv2d(cin, HHID, self.K), math.sqrt(2.0)) for _ in range(nf)])\n        self.outs = nn.ModuleList([ortho(nn.Conv2d(HHID, self.T, 1), 0.01) for _ in range(nf)])\n        self.tmix = nn.Parameter(torch.zeros(nf, self.T, self.T))\n        self.mixw = nn.Parameter(torch.zeros(nf))\n\n    def forward(self, h):\n        K = self.K\n        L = []\n        for i, k in enumerate(self.frames):\n            x = frame(h, k)\n            x = F.pad(x, (0, K - 1, 0, K - 1))\n            z = F.relu(self.convs[i](x))\n            o = self.outs[i](z)\n            o = o + torch.einsum('btyx,ts->bsyx', o, self.tmix[i])\n            L.append(o.flatten(1))\n        L = torch.stack(L, 1)\n        a = torch.softmax(SCALE * self.mixw, dim=0)\n        return (L * a[None, :, None]).sum(1)\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.trunk = Trunk(spec)\n        self.head = SquareHead(WIDTH + SKIP, spec)\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * WIDTH, 64), math.sqrt(2.0)), nn.ReLU())\n        self.dense = ortho(nn.Linear(64, spec.n_place), 0.01)\n        self.done_head = ortho(nn.Linear(64, 1), 0.01)\n        self.value_head = ortho(nn.Linear(64, 1), 1.0)\n\n    def forward(self, obs, mask):\n        f, h = self.trunk(obs)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], dim=1))\n        place = self.head(h) + self.dense(g)\n        logits = torch.cat([place, self.done_head(g)], dim=1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 62172,
+    "fb_ms": 42.97,
+    "flops_per_sample": 15532800,
+    "flops_ratio": 0.85,
+    "sha": "5aa362bf87f85abe",
+    "recipe": {
+     "lr": 0.0015,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "ppo_epochs": 2,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "ent_coef": 0.005,
+     "lr": 0.0015
+    },
+    "budget": {
+     "allowed_steps": 243419,
+     "n_updates": 118,
+     "batch": 2048,
+     "steps": 241664,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0126
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 8
+    },
+    "rule": "rot270"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0,
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 62172,
+    "flops_ratio": 0.85,
+    "train_steps": 241664,
+    "wall_s": 122.5,
+    "sha": "5aa362bf87f85abe",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r1c4",
+   "round": 1,
+   "name": "Per-type frame mixture, scale 2",
+   "hypothesis": "Change: the same pooling frame head as candidate 1, but with a [T, frames] softmax at scale 2, so each brick type picks its own frame and the choice hardens more slowly. Why: this won the world where scale-5 runs kept collapsing at 0.078 (0.94). It also allows a different frame per type. Refuted if both seeds sit at or below candidate 1, or if either seed collapses to about 0.078.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {\"ppo_epochs\": 2, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 32, \"gamma\": 0.97, \"gae_lambda\": 0.95, \"ent_coef\": 0.005, \"lr\": 0.0015}\n\nWIDTH = 32\nSKIP = 16\nPROJ = 16\nHID = 12\nSCALE = 2.0\nPER_TYPE = True\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    nn.init.zeros_(m.bias)\n    return m\n\n\ndef frame(x, k):\n    if k >= 4:\n        x = x.transpose(2, 3)\n    r = k % 4\n    if r == 1:\n        x = x.flip(3)\n    elif r == 2:\n        x = x.flip(2)\n    elif r == 3:\n        x = x.flip(2).flip(3)\n    return x\n\n\ndef frame_list(spec):\n    if int(spec.X) == int(spec.Y):\n        return list(range(8))\n    return [0, 1, 2, 3]\n\n\nclass Trunk(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        c = spec.in_channels\n        g = math.sqrt(2.0)\n        self.stem = nn.Sequential(ortho(nn.Conv2d(c, 64, 1), g), nn.ReLU(),\n                                  ortho(nn.Conv2d(64, 48, 1), g), nn.ReLU())\n        self.c1 = ortho(nn.Conv2d(48, WIDTH, 3, padding=1), g)\n        self.n1 = nn.GroupNorm(4, WIDTH)\n        self.c2 = ortho(nn.Conv2d(WIDTH, WIDTH, 3, padding=1), g)\n        self.n2 = nn.GroupNorm(4, WIDTH)\n        self.skip = ortho(nn.Conv2d(c, SKIP, 1), g)\n\n    def forward(self, obs):\n        s = self.stem(obs)\n        x = F.relu(self.n1(self.c1(s)))\n        f = F.relu(x + self.n2(self.c2(x)))\n        h = torch.cat([f, F.relu(self.skip(obs))], 1)\n        return f, h\n\n\nclass FrameHead(nn.Module):\n    def __init__(self, cin, spec):\n        super().__init__()\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        self.frames = frame_list(spec)\n        nf = len(self.frames)\n        T = len(self.fps)\n        self.nf = nf\n        self.T = T\n        self.proj = ortho(nn.Conv2d(cin, PROJ, 1), 1.0)\n        self.w1 = nn.Parameter(torch.randn(nf, T, 3 * PROJ, HID) * math.sqrt(2.0 / (3 * PROJ)))\n        self.b1 = nn.Parameter(torch.zeros(nf, T, HID))\n        self.w2 = nn.Parameter(torch.randn(nf, T, HID) * (0.01 / math.sqrt(HID)))\n        self.b2 = nn.Parameter(torch.zeros(nf, T))\n        if PER_TYPE:\n            self.mixw = nn.Parameter(torch.zeros(T, nf))\n        else:\n            self.mixw = nn.Parameter(torch.zeros(nf))\n\n    def forward(self, h):\n        p = self.proj(h)\n        B, P = p.shape[0], p.shape[1]\n        nf = self.nf\n        q = torch.cat([frame(p, k) for k in self.frames], 1)\n        Yp, Xp = q.shape[2], q.shape[3]\n        feats = []\n        for dy, dx in self.fps:\n            if dy * dx == 1:\n                mx, mn, av = q, q, q\n            else:\n                qq = F.pad(q, (0, dx - 1, 0, dy - 1))\n                mx = F.max_pool2d(qq, (dy, dx), stride=1)\n                mn = -F.max_pool2d(-qq, (dy, dx), stride=1)\n                av = F.avg_pool2d(qq, (dy, dx), stride=1)\n            z = torch.cat([mx.reshape(B, nf, P, Yp, Xp), mn.reshape(B, nf, P, Yp, Xp),\n                           av.reshape(B, nf, P, Yp, Xp)], 2)\n            feats.append(z)\n        z = torch.stack(feats, 2)\n        hid = torch.einsum('bftcyx,ftch->bfthyx', z, self.w1) + self.b1[None, :, :, :, None, None]\n        hid = F.relu(hid)\n        L = torch.einsum('bfthyx,fth->bftyx', hid, self.w2) + self.b2[None, :, :, None, None]\n        L = L.reshape(B, nf, self.T, Yp * Xp)\n        if PER_TYPE:\n            a = torch.softmax(SCALE * self.mixw, dim=1)\n            out = (L * a.t()[None, :, :, None]).sum(1)\n        else:\n            a = torch.softmax(SCALE * self.mixw, dim=0)\n            out = (L * a[None, :, None, None]).sum(1)\n        return out\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.trunk = Trunk(spec)\n        self.head = FrameHead(WIDTH + SKIP, spec)\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * WIDTH, 64), math.sqrt(2.0)), nn.ReLU())\n        self.tbias = ortho(nn.Linear(64, len(spec.footprints)), 0.01)\n        self.done_head = ortho(nn.Linear(64, 1), 0.01)\n        self.value_head = ortho(nn.Linear(64, 1), 1.0)\n\n    def forward(self, obs, mask):\n        f, h = self.trunk(obs)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], dim=1))\n        place = self.head(h) + self.tbias(g)[:, :, None]\n        logits = torch.cat([place.flatten(1), self.done_head(g)], dim=1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 53190,
+    "fb_ms": 138.08,
+    "flops_per_sample": 18127104,
+    "flops_ratio": 0.99,
+    "sha": "d61dbd8d788b9a8b",
+    "recipe": {
+     "lr": 0.0015,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "ppo_epochs": 2,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "ent_coef": 0.005,
+     "lr": 0.0015
+    },
+    "budget": {
+     "allowed_steps": 243419,
+     "n_updates": 118,
+     "batch": 2048,
+     "steps": 241664,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0204
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 8
+    },
+    "rule": "rot270"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.9502,
+    "dev_per_seed": [
+     0.9531,
+     0.9473
+    ],
+    "train_exact": 0.9195,
+    "params": 53190,
+    "flops_ratio": 0.99,
+    "train_steps": 241664,
+    "wall_s": 206.9,
+    "sha": "d61dbd8d788b9a8b",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r2c1",
+   "round": 2,
+   "name": "Per-type frames, lr 2.5e-3",
+   "hypothesis": "Change: same per-type scale-2 frame head as r1c4, with lr 2.5e-3 instead of 1.5e-3. Why: training (0.92) still trails dev, and runs look sample-limited at 118 updates, so faster learning may close the gap. A 3e-3 lr was best in two earlier worlds. Refuted if the mean falls below 0.95 or either seed collapses to about 0.078.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {\"ppo_epochs\": 2, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 32, \"gamma\": 0.97, \"gae_lambda\": 0.95, \"ent_coef\": 0.005, \"lr\": 0.0025}\n\nWIDTH = 32\nSKIP = 16\nPROJ = 16\nHID = 12\nSCALE = 2.0\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    nn.init.zeros_(m.bias)\n    return m\n\n\ndef frame(x, k):\n    if k >= 4:\n        x = x.transpose(2, 3)\n    r = k % 4\n    if r == 1:\n        x = x.flip(3)\n    elif r == 2:\n        x = x.flip(2)\n    elif r == 3:\n        x = x.flip(2).flip(3)\n    return x\n\n\ndef frame_list(spec):\n    if int(spec.X) == int(spec.Y):\n        return list(range(8))\n    return [0, 1, 2, 3]\n\n\nclass Trunk(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        c = spec.in_channels\n        g = math.sqrt(2.0)\n        self.stem = nn.Sequential(ortho(nn.Conv2d(c, 64, 1), g), nn.ReLU(),\n                                  ortho(nn.Conv2d(64, 48, 1), g), nn.ReLU())\n        self.c1 = ortho(nn.Conv2d(48, WIDTH, 3, padding=1), g)\n        self.n1 = nn.GroupNorm(4, WIDTH)\n        self.c2 = ortho(nn.Conv2d(WIDTH, WIDTH, 3, padding=1), g)\n        self.n2 = nn.GroupNorm(4, WIDTH)\n        self.skip = ortho(nn.Conv2d(c, SKIP, 1), g)\n\n    def forward(self, obs):\n        s = self.stem(obs)\n        x = F.relu(self.n1(self.c1(s)))\n        f = F.relu(x + self.n2(self.c2(x)))\n        h = torch.cat([f, F.relu(self.skip(obs))], 1)\n        return f, h\n\n\nclass FrameHead(nn.Module):\n    def __init__(self, cin, spec):\n        super().__init__()\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        self.frames = frame_list(spec)\n        nf = len(self.frames)\n        T = len(self.fps)\n        self.nf = nf\n        self.T = T\n        self.proj = ortho(nn.Conv2d(cin, PROJ, 1), 1.0)\n        self.w1 = nn.Parameter(torch.randn(nf, T, 3 * PROJ, HID) * math.sqrt(2.0 / (3 * PROJ)))\n        self.b1 = nn.Parameter(torch.zeros(nf, T, HID))\n        self.w2 = nn.Parameter(torch.randn(nf, T, HID) * (0.01 / math.sqrt(HID)))\n        self.b2 = nn.Parameter(torch.zeros(nf, T))\n        self.mixw = nn.Parameter(torch.zeros(T, nf))\n\n    def forward(self, h):\n        p = self.proj(h)\n        B, P = p.shape[0], p.shape[1]\n        nf = self.nf\n        q = torch.cat([frame(p, k) for k in self.frames], 1)\n        Yp, Xp = q.shape[2], q.shape[3]\n        feats = []\n        for dy, dx in self.fps:\n            if dy * dx == 1:\n                mx, mn, av = q, q, q\n            else:\n                qq = F.pad(q, (0, dx - 1, 0, dy - 1))\n                mx = F.max_pool2d(qq, (dy, dx), stride=1)\n                mn = -F.max_pool2d(-qq, (dy, dx), stride=1)\n                av = F.avg_pool2d(qq, (dy, dx), stride=1)\n            z = torch.cat([mx.reshape(B, nf, P, Yp, Xp), mn.reshape(B, nf, P, Yp, Xp),\n                           av.reshape(B, nf, P, Yp, Xp)], 2)\n            feats.append(z)\n        z = torch.stack(feats, 2)\n        hid = torch.einsum('bftcyx,ftch->bfthyx', z, self.w1) + self.b1[None, :, :, :, None, None]\n        hid = F.relu(hid)\n        L = torch.einsum('bfthyx,fth->bftyx', hid, self.w2) + self.b2[None, :, :, None, None]\n        L = L.reshape(B, nf, self.T, Yp * Xp)\n        a = torch.softmax(SCALE * self.mixw, dim=1)\n        return (L * a.t()[None, :, :, None]).sum(1)\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.trunk = Trunk(spec)\n        self.head = FrameHead(WIDTH + SKIP, spec)\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * WIDTH, 64), math.sqrt(2.0)), nn.ReLU())\n        self.tbias = ortho(nn.Linear(64, len(spec.footprints)), 0.01)\n        self.done_head = ortho(nn.Linear(64, 1), 0.01)\n        self.value_head = ortho(nn.Linear(64, 1), 1.0)\n\n    def forward(self, obs, mask):\n        f, h = self.trunk(obs)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], dim=1))\n        place = self.head(h) + self.tbias(g)[:, :, None]\n        logits = torch.cat([place.flatten(1), self.done_head(g)], dim=1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 53190,
+    "fb_ms": 129.11,
+    "flops_per_sample": 18127104,
+    "flops_ratio": 0.99,
+    "sha": "0d21a2f07442de13",
+    "recipe": {
+     "lr": 0.0025,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "ppo_epochs": 2,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "ent_coef": 0.005,
+     "lr": 0.0025
+    },
+    "budget": {
+     "allowed_steps": 243419,
+     "n_updates": 118,
+     "batch": 2048,
+     "steps": 241664,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0204
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 8
+    },
+    "rule": "rot270"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.9688,
+    "dev_per_seed": [
+     0.959,
+     0.9785
+    ],
+    "train_exact": 0.9306,
+    "params": 53190,
+    "flops_ratio": 0.99,
+    "train_steps": 241664,
+    "wall_s": 237.2,
+    "sha": "0d21a2f07442de13",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r2c2",
+   "round": 2,
+   "name": "Per-type frames, 16 minibatches",
+   "hypothesis": "Change: r1c4 with 16 minibatches instead of 32, giving larger, lower-noise gradient steps and half as many updates per epoch. Why: fewer noisy steps may cut the gap between seeds and stabilise the late stage of training. Refuted if the mean falls below 0.95 or the minimum seed falls below r1c4's 0.947.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {\"ppo_epochs\": 2, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 16, \"gamma\": 0.97, \"gae_lambda\": 0.95, \"ent_coef\": 0.005, \"lr\": 0.0015}\n\nWIDTH = 32\nSKIP = 16\nPROJ = 16\nHID = 12\nSCALE = 2.0\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    nn.init.zeros_(m.bias)\n    return m\n\n\ndef frame(x, k):\n    if k >= 4:\n        x = x.transpose(2, 3)\n    r = k % 4\n    if r == 1:\n        x = x.flip(3)\n    elif r == 2:\n        x = x.flip(2)\n    elif r == 3:\n        x = x.flip(2).flip(3)\n    return x\n\n\ndef frame_list(spec):\n    if int(spec.X) == int(spec.Y):\n        return list(range(8))\n    return [0, 1, 2, 3]\n\n\nclass Trunk(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        c = spec.in_channels\n        g = math.sqrt(2.0)\n        self.stem = nn.Sequential(ortho(nn.Conv2d(c, 64, 1), g), nn.ReLU(),\n                                  ortho(nn.Conv2d(64, 48, 1), g), nn.ReLU())\n        self.c1 = ortho(nn.Conv2d(48, WIDTH, 3, padding=1), g)\n        self.n1 = nn.GroupNorm(4, WIDTH)\n        self.c2 = ortho(nn.Conv2d(WIDTH, WIDTH, 3, padding=1), g)\n        self.n2 = nn.GroupNorm(4, WIDTH)\n        self.skip = ortho(nn.Conv2d(c, SKIP, 1), g)\n\n    def forward(self, obs):\n        s = self.stem(obs)\n        x = F.relu(self.n1(self.c1(s)))\n        f = F.relu(x + self.n2(self.c2(x)))\n        h = torch.cat([f, F.relu(self.skip(obs))], 1)\n        return f, h\n\n\nclass FrameHead(nn.Module):\n    def __init__(self, cin, spec):\n        super().__init__()\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        self.frames = frame_list(spec)\n        nf = len(self.frames)\n        T = len(self.fps)\n        self.nf = nf\n        self.T = T\n        self.proj = ortho(nn.Conv2d(cin, PROJ, 1), 1.0)\n        self.w1 = nn.Parameter(torch.randn(nf, T, 3 * PROJ, HID) * math.sqrt(2.0 / (3 * PROJ)))\n        self.b1 = nn.Parameter(torch.zeros(nf, T, HID))\n        self.w2 = nn.Parameter(torch.randn(nf, T, HID) * (0.01 / math.sqrt(HID)))\n        self.b2 = nn.Parameter(torch.zeros(nf, T))\n        self.mixw = nn.Parameter(torch.zeros(T, nf))\n\n    def forward(self, h):\n        p = self.proj(h)\n        B, P = p.shape[0], p.shape[1]\n        nf = self.nf\n        q = torch.cat([frame(p, k) for k in self.frames], 1)\n        Yp, Xp = q.shape[2], q.shape[3]\n        feats = []\n        for dy, dx in self.fps:\n            if dy * dx == 1:\n                mx, mn, av = q, q, q\n            else:\n                qq = F.pad(q, (0, dx - 1, 0, dy - 1))\n                mx = F.max_pool2d(qq, (dy, dx), stride=1)\n                mn = -F.max_pool2d(-qq, (dy, dx), stride=1)\n                av = F.avg_pool2d(qq, (dy, dx), stride=1)\n            z = torch.cat([mx.reshape(B, nf, P, Yp, Xp), mn.reshape(B, nf, P, Yp, Xp),\n                           av.reshape(B, nf, P, Yp, Xp)], 2)\n            feats.append(z)\n        z = torch.stack(feats, 2)\n        hid = torch.einsum('bftcyx,ftch->bfthyx', z, self.w1) + self.b1[None, :, :, :, None, None]\n        hid = F.relu(hid)\n        L = torch.einsum('bfthyx,fth->bftyx', hid, self.w2) + self.b2[None, :, :, None, None]\n        L = L.reshape(B, nf, self.T, Yp * Xp)\n        a = torch.softmax(SCALE * self.mixw, dim=1)\n        return (L * a.t()[None, :, :, None]).sum(1)\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.trunk = Trunk(spec)\n        self.head = FrameHead(WIDTH + SKIP, spec)\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * WIDTH, 64), math.sqrt(2.0)), nn.ReLU())\n        self.tbias = ortho(nn.Linear(64, len(spec.footprints)), 0.01)\n        self.done_head = ortho(nn.Linear(64, 1), 0.01)\n        self.value_head = ortho(nn.Linear(64, 1), 1.0)\n\n    def forward(self, obs, mask):\n        f, h = self.trunk(obs)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], dim=1))\n        place = self.head(h) + self.tbias(g)[:, :, None]\n        logits = torch.cat([place.flatten(1), self.done_head(g)], dim=1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 53190,
+    "fb_ms": 129.03,
+    "flops_per_sample": 18127104,
+    "flops_ratio": 0.99,
+    "sha": "f8ef139b09d1ace6",
+    "recipe": {
+     "lr": 0.0015,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 16,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "ppo_epochs": 2,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 16,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "ent_coef": 0.005,
+     "lr": 0.0015
+    },
+    "budget": {
+     "allowed_steps": 243419,
+     "n_updates": 118,
+     "batch": 2048,
+     "steps": 241664,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0204
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 8
+    },
+    "rule": "rot270"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.7061,
+    "dev_per_seed": [
+     0.9297,
+     0.4824
+    ],
+    "train_exact": 0.6814,
+    "params": 53190,
+    "flops_ratio": 0.99,
+    "train_steps": 241664,
+    "wall_s": 216.4,
+    "sha": "f8ef139b09d1ace6",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r2c3",
+   "round": 2,
+   "name": "Per-type frames, 3 epochs lr 3e-3",
+   "hypothesis": "Change: r1c4 trained with 3 PPO epochs at lr 3e-3, which leaves about 170k samples instead of 242k. Why: this recipe won one earlier world, and getting more out of each sample may beat having more samples. Refuted if the mean falls below 0.95 or either seed collapses to about 0.078, which would show that a high lr with more epochs is unstable here.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {\"ppo_epochs\": 3, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 32, \"gamma\": 0.97, \"gae_lambda\": 0.95, \"ent_coef\": 0.005, \"lr\": 0.003}\n\nWIDTH = 32\nSKIP = 16\nPROJ = 16\nHID = 12\nSCALE = 2.0\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    nn.init.zeros_(m.bias)\n    return m\n\n\ndef frame(x, k):\n    if k >= 4:\n        x = x.transpose(2, 3)\n    r = k % 4\n    if r == 1:\n        x = x.flip(3)\n    elif r == 2:\n        x = x.flip(2)\n    elif r == 3:\n        x = x.flip(2).flip(3)\n    return x\n\n\ndef frame_list(spec):\n    if int(spec.X) == int(spec.Y):\n        return list(range(8))\n    return [0, 1, 2, 3]\n\n\nclass Trunk(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        c = spec.in_channels\n        g = math.sqrt(2.0)\n        self.stem = nn.Sequential(ortho(nn.Conv2d(c, 64, 1), g), nn.ReLU(),\n                                  ortho(nn.Conv2d(64, 48, 1), g), nn.ReLU())\n        self.c1 = ortho(nn.Conv2d(48, WIDTH, 3, padding=1), g)\n        self.n1 = nn.GroupNorm(4, WIDTH)\n        self.c2 = ortho(nn.Conv2d(WIDTH, WIDTH, 3, padding=1), g)\n        self.n2 = nn.GroupNorm(4, WIDTH)\n        self.skip = ortho(nn.Conv2d(c, SKIP, 1), g)\n\n    def forward(self, obs):\n        s = self.stem(obs)\n        x = F.relu(self.n1(self.c1(s)))\n        f = F.relu(x + self.n2(self.c2(x)))\n        h = torch.cat([f, F.relu(self.skip(obs))], 1)\n        return f, h\n\n\nclass FrameHead(nn.Module):\n    def __init__(self, cin, spec):\n        super().__init__()\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        self.frames = frame_list(spec)\n        nf = len(self.frames)\n        T = len(self.fps)\n        self.nf = nf\n        self.T = T\n        self.proj = ortho(nn.Conv2d(cin, PROJ, 1), 1.0)\n        self.w1 = nn.Parameter(torch.randn(nf, T, 3 * PROJ, HID) * math.sqrt(2.0 / (3 * PROJ)))\n        self.b1 = nn.Parameter(torch.zeros(nf, T, HID))\n        self.w2 = nn.Parameter(torch.randn(nf, T, HID) * (0.01 / math.sqrt(HID)))\n        self.b2 = nn.Parameter(torch.zeros(nf, T))\n        self.mixw = nn.Parameter(torch.zeros(T, nf))\n\n    def forward(self, h):\n        p = self.proj(h)\n        B, P = p.shape[0], p.shape[1]\n        nf = self.nf\n        q = torch.cat([frame(p, k) for k in self.frames], 1)\n        Yp, Xp = q.shape[2], q.shape[3]\n        feats = []\n        for dy, dx in self.fps:\n            if dy * dx == 1:\n                mx, mn, av = q, q, q\n            else:\n                qq = F.pad(q, (0, dx - 1, 0, dy - 1))\n                mx = F.max_pool2d(qq, (dy, dx), stride=1)\n                mn = -F.max_pool2d(-qq, (dy, dx), stride=1)\n                av = F.avg_pool2d(qq, (dy, dx), stride=1)\n            z = torch.cat([mx.reshape(B, nf, P, Yp, Xp), mn.reshape(B, nf, P, Yp, Xp),\n                           av.reshape(B, nf, P, Yp, Xp)], 2)\n            feats.append(z)\n        z = torch.stack(feats, 2)\n        hid = torch.einsum('bftcyx,ftch->bfthyx', z, self.w1) + self.b1[None, :, :, :, None, None]\n        hid = F.relu(hid)\n        L = torch.einsum('bfthyx,fth->bftyx', hid, self.w2) + self.b2[None, :, :, None, None]\n        L = L.reshape(B, nf, self.T, Yp * Xp)\n        a = torch.softmax(SCALE * self.mixw, dim=1)\n        return (L * a.t()[None, :, :, None]).sum(1)\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.trunk = Trunk(spec)\n        self.head = FrameHead(WIDTH + SKIP, spec)\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * WIDTH, 64), math.sqrt(2.0)), nn.ReLU())\n        self.tbias = ortho(nn.Linear(64, len(spec.footprints)), 0.01)\n        self.done_head = ortho(nn.Linear(64, 1), 0.01)\n        self.value_head = ortho(nn.Linear(64, 1), 1.0)\n\n    def forward(self, obs, mask):\n        f, h = self.trunk(obs)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], dim=1))\n        place = self.head(h) + self.tbias(g)[:, :, None]\n        logits = torch.cat([place.flatten(1), self.done_head(g)], dim=1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 53190,
+    "fb_ms": 125.53,
+    "flops_per_sample": 18127104,
+    "flops_ratio": 0.99,
+    "sha": "dae7e71ef57bc745",
+    "recipe": {
+     "lr": 0.003,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "ppo_epochs": 3,
+     "ent_coef": 0.005,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "ppo_epochs": 3,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "ent_coef": 0.005,
+     "lr": 0.003
+    },
+    "budget": {
+     "allowed_steps": 170393,
+     "n_updates": 83,
+     "batch": 2048,
+     "steps": 169984,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0204
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 8
+    },
+    "rule": "rot270"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.9473,
+    "dev_per_seed": [
+     0.9453,
+     0.9492
+    ],
+    "train_exact": 0.9127,
+    "params": 53190,
+    "flops_ratio": 0.99,
+    "train_steps": 169984,
+    "wall_s": 253.6,
+    "sha": "dae7e71ef57bc745",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r2c4",
+   "round": 2,
+   "name": "Per-type frames, lr 1e-3",
+   "hypothesis": "Change: r1c4 with lr 1e-3 instead of 1.5e-3. Why: lr 1e-3 was best in two earlier worlds and should reduce the risk of collapse across seeds. Paired with the 2.5e-3 candidate, it shows which direction this world prefers. Refuted if the mean falls below 0.93, which would mean that learning too slowly within the fixed sample budget costs more than the extra stability gains.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {\"ppo_epochs\": 2, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 32, \"gamma\": 0.97, \"gae_lambda\": 0.95, \"ent_coef\": 0.005, \"lr\": 0.001}\n\nWIDTH = 32\nSKIP = 16\nPROJ = 16\nHID = 12\nSCALE = 2.0\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    nn.init.zeros_(m.bias)\n    return m\n\n\ndef frame(x, k):\n    if k >= 4:\n        x = x.transpose(2, 3)\n    r = k % 4\n    if r == 1:\n        x = x.flip(3)\n    elif r == 2:\n        x = x.flip(2)\n    elif r == 3:\n        x = x.flip(2).flip(3)\n    return x\n\n\ndef frame_list(spec):\n    if int(spec.X) == int(spec.Y):\n        return list(range(8))\n    return [0, 1, 2, 3]\n\n\nclass Trunk(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        c = spec.in_channels\n        g = math.sqrt(2.0)\n        self.stem = nn.Sequential(ortho(nn.Conv2d(c, 64, 1), g), nn.ReLU(),\n                                  ortho(nn.Conv2d(64, 48, 1), g), nn.ReLU())\n        self.c1 = ortho(nn.Conv2d(48, WIDTH, 3, padding=1), g)\n        self.n1 = nn.GroupNorm(4, WIDTH)\n        self.c2 = ortho(nn.Conv2d(WIDTH, WIDTH, 3, padding=1), g)\n        self.n2 = nn.GroupNorm(4, WIDTH)\n        self.skip = ortho(nn.Conv2d(c, SKIP, 1), g)\n\n    def forward(self, obs):\n        s = self.stem(obs)\n        x = F.relu(self.n1(self.c1(s)))\n        f = F.relu(x + self.n2(self.c2(x)))\n        h = torch.cat([f, F.relu(self.skip(obs))], 1)\n        return f, h\n\n\nclass FrameHead(nn.Module):\n    def __init__(self, cin, spec):\n        super().__init__()\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        self.frames = frame_list(spec)\n        nf = len(self.frames)\n        T = len(self.fps)\n        self.nf = nf\n        self.T = T\n        self.proj = ortho(nn.Conv2d(cin, PROJ, 1), 1.0)\n        self.w1 = nn.Parameter(torch.randn(nf, T, 3 * PROJ, HID) * math.sqrt(2.0 / (3 * PROJ)))\n        self.b1 = nn.Parameter(torch.zeros(nf, T, HID))\n        self.w2 = nn.Parameter(torch.randn(nf, T, HID) * (0.01 / math.sqrt(HID)))\n        self.b2 = nn.Parameter(torch.zeros(nf, T))\n        self.mixw = nn.Parameter(torch.zeros(T, nf))\n\n    def forward(self, h):\n        p = self.proj(h)\n        B, P = p.shape[0], p.shape[1]\n        nf = self.nf\n        q = torch.cat([frame(p, k) for k in self.frames], 1)\n        Yp, Xp = q.shape[2], q.shape[3]\n        feats = []\n        for dy, dx in self.fps:\n            if dy * dx == 1:\n                mx, mn, av = q, q, q\n            else:\n                qq = F.pad(q, (0, dx - 1, 0, dy - 1))\n                mx = F.max_pool2d(qq, (dy, dx), stride=1)\n                mn = -F.max_pool2d(-qq, (dy, dx), stride=1)\n                av = F.avg_pool2d(qq, (dy, dx), stride=1)\n            z = torch.cat([mx.reshape(B, nf, P, Yp, Xp), mn.reshape(B, nf, P, Yp, Xp),\n                           av.reshape(B, nf, P, Yp, Xp)], 2)\n            feats.append(z)\n        z = torch.stack(feats, 2)\n        hid = torch.einsum('bftcyx,ftch->bfthyx', z, self.w1) + self.b1[None, :, :, :, None, None]\n        hid = F.relu(hid)\n        L = torch.einsum('bfthyx,fth->bftyx', hid, self.w2) + self.b2[None, :, :, None, None]\n        L = L.reshape(B, nf, self.T, Yp * Xp)\n        a = torch.softmax(SCALE * self.mixw, dim=1)\n        return (L * a.t()[None, :, :, None]).sum(1)\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.trunk = Trunk(spec)\n        self.head = FrameHead(WIDTH + SKIP, spec)\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * WIDTH, 64), math.sqrt(2.0)), nn.ReLU())\n        self.tbias = ortho(nn.Linear(64, len(spec.footprints)), 0.01)\n        self.done_head = ortho(nn.Linear(64, 1), 0.01)\n        self.value_head = ortho(nn.Linear(64, 1), 1.0)\n\n    def forward(self, obs, mask):\n        f, h = self.trunk(obs)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], dim=1))\n        place = self.head(h) + self.tbias(g)[:, :, None]\n        logits = torch.cat([place.flatten(1), self.done_head(g)], dim=1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 53190,
+    "fb_ms": 128.91,
+    "flops_per_sample": 18127104,
+    "flops_ratio": 0.99,
+    "sha": "a7be81b0b72c1695",
+    "recipe": {
+     "lr": 0.001,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "ppo_epochs": 2,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "ent_coef": 0.005,
+     "lr": 0.001
+    },
+    "budget": {
+     "allowed_steps": 243419,
+     "n_updates": 118,
+     "batch": 2048,
+     "steps": 241664,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0204
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 8
+    },
+    "rule": "rot270"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.9111,
+    "dev_per_seed": [
+     0.916,
+     0.9062
+    ],
+    "train_exact": 0.876,
+    "params": 53190,
+    "flops_ratio": 0.99,
+    "train_steps": 241664,
+    "wall_s": 231.3,
+    "sha": "a7be81b0b72c1695",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r3c1",
+   "round": 3,
+   "name": "Per-type frames, lr 3e-3",
+   "hypothesis": "Change: r2c1 with lr 3e-3. Why: raising lr from 1e-3 to 1.5e-3 to 2.5e-3 raised the score steadily (0.91, 0.95, 0.97), with no collapse. Runs look sample-limited, so faster learning may finish the last 3%. Refuted if the mean falls below 0.969 or either seed falls below 0.95 or collapses to 0.078.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {\"ppo_epochs\": 2, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 32, \"gamma\": 0.97, \"gae_lambda\": 0.95, \"ent_coef\": 0.005, \"lr\": 0.003}\n\nWIDTH = 32\nSKIP = 16\nPROJ = 16\nHID = 12\nSCALE = 2.0\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    nn.init.zeros_(m.bias)\n    return m\n\n\ndef frame(x, k):\n    if k >= 4:\n        x = x.transpose(2, 3)\n    r = k % 4\n    if r == 1:\n        x = x.flip(3)\n    elif r == 2:\n        x = x.flip(2)\n    elif r == 3:\n        x = x.flip(2).flip(3)\n    return x\n\n\ndef frame_list(spec):\n    if int(spec.X) == int(spec.Y):\n        return list(range(8))\n    return [0, 1, 2, 3]\n\n\nclass Trunk(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        c = spec.in_channels\n        g = math.sqrt(2.0)\n        self.stem = nn.Sequential(ortho(nn.Conv2d(c, 64, 1), g), nn.ReLU(),\n                                  ortho(nn.Conv2d(64, 48, 1), g), nn.ReLU())\n        self.c1 = ortho(nn.Conv2d(48, WIDTH, 3, padding=1), g)\n        self.n1 = nn.GroupNorm(4, WIDTH)\n        self.c2 = ortho(nn.Conv2d(WIDTH, WIDTH, 3, padding=1), g)\n        self.n2 = nn.GroupNorm(4, WIDTH)\n        self.skip = ortho(nn.Conv2d(c, SKIP, 1), g)\n\n    def forward(self, obs):\n        s = self.stem(obs)\n        x = F.relu(self.n1(self.c1(s)))\n        f = F.relu(x + self.n2(self.c2(x)))\n        h = torch.cat([f, F.relu(self.skip(obs))], 1)\n        return f, h\n\n\nclass FrameHead(nn.Module):\n    def __init__(self, cin, spec):\n        super().__init__()\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        self.frames = frame_list(spec)\n        nf = len(self.frames)\n        T = len(self.fps)\n        self.nf = nf\n        self.T = T\n        self.proj = ortho(nn.Conv2d(cin, PROJ, 1), 1.0)\n        self.w1 = nn.Parameter(torch.randn(nf, T, 3 * PROJ, HID) * math.sqrt(2.0 / (3 * PROJ)))\n        self.b1 = nn.Parameter(torch.zeros(nf, T, HID))\n        self.w2 = nn.Parameter(torch.randn(nf, T, HID) * (0.01 / math.sqrt(HID)))\n        self.b2 = nn.Parameter(torch.zeros(nf, T))\n        self.mixw = nn.Parameter(torch.zeros(T, nf))\n\n    def forward(self, h):\n        p = self.proj(h)\n        B, P = p.shape[0], p.shape[1]\n        nf = self.nf\n        q = torch.cat([frame(p, k) for k in self.frames], 1)\n        Yp, Xp = q.shape[2], q.shape[3]\n        feats = []\n        for dy, dx in self.fps:\n            if dy * dx == 1:\n                mx, mn, av = q, q, q\n            else:\n                qq = F.pad(q, (0, dx - 1, 0, dy - 1))\n                mx = F.max_pool2d(qq, (dy, dx), stride=1)\n                mn = -F.max_pool2d(-qq, (dy, dx), stride=1)\n                av = F.avg_pool2d(qq, (dy, dx), stride=1)\n            z = torch.cat([mx.reshape(B, nf, P, Yp, Xp), mn.reshape(B, nf, P, Yp, Xp),\n                           av.reshape(B, nf, P, Yp, Xp)], 2)\n            feats.append(z)\n        z = torch.stack(feats, 2)\n        hid = torch.einsum('bftcyx,ftch->bfthyx', z, self.w1) + self.b1[None, :, :, :, None, None]\n        hid = F.relu(hid)\n        L = torch.einsum('bfthyx,fth->bftyx', hid, self.w2) + self.b2[None, :, :, None, None]\n        L = L.reshape(B, nf, self.T, Yp * Xp)\n        a = torch.softmax(SCALE * self.mixw, dim=1)\n        return (L * a.t()[None, :, :, None]).sum(1)\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.trunk = Trunk(spec)\n        self.head = FrameHead(WIDTH + SKIP, spec)\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * WIDTH, 64), math.sqrt(2.0)), nn.ReLU())\n        self.tbias = ortho(nn.Linear(64, len(spec.footprints)), 0.01)\n        self.done_head = ortho(nn.Linear(64, 1), 0.01)\n        self.value_head = ortho(nn.Linear(64, 1), 1.0)\n\n    def forward(self, obs, mask):\n        f, h = self.trunk(obs)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], dim=1))\n        place = self.head(h) + self.tbias(g)[:, :, None]\n        logits = torch.cat([place.flatten(1), self.done_head(g)], dim=1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 53190,
+    "fb_ms": 118.91,
+    "flops_per_sample": 18127104,
+    "flops_ratio": 0.99,
+    "sha": "7e22393bc71f047d",
+    "recipe": {
+     "lr": 0.003,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "ppo_epochs": 2,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "ent_coef": 0.005,
+     "lr": 0.003
+    },
+    "budget": {
+     "allowed_steps": 243419,
+     "n_updates": 118,
+     "batch": 2048,
+     "steps": 241664,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0204
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 8
+    },
+    "rule": "rot270"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.3193,
+    "dev_per_seed": [
+     0.4824,
+     0.1562
+    ],
+    "train_exact": 0.327,
+    "params": 53190,
+    "flops_ratio": 0.99,
+    "train_steps": 241664,
+    "wall_s": 228.6,
+    "sha": "7e22393bc71f047d",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r3c2",
+   "round": 3,
+   "name": "Global scale-5 frames, lr 2.5e-3",
+   "hypothesis": "Change: the r1c1 head (one global 8-frame softmax at scale 5) with lr 2.5e-3. Why: r1c1 matched r1c4 at lr 1.5e-3 and had the highest single seed (0.971). If lr 2.5e-3 helps it as it helped the per-type head, it may beat 0.969. Refuted if the mean is at or below 0.969, or a seed collapses, which would show the scale-5 global mixture is less robust at high lr.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {\"ppo_epochs\": 2, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 32, \"gamma\": 0.97, \"gae_lambda\": 0.95, \"ent_coef\": 0.005, \"lr\": 0.0025}\n\nWIDTH = 32\nSKIP = 16\nPROJ = 16\nHID = 12\nSCALE = 5.0\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    nn.init.zeros_(m.bias)\n    return m\n\n\ndef frame(x, k):\n    if k >= 4:\n        x = x.transpose(2, 3)\n    r = k % 4\n    if r == 1:\n        x = x.flip(3)\n    elif r == 2:\n        x = x.flip(2)\n    elif r == 3:\n        x = x.flip(2).flip(3)\n    return x\n\n\ndef frame_list(spec):\n    if int(spec.X) == int(spec.Y):\n        return list(range(8))\n    return [0, 1, 2, 3]\n\n\nclass Trunk(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        c = spec.in_channels\n        g = math.sqrt(2.0)\n        self.stem = nn.Sequential(ortho(nn.Conv2d(c, 64, 1), g), nn.ReLU(),\n                                  ortho(nn.Conv2d(64, 48, 1), g), nn.ReLU())\n        self.c1 = ortho(nn.Conv2d(48, WIDTH, 3, padding=1), g)\n        self.n1 = nn.GroupNorm(4, WIDTH)\n        self.c2 = ortho(nn.Conv2d(WIDTH, WIDTH, 3, padding=1), g)\n        self.n2 = nn.GroupNorm(4, WIDTH)\n        self.skip = ortho(nn.Conv2d(c, SKIP, 1), g)\n\n    def forward(self, obs):\n        s = self.stem(obs)\n        x = F.relu(self.n1(self.c1(s)))\n        f = F.relu(x + self.n2(self.c2(x)))\n        h = torch.cat([f, F.relu(self.skip(obs))], 1)\n        return f, h\n\n\nclass FrameHead(nn.Module):\n    def __init__(self, cin, spec):\n        super().__init__()\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        self.frames = frame_list(spec)\n        nf = len(self.frames)\n        T = len(self.fps)\n        self.nf = nf\n        self.T = T\n        self.proj = ortho(nn.Conv2d(cin, PROJ, 1), 1.0)\n        self.w1 = nn.Parameter(torch.randn(nf, T, 3 * PROJ, HID) * math.sqrt(2.0 / (3 * PROJ)))\n        self.b1 = nn.Parameter(torch.zeros(nf, T, HID))\n        self.w2 = nn.Parameter(torch.randn(nf, T, HID) * (0.01 / math.sqrt(HID)))\n        self.b2 = nn.Parameter(torch.zeros(nf, T))\n        self.mixw = nn.Parameter(torch.zeros(nf))\n\n    def forward(self, h):\n        p = self.proj(h)\n        B, P = p.shape[0], p.shape[1]\n        nf = self.nf\n        q = torch.cat([frame(p, k) for k in self.frames], 1)\n        Yp, Xp = q.shape[2], q.shape[3]\n        feats = []\n        for dy, dx in self.fps:\n            if dy * dx == 1:\n                mx, mn, av = q, q, q\n            else:\n                qq = F.pad(q, (0, dx - 1, 0, dy - 1))\n                mx = F.max_pool2d(qq, (dy, dx), stride=1)\n                mn = -F.max_pool2d(-qq, (dy, dx), stride=1)\n                av = F.avg_pool2d(qq, (dy, dx), stride=1)\n            z = torch.cat([mx.reshape(B, nf, P, Yp, Xp), mn.reshape(B, nf, P, Yp, Xp),\n                           av.reshape(B, nf, P, Yp, Xp)], 2)\n            feats.append(z)\n        z = torch.stack(feats, 2)\n        hid = torch.einsum('bftcyx,ftch->bfthyx', z, self.w1) + self.b1[None, :, :, :, None, None]\n        hid = F.relu(hid)\n        L = torch.einsum('bfthyx,fth->bftyx', hid, self.w2) + self.b2[None, :, :, None, None]\n        L = L.reshape(B, nf, self.T, Yp * Xp)\n        a = torch.softmax(SCALE * self.mixw, dim=0)\n        return (L * a[None, :, None, None]).sum(1)\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.trunk = Trunk(spec)\n        self.head = FrameHead(WIDTH + SKIP, spec)\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * WIDTH, 64), math.sqrt(2.0)), nn.ReLU())\n        self.tbias = ortho(nn.Linear(64, len(spec.footprints)), 0.01)\n        self.done_head = ortho(nn.Linear(64, 1), 0.01)\n        self.value_head = ortho(nn.Linear(64, 1), 1.0)\n\n    def forward(self, obs, mask):\n        f, h = self.trunk(obs)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], dim=1))\n        place = self.head(h) + self.tbias(g)[:, :, None]\n        logits = torch.cat([place.flatten(1), self.done_head(g)], dim=1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 53166,
+    "fb_ms": 117.99,
+    "flops_per_sample": 18127104,
+    "flops_ratio": 0.99,
+    "sha": "e7d48f286e67fc0f",
+    "recipe": {
+     "lr": 0.0025,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "ppo_epochs": 2,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "ent_coef": 0.005,
+     "lr": 0.0025
+    },
+    "budget": {
+     "allowed_steps": 243419,
+     "n_updates": 118,
+     "batch": 2048,
+     "steps": 241664,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0204
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 8
+    },
+    "rule": "rot270"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.9707,
+    "dev_per_seed": [
+     0.9805,
+     0.9609
+    ],
+    "train_exact": 0.9289,
+    "params": 53166,
+    "flops_ratio": 0.99,
+    "train_steps": 241664,
+    "wall_s": 228.8,
+    "sha": "e7d48f286e67fc0f",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r3c3",
+   "round": 3,
+   "name": "Per-type frames, lr 2.5e-3, ent 0.01",
+   "hypothesis": "Change: r2c1 with ent_coef 0.01 instead of 0.005. Why: a faster lr can harden the policy early, and remaining failures may come from wrong placement-order habits locked in before they are corrected. More entropy keeps exploring the rare exact-build bonus and should cut variance between seeds. Refuted if the mean is at or below 0.969, or the minimum seed falls below 0.95.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {\"ppo_epochs\": 2, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 32, \"gamma\": 0.97, \"gae_lambda\": 0.95, \"ent_coef\": 0.01, \"lr\": 0.0025}\n\nWIDTH = 32\nSKIP = 16\nPROJ = 16\nHID = 12\nSCALE = 2.0\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    nn.init.zeros_(m.bias)\n    return m\n\n\ndef frame(x, k):\n    if k >= 4:\n        x = x.transpose(2, 3)\n    r = k % 4\n    if r == 1:\n        x = x.flip(3)\n    elif r == 2:\n        x = x.flip(2)\n    elif r == 3:\n        x = x.flip(2).flip(3)\n    return x\n\n\ndef frame_list(spec):\n    if int(spec.X) == int(spec.Y):\n        return list(range(8))\n    return [0, 1, 2, 3]\n\n\nclass Trunk(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        c = spec.in_channels\n        g = math.sqrt(2.0)\n        self.stem = nn.Sequential(ortho(nn.Conv2d(c, 64, 1), g), nn.ReLU(),\n                                  ortho(nn.Conv2d(64, 48, 1), g), nn.ReLU())\n        self.c1 = ortho(nn.Conv2d(48, WIDTH, 3, padding=1), g)\n        self.n1 = nn.GroupNorm(4, WIDTH)\n        self.c2 = ortho(nn.Conv2d(WIDTH, WIDTH, 3, padding=1), g)\n        self.n2 = nn.GroupNorm(4, WIDTH)\n        self.skip = ortho(nn.Conv2d(c, SKIP, 1), g)\n\n    def forward(self, obs):\n        s = self.stem(obs)\n        x = F.relu(self.n1(self.c1(s)))\n        f = F.relu(x + self.n2(self.c2(x)))\n        h = torch.cat([f, F.relu(self.skip(obs))], 1)\n        return f, h\n\n\nclass FrameHead(nn.Module):\n    def __init__(self, cin, spec):\n        super().__init__()\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        self.frames = frame_list(spec)\n        nf = len(self.frames)\n        T = len(self.fps)\n        self.nf = nf\n        self.T = T\n        self.proj = ortho(nn.Conv2d(cin, PROJ, 1), 1.0)\n        self.w1 = nn.Parameter(torch.randn(nf, T, 3 * PROJ, HID) * math.sqrt(2.0 / (3 * PROJ)))\n        self.b1 = nn.Parameter(torch.zeros(nf, T, HID))\n        self.w2 = nn.Parameter(torch.randn(nf, T, HID) * (0.01 / math.sqrt(HID)))\n        self.b2 = nn.Parameter(torch.zeros(nf, T))\n        self.mixw = nn.Parameter(torch.zeros(T, nf))\n\n    def forward(self, h):\n        p = self.proj(h)\n        B, P = p.shape[0], p.shape[1]\n        nf = self.nf\n        q = torch.cat([frame(p, k) for k in self.frames], 1)\n        Yp, Xp = q.shape[2], q.shape[3]\n        feats = []\n        for dy, dx in self.fps:\n            if dy * dx == 1:\n                mx, mn, av = q, q, q\n            else:\n                qq = F.pad(q, (0, dx - 1, 0, dy - 1))\n                mx = F.max_pool2d(qq, (dy, dx), stride=1)\n                mn = -F.max_pool2d(-qq, (dy, dx), stride=1)\n                av = F.avg_pool2d(qq, (dy, dx), stride=1)\n            z = torch.cat([mx.reshape(B, nf, P, Yp, Xp), mn.reshape(B, nf, P, Yp, Xp),\n                           av.reshape(B, nf, P, Yp, Xp)], 2)\n            feats.append(z)\n        z = torch.stack(feats, 2)\n        hid = torch.einsum('bftcyx,ftch->bfthyx', z, self.w1) + self.b1[None, :, :, :, None, None]\n        hid = F.relu(hid)\n        L = torch.einsum('bfthyx,fth->bftyx', hid, self.w2) + self.b2[None, :, :, None, None]\n        L = L.reshape(B, nf, self.T, Yp * Xp)\n        a = torch.softmax(SCALE * self.mixw, dim=1)\n        return (L * a.t()[None, :, :, None]).sum(1)\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.trunk = Trunk(spec)\n        self.head = FrameHead(WIDTH + SKIP, spec)\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * WIDTH, 64), math.sqrt(2.0)), nn.ReLU())\n        self.tbias = ortho(nn.Linear(64, len(spec.footprints)), 0.01)\n        self.done_head = ortho(nn.Linear(64, 1), 0.01)\n        self.value_head = ortho(nn.Linear(64, 1), 1.0)\n\n    def forward(self, obs, mask):\n        f, h = self.trunk(obs)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], dim=1))\n        place = self.head(h) + self.tbias(g)[:, :, None]\n        logits = torch.cat([place.flatten(1), self.done_head(g)], dim=1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 53190,
+    "fb_ms": 118.38,
+    "flops_per_sample": 18127104,
+    "flops_ratio": 0.99,
+    "sha": "05ad972d8fa12656",
+    "recipe": {
+     "lr": 0.0025,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "ppo_epochs": 2,
+     "ent_coef": 0.01,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "ppo_epochs": 2,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "ent_coef": 0.01,
+     "lr": 0.0025
+    },
+    "budget": {
+     "allowed_steps": 243419,
+     "n_updates": 118,
+     "batch": 2048,
+     "steps": 241664,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0204
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 8
+    },
+    "rule": "rot270"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.9639,
+    "dev_per_seed": [
+     0.9648,
+     0.9629
+    ],
+    "train_exact": 0.9328,
+    "params": 53190,
+    "flops_ratio": 0.99,
+    "train_steps": 241664,
+    "wall_s": 228.6,
+    "sha": "05ad972d8fa12656",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r3c4",
+   "round": 3,
+   "name": "Per-type frames, lr 2.5e-3, lambda 0.98",
+   "hypothesis": "Change: r2c1 with gae_lambda 0.98 instead of 0.95, keeping gamma at 0.97 (higher gamma collapsed before). Why: the +1 exact-build bonus arrives at the end of 6\u201316 placements, and a longer GAE trace passes it back to the early placement-order choices that decide exactness. Refuted if the mean is at or below 0.969, or the minimum seed falls below 0.95, which would show the extra advantage variance outweighs the better credit assignment.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {\"ppo_epochs\": 2, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 32, \"gamma\": 0.97, \"gae_lambda\": 0.98, \"ent_coef\": 0.005, \"lr\": 0.0025}\n\nWIDTH = 32\nSKIP = 16\nPROJ = 16\nHID = 12\nSCALE = 2.0\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    nn.init.zeros_(m.bias)\n    return m\n\n\ndef frame(x, k):\n    if k >= 4:\n        x = x.transpose(2, 3)\n    r = k % 4\n    if r == 1:\n        x = x.flip(3)\n    elif r == 2:\n        x = x.flip(2)\n    elif r == 3:\n        x = x.flip(2).flip(3)\n    return x\n\n\ndef frame_list(spec):\n    if int(spec.X) == int(spec.Y):\n        return list(range(8))\n    return [0, 1, 2, 3]\n\n\nclass Trunk(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        c = spec.in_channels\n        g = math.sqrt(2.0)\n        self.stem = nn.Sequential(ortho(nn.Conv2d(c, 64, 1), g), nn.ReLU(),\n                                  ortho(nn.Conv2d(64, 48, 1), g), nn.ReLU())\n        self.c1 = ortho(nn.Conv2d(48, WIDTH, 3, padding=1), g)\n        self.n1 = nn.GroupNorm(4, WIDTH)\n        self.c2 = ortho(nn.Conv2d(WIDTH, WIDTH, 3, padding=1), g)\n        self.n2 = nn.GroupNorm(4, WIDTH)\n        self.skip = ortho(nn.Conv2d(c, SKIP, 1), g)\n\n    def forward(self, obs):\n        s = self.stem(obs)\n        x = F.relu(self.n1(self.c1(s)))\n        f = F.relu(x + self.n2(self.c2(x)))\n        h = torch.cat([f, F.relu(self.skip(obs))], 1)\n        return f, h\n\n\nclass FrameHead(nn.Module):\n    def __init__(self, cin, spec):\n        super().__init__()\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        self.frames = frame_list(spec)\n        nf = len(self.frames)\n        T = len(self.fps)\n        self.nf = nf\n        self.T = T\n        self.proj = ortho(nn.Conv2d(cin, PROJ, 1), 1.0)\n        self.w1 = nn.Parameter(torch.randn(nf, T, 3 * PROJ, HID) * math.sqrt(2.0 / (3 * PROJ)))\n        self.b1 = nn.Parameter(torch.zeros(nf, T, HID))\n        self.w2 = nn.Parameter(torch.randn(nf, T, HID) * (0.01 / math.sqrt(HID)))\n        self.b2 = nn.Parameter(torch.zeros(nf, T))\n        self.mixw = nn.Parameter(torch.zeros(T, nf))\n\n    def forward(self, h):\n        p = self.proj(h)\n        B, P = p.shape[0], p.shape[1]\n        nf = self.nf\n        q = torch.cat([frame(p, k) for k in self.frames], 1)\n        Yp, Xp = q.shape[2], q.shape[3]\n        feats = []\n        for dy, dx in self.fps:\n            if dy * dx == 1:\n                mx, mn, av = q, q, q\n            else:\n                qq = F.pad(q, (0, dx - 1, 0, dy - 1))\n                mx = F.max_pool2d(qq, (dy, dx), stride=1)\n                mn = -F.max_pool2d(-qq, (dy, dx), stride=1)\n                av = F.avg_pool2d(qq, (dy, dx), stride=1)\n            z = torch.cat([mx.reshape(B, nf, P, Yp, Xp), mn.reshape(B, nf, P, Yp, Xp),\n                           av.reshape(B, nf, P, Yp, Xp)], 2)\n            feats.append(z)\n        z = torch.stack(feats, 2)\n        hid = torch.einsum('bftcyx,ftch->bfthyx', z, self.w1) + self.b1[None, :, :, :, None, None]\n        hid = F.relu(hid)\n        L = torch.einsum('bfthyx,fth->bftyx', hid, self.w2) + self.b2[None, :, :, None, None]\n        L = L.reshape(B, nf, self.T, Yp * Xp)\n        a = torch.softmax(SCALE * self.mixw, dim=1)\n        return (L * a.t()[None, :, :, None]).sum(1)\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.trunk = Trunk(spec)\n        self.head = FrameHead(WIDTH + SKIP, spec)\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * WIDTH, 64), math.sqrt(2.0)), nn.ReLU())\n        self.tbias = ortho(nn.Linear(64, len(spec.footprints)), 0.01)\n        self.done_head = ortho(nn.Linear(64, 1), 0.01)\n        self.value_head = ortho(nn.Linear(64, 1), 1.0)\n\n    def forward(self, obs, mask):\n        f, h = self.trunk(obs)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], dim=1))\n        place = self.head(h) + self.tbias(g)[:, :, None]\n        logits = torch.cat([place.flatten(1), self.done_head(g)], dim=1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 53190,
+    "fb_ms": 119.75,
+    "flops_per_sample": 18127104,
+    "flops_ratio": 0.99,
+    "sha": "f70c25ee517b4f2c",
+    "recipe": {
+     "lr": 0.0025,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.97,
+     "gae_lambda": 0.98,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "ppo_epochs": 2,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "gamma": 0.97,
+     "gae_lambda": 0.98,
+     "ent_coef": 0.005,
+     "lr": 0.0025
+    },
+    "budget": {
+     "allowed_steps": 243419,
+     "n_updates": 118,
+     "batch": 2048,
+     "steps": 241664,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0204
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 8
+    },
+    "rule": "rot270"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.9609,
+    "dev_per_seed": [
+     0.9766,
+     0.9453
+    ],
+    "train_exact": 0.9283,
+    "params": 53190,
+    "flops_ratio": 0.99,
+    "train_steps": 241664,
+    "wall_s": 226.4,
+    "sha": "f70c25ee517b4f2c",
+    "readouts": null
+   }
+  }
+ ],
+ "rounds_done": 3,
+ "incumbent": "r3c2",
+ "analyses": {
+  "1": "There are no trials in this world yet. The starting architecture scored 0.000 on both seeds. Under the g2 evidence, that most likely means a hidden action-layout mismatch, not a weak policy. So round 1 tests four learnable layout heads in parallel, all on the default 2-epoch recipe: an 8-frame dihedral mixture with footprint pooling; frames combined with a centred window and two flatten orders; identity plus transposed square heads; and a per-type frame mixture at scale 2. By my hand count of multiply-adds per cell, every candidate is at or below the starting network's cost (r \u2264 1), mainly because the trunk is slimmed to width 32 and the per-frame heads are batched with einsum. The FLOP counter may disagree slightly. The next steps depend on the results. If every seed scores 0 on both training and dev, round 2 tries product heads (frames \u00d7 corners, frames \u00d7 type permutation). If any score is above 0, round 2 keeps the best head and changes one recipe setting per candidate. A dev score of about 0.078 on both training and dev would mean the run collapsed.",
+  "2": "The layout mismatch is fixed. Both pooling frame heads scored about 0.95 on dev: global scale 5 got 0.971 and 0.938, and per-type scale 2 got 0.953 and 0.947. Training success is 0.92 for both, so there is no generalisation gap and no collapse at 0.078. The centred-window, 2-order head scored 0.46 with both seeds above 0. Its layout probably matches only partly, or it learns slowly. The identity+transpose square heads stayed at 0 on training and dev, so the mismatch is not a plain transpose. The two pooling heads are tied within noise. Per-type scale 2 has the better minimum, which fits the robustness goal, so it is the base for all four candidates. Each candidate tests one recipe change from the program. The aim is to push past 0.954 with both seeds high. r is already 0.99, so slimming the head buys no extra samples. The remaining lever is how well the fixed 241k samples are used.",
+  "3": "The layout mismatch is fixed. Dihedral pooling frame heads scored about 0.95 on both seeds with the default recipe, for both the global scale-5 mixture (r1c1) and the per-type scale-2 mixture (r1c4). The window head reached 0.46 and the square-transpose head scored 0, so the mismatch is a dihedral frame and not an anchor offset. For the recipe: lr 2.5e-3 gave the best result so far (0.969, both seeds at least 0.959). lr 1e-3 hurt (0.91). 16 minibatches made the seeds unstable (0.93 vs 0.48). Three epochs at lr 3e-3 was neutral (0.947). No run collapsed to 0.078. Training success (0.93) trails dev (0.97) only because training samples actions while dev runs greedily, so there is no generalisation gap. Runs look sample-limited, and the faster lr helps. In the last round I make one change on top of r2c1: lr 3e-3, the global head at lr 2.5e-3, more entropy, or a longer GAE horizon for the exact-build bonus."
+ }
+}

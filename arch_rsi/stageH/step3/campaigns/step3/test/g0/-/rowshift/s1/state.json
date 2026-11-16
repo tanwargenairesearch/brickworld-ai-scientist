@@ -1,0 +1,810 @@
+{
+ "trials": [
+  {
+   "label": "r1c1",
+   "round": 1,
+   "name": "baseline, 2 epochs, more updates",
+   "hypothesis": "Keeps the starting network. Sets 2 PPO epochs, 128 envs and minibatches of 128. That gives about 243k samples and about 118 updates, against 131k samples and 32 updates by default. The starting run failed on both seeds, which points to too few updates and samples. Refuted if dev success stays near 0 and the starting network with 1 epoch (candidate C) also stays near 0.",
+   "code": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {\"ppo_epochs\": 2, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 16, \"ent_coef\": 0.005}\n\nSTEM = 64\nCOL = 48\nWIDTH = 40\nPROJ = 32\nHID = 32\n\n\nclass PoolHead(nn.Module):\n    def __init__(self, c, footprints, proj, hid):\n        super().__init__()\n        self.fps = [(int(a), int(b)) for a, b in footprints]\n        self.proj = nn.Conv2d(c, proj, 1)\n        self.mix = nn.ModuleList([nn.Conv2d(3 * proj, hid, 1) for _ in self.fps])\n        self.outs = nn.ModuleList([nn.Conv2d(hid, 1, 1) for _ in self.fps])\n\n    def forward(self, f):\n        p = self.proj(f)\n        res = []\n        for (dy, dx), mix, out in zip(self.fps, self.mix, self.outs):\n            if dy * dx == 1:\n                mx, mn, av = p, p, p\n            else:\n                q = F.pad(p, (0, dx - 1, 0, dy - 1))\n                mx = F.max_pool2d(q, (dy, dx), stride=1)\n                mn = -F.max_pool2d(-q, (dy, dx), stride=1)\n                av = F.avg_pool2d(q, (dy, dx), stride=1)\n            h = F.relu(mix(torch.cat([mx, mn, av], dim=1)))\n            res.append(out(h))\n        return torch.cat(res, dim=1).flatten(1)\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.stem = nn.Sequential(\n            nn.Conv2d(spec.in_channels, STEM, 1), nn.ReLU(),\n            nn.Conv2d(STEM, COL, 1), nn.ReLU())\n        self.c1 = nn.Conv2d(COL, WIDTH, 3, padding=1)\n        self.c2 = nn.Conv2d(WIDTH, WIDTH, 3, padding=1)\n        self.head = PoolHead(WIDTH, spec.footprints, PROJ, HID)\n        self.glob = nn.Sequential(nn.Linear(2 * WIDTH, 64), nn.ReLU())\n        self.done_head = nn.Linear(64, 1)\n        self.value_head = nn.Linear(64, 1)\n\n    def forward(self, obs, mask):\n        s = self.stem(obs)\n        x = F.relu(self.c1(s))\n        f = F.relu(x + self.c2(x))\n        place = self.head(f)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], dim=1))\n        logits = torch.cat([place, self.done_head(g)], dim=1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 55846,
+    "fb_ms": 63.01,
+    "flops_per_sample": 19077888,
+    "flops_ratio": 1.04,
+    "sha": "93b011ec587f7312",
+    "recipe": {
+     "lr": 0.001,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 16,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.95,
+     "gae_lambda": 0.9,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "ppo_epochs": 2,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 16,
+     "ent_coef": 0.005
+    },
+    "budget": {
+     "allowed_steps": 233306,
+     "n_updates": 113,
+     "batch": 2048,
+     "steps": 231424,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.011
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 7
+    },
+    "rule": "rowshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0,
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 55846,
+    "flops_ratio": 1.04,
+    "train_steps": 231424,
+    "wall_s": 86.3,
+    "sha": "93b011ec587f7312",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r1c2",
+   "round": 1,
+   "name": "per-layer scoring with learned landing gate",
+   "hypothesis": "Splits the build into layers. Each layer gets its own, below and above occupancy and target channels, plus a one-hot layer index and 2D column context. One shared small network scores each placement at every layer, and a learned softmax gate over layers combines the scores. The gate can learn the landing layer: support below under the footprint and nothing occupied at that layer. Uses fewer FLOPs than the starting network, with candidate A's recipe. Refuted if it does not beat A.",
+   "code": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {\"ppo_epochs\": 2, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 16, \"ent_coef\": 0.005}\n\nCTX = 32\nLW = 32\nPROJ = 16\nHID = 16\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.Z = int(spec.Z)\n        Z = self.Z\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        cin = spec.in_channels\n        self.ctx1 = nn.Conv2d(cin, CTX, 1)\n        self.ctx2 = nn.Conv2d(CTX, CTX, 3, padding=1)\n        self.ctx_to_layer = nn.Conv2d(CTX, LW, 1)\n        self.lin = nn.Conv2d(12 + Z, LW, 1)\n        self.l2 = nn.Conv2d(LW, LW, 1)\n        self.proj = nn.Conv2d(LW, PROJ, 1)\n        self.mix = nn.ModuleList([nn.Conv2d(3 * PROJ, HID, 1) for _ in self.fps])\n        self.outs = nn.ModuleList([nn.Conv2d(HID, 2, 1) for _ in self.fps])\n        self.glob = nn.Sequential(nn.Linear(2 * CTX, 64), nn.ReLU())\n        self.done_head = nn.Linear(64, 1)\n        self.value_head = nn.Linear(64, 1)\n\n    def forward(self, obs, mask):\n        B, C, Y, X = obs.shape\n        Z = self.Z\n        # 2D column context\n        c = F.relu(self.ctx1(obs))\n        f = F.relu(c + self.ctx2(c))\n        ctx_l = self.ctx_to_layer(f)  # [B, LW, Y, X]\n        # per-layer inputs\n        grid = obs[:, :4 * Z].reshape(B, 4, Z, Y, X)\n        below = F.pad(grid, (0, 0, 0, 0, 1, 0))[:, :, :Z]\n        above = F.pad(grid, (0, 0, 0, 0, 0, 1))[:, :, 1:]\n        eye = torch.eye(Z, device=obs.device, dtype=obs.dtype)\n        pos = eye.reshape(1, Z, Z, 1, 1).expand(B, Z, Z, Y, X)\n        lay = torch.cat([grid, below, above, pos], dim=1)  # [B, 12+Z, Z, Y, X]\n        lay = lay.permute(0, 2, 1, 3, 4).reshape(B * Z, 12 + Z, Y, X)\n        ctx_b = ctx_l.unsqueeze(1).expand(B, Z, LW, Y, X).reshape(B * Z, LW, Y, X)\n        h = F.relu(self.lin(lay) + ctx_b)\n        h = F.relu(h + self.l2(h))\n        p = self.proj(h)\n        res = []\n        for (dy, dx), mix, out in zip(self.fps, self.mix, self.outs):\n            if dy * dx == 1:\n                mx, mn, av = p, p, p\n            else:\n                q = F.pad(p, (0, dx - 1, 0, dy - 1))\n                mx = F.max_pool2d(q, (dy, dx), stride=1)\n                mn = -F.max_pool2d(-q, (dy, dx), stride=1)\n                av = F.avg_pool2d(q, (dy, dx), stride=1)\n            u = F.relu(mix(torch.cat([mx, mn, av], dim=1)))\n            o = out(u).reshape(B, Z, 2, Y, X)\n            score = o[:, :, 0]\n            gate = torch.softmax(o[:, :, 1], dim=1)\n            res.append((gate * score).sum(1).flatten(1))\n        place = torch.cat(res, dim=1)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], dim=1))\n        logits = torch.cat([place, self.done_head(g)], dim=1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 20954,
+    "fb_ms": 234.48,
+    "flops_per_sample": 15975168,
+    "flops_ratio": 0.87,
+    "sha": "468bacbe835a0f7d",
+    "recipe": {
+     "lr": 0.001,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 16,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.95,
+     "gae_lambda": 0.9,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "ppo_epochs": 2,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 16,
+     "ent_coef": 0.005
+    },
+    "budget": {
+     "allowed_steps": 243419,
+     "n_updates": 118,
+     "batch": 2048,
+     "steps": 241664,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0085
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 8
+    },
+    "rule": "rowshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0,
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 20954,
+    "flops_ratio": 0.87,
+    "train_steps": 241664,
+    "wall_s": 135.4,
+    "sha": "468bacbe835a0f7d",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r1c3",
+   "round": 1,
+   "name": "baseline, 1 epoch, max samples",
+   "hypothesis": "Keeps the starting network. Sets 1 PPO epoch, 128 envs and minibatches of 128. That gives about 426k samples and about 208 updates, with no data reuse. The bet is that sample count matters more than optimisation per sample here. Refuted if it scores clearly below candidate A, which uses 2 epochs. That would mean reusing data is worth more than extra samples.",
+   "code": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {\"ppo_epochs\": 1, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 16, \"ent_coef\": 0.005}\n\nSTEM = 64\nCOL = 48\nWIDTH = 40\nPROJ = 32\nHID = 32\n\n\nclass PoolHead(nn.Module):\n    def __init__(self, c, footprints, proj, hid):\n        super().__init__()\n        self.fps = [(int(a), int(b)) for a, b in footprints]\n        self.proj = nn.Conv2d(c, proj, 1)\n        self.mix = nn.ModuleList([nn.Conv2d(3 * proj, hid, 1) for _ in self.fps])\n        self.outs = nn.ModuleList([nn.Conv2d(hid, 1, 1) for _ in self.fps])\n\n    def forward(self, f):\n        p = self.proj(f)\n        res = []\n        for (dy, dx), mix, out in zip(self.fps, self.mix, self.outs):\n            if dy * dx == 1:\n                mx, mn, av = p, p, p\n            else:\n                q = F.pad(p, (0, dx - 1, 0, dy - 1))\n                mx = F.max_pool2d(q, (dy, dx), stride=1)\n                mn = -F.max_pool2d(-q, (dy, dx), stride=1)\n                av = F.avg_pool2d(q, (dy, dx), stride=1)\n            h = F.relu(mix(torch.cat([mx, mn, av], dim=1)))\n            res.append(out(h))\n        return torch.cat(res, dim=1).flatten(1)\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.stem = nn.Sequential(\n            nn.Conv2d(spec.in_channels, STEM, 1), nn.ReLU(),\n            nn.Conv2d(STEM, COL, 1), nn.ReLU())\n        self.c1 = nn.Conv2d(COL, WIDTH, 3, padding=1)\n        self.c2 = nn.Conv2d(WIDTH, WIDTH, 3, padding=1)\n        self.head = PoolHead(WIDTH, spec.footprints, PROJ, HID)\n        self.glob = nn.Sequential(nn.Linear(2 * WIDTH, 64), nn.ReLU())\n        self.done_head = nn.Linear(64, 1)\n        self.value_head = nn.Linear(64, 1)\n\n    def forward(self, obs, mask):\n        s = self.stem(obs)\n        x = F.relu(self.c1(s))\n        f = F.relu(x + self.c2(x))\n        place = self.head(f)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], dim=1))\n        logits = torch.cat([place, self.done_head(g)], dim=1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 55846,
+    "fb_ms": 61.51,
+    "flops_per_sample": 19077888,
+    "flops_ratio": 1.04,
+    "sha": "c5f7452430c0a4a0",
+    "recipe": {
+     "lr": 0.001,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 16,
+     "ppo_epochs": 1,
+     "ent_coef": 0.005,
+     "gamma": 0.95,
+     "gae_lambda": 0.9,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "ppo_epochs": 1,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 16,
+     "ent_coef": 0.005
+    },
+    "budget": {
+     "allowed_steps": 408286,
+     "n_updates": 199,
+     "batch": 2048,
+     "steps": 407552,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.011
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 7
+    },
+    "rule": "rowshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0,
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 55846,
+    "flops_ratio": 1.04,
+    "train_steps": 407552,
+    "wall_s": 110.1,
+    "sha": "c5f7452430c0a4a0",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r2c1",
+   "round": 2,
+   "name": "column MLP + direct footprint pool",
+   "hypothesis": "A wide per-column MLP (1x1 convs) keeps exact per-cell layer information. A small 3x3 branch adds context. Both feed the max/min/avg footprint pooling directly, wider than before (PROJ 48, HID 48). The landing layer (max over the footprint of height thresholds) AND 'missing at that layer' then fits in one ReLU layer. The compute ratio stays about 1. Refuted if dev and train success stay at 0, like the starting net with the same recipe (r1c1).",
+   "code": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {\"ppo_epochs\": 2, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 16, \"ent_coef\": 0.005}\n\nCOL1 = 96\nCOL2 = 64\nCTX = 32\nPROJ = 48\nHID = 48\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        cin = spec.in_channels\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        self.col = nn.Sequential(\n            nn.Conv2d(cin, COL1, 1), nn.ReLU(),\n            nn.Conv2d(COL1, COL2, 1), nn.ReLU())\n        self.ctx_in = nn.Conv2d(COL2, CTX, 1)\n        self.ctx = nn.Conv2d(CTX, CTX, 3, padding=1)\n        self.proj = nn.Conv2d(COL2 + CTX, PROJ, 1)\n        self.mix = nn.ModuleList([nn.Conv2d(3 * PROJ, HID, 1) for _ in self.fps])\n        self.outs = nn.ModuleList([nn.Conv2d(HID, 1, 1) for _ in self.fps])\n        self.glob = nn.Sequential(nn.Linear(2 * (COL2 + CTX), 64), nn.ReLU())\n        self.done_head = nn.Linear(64, 1)\n        self.value_head = nn.Linear(64, 1)\n\n    def forward(self, obs, mask):\n        c = self.col(obs)\n        k = F.relu(self.ctx_in(c))\n        k = F.relu(k + self.ctx(k))\n        f = torch.cat([c, k], dim=1)\n        p = self.proj(f)\n        res = []\n        for (dy, dx), mix, out in zip(self.fps, self.mix, self.outs):\n            if dy * dx == 1:\n                mx, mn, av = p, p, p\n            else:\n                q = F.pad(p, (0, dx - 1, 0, dy - 1))\n                mx = F.max_pool2d(q, (dy, dx), stride=1)\n                mn = -F.max_pool2d(-q, (dy, dx), stride=1)\n                av = F.avg_pool2d(q, (dy, dx), stride=1)\n            h = F.relu(mix(torch.cat([mx, mn, av], dim=1)))\n            res.append(out(h).flatten(1))\n        place = torch.cat(res, dim=1)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], dim=1))\n        logits = torch.cat([place, self.done_head(g)], dim=1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 65398,
+    "fb_ms": 130.52,
+    "flops_per_sample": 19882752,
+    "flops_ratio": 1.09,
+    "sha": "b331915f2634e1da",
+    "recipe": {
+     "lr": 0.001,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 16,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.95,
+     "gae_lambda": 0.9,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "ppo_epochs": 2,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 16,
+     "ent_coef": 0.005
+    },
+    "budget": {
+     "allowed_steps": 223862,
+     "n_updates": 109,
+     "batch": 2048,
+     "steps": 223232,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0088
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 7
+    },
+    "rule": "rowshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0,
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 65398,
+    "flops_ratio": 1.09,
+    "train_steps": 223232,
+    "wall_s": 75.8,
+    "sha": "b331915f2634e1da",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r2c2",
+   "round": 2,
+   "name": "column MLP + learned 3x3 placement head",
+   "hypothesis": "This replaces the fixed top-left footprint pooling with a per-type learned conv (3x3 kernel for 2-cell bricks), followed by two ReLU layers. These are enough to learn landing-layer detection (sum then threshold) and then AND it with 'missing'. The head no longer depends on the stated anchor convention, which may differ in this world. Refuted if it scores no better than the pooled column net in the same round.",
+   "code": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {\"ppo_epochs\": 2, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 16, \"ent_coef\": 0.005}\n\nCOL1 = 96\nCOL2 = 64\nPROJ = 48\nHID = 32\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        cin = spec.in_channels\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        self.col = nn.Sequential(\n            nn.Conv2d(cin, COL1, 1), nn.ReLU(),\n            nn.Conv2d(COL1, COL2, 1), nn.ReLU())\n        self.proj = nn.Conv2d(COL2, PROJ, 1)\n        convs = []\n        for dy, dx in self.fps:\n            k = 2 * max(dy, dx) - 1\n            convs.append(nn.Conv2d(PROJ, HID, k, padding=k // 2))\n        self.convs = nn.ModuleList(convs)\n        self.mids = nn.ModuleList([nn.Conv2d(HID, HID, 1) for _ in self.fps])\n        self.outs = nn.ModuleList([nn.Conv2d(HID, 1, 1) for _ in self.fps])\n        self.glob = nn.Sequential(nn.Linear(2 * COL2, 64), nn.ReLU())\n        self.done_head = nn.Linear(64, 1)\n        self.value_head = nn.Linear(64, 1)\n\n    def forward(self, obs, mask):\n        c = self.col(obs)\n        p = F.relu(self.proj(c))\n        res = []\n        for conv, mid, out in zip(self.convs, self.mids, self.outs):\n            h = F.relu(conv(p))\n            h = F.relu(mid(h))\n            res.append(out(h).flatten(1))\n        place = torch.cat(res, dim=1)\n        g = self.glob(torch.cat([c.mean((2, 3)), c.amax((2, 3))], dim=1))\n        logits = torch.cat([place, self.done_head(g)], dim=1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 67894,
+    "fb_ms": 55.23,
+    "flops_per_sample": 22389504,
+    "flops_ratio": 1.22,
+    "sha": "976afbd30d125085",
+    "recipe": {
+     "lr": 0.001,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 16,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.95,
+     "gae_lambda": 0.9,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "ppo_epochs": 2,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 16,
+     "ent_coef": 0.005
+    },
+    "budget": {
+     "allowed_steps": 198798,
+     "n_updates": 97,
+     "batch": 2048,
+     "steps": 198656,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0071
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 6
+    },
+    "rule": "rowshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0,
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 67894,
+    "flops_ratio": 1.22,
+    "train_steps": 198656,
+    "wall_s": 55.8,
+    "sha": "976afbd30d125085",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r2c3",
+   "round": 2,
+   "name": "column pool net, high entropy",
+   "hypothesis": "Same network as the column MLP + direct footprint pool candidate, with ent_coef raised from 0.005 to 0.03. Random placements usually score negative while DONE scores 0, so PPO may collapse onto early DONE or a narrow policy before it learns correct placements. Stronger entropy keeps exploring long enough to find exact builds. Refuted if it scores at or below the 0.005-entropy version in the same round.",
+   "code": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {\"ppo_epochs\": 2, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 16, \"ent_coef\": 0.03}\n\nCOL1 = 96\nCOL2 = 64\nCTX = 32\nPROJ = 48\nHID = 48\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        cin = spec.in_channels\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        self.col = nn.Sequential(\n            nn.Conv2d(cin, COL1, 1), nn.ReLU(),\n            nn.Conv2d(COL1, COL2, 1), nn.ReLU())\n        self.ctx_in = nn.Conv2d(COL2, CTX, 1)\n        self.ctx = nn.Conv2d(CTX, CTX, 3, padding=1)\n        self.proj = nn.Conv2d(COL2 + CTX, PROJ, 1)\n        self.mix = nn.ModuleList([nn.Conv2d(3 * PROJ, HID, 1) for _ in self.fps])\n        self.outs = nn.ModuleList([nn.Conv2d(HID, 1, 1) for _ in self.fps])\n        self.glob = nn.Sequential(nn.Linear(2 * (COL2 + CTX), 64), nn.ReLU())\n        self.done_head = nn.Linear(64, 1)\n        self.value_head = nn.Linear(64, 1)\n\n    def forward(self, obs, mask):\n        c = self.col(obs)\n        k = F.relu(self.ctx_in(c))\n        k = F.relu(k + self.ctx(k))\n        f = torch.cat([c, k], dim=1)\n        p = self.proj(f)\n        res = []\n        for (dy, dx), mix, out in zip(self.fps, self.mix, self.outs):\n            if dy * dx == 1:\n                mx, mn, av = p, p, p\n            else:\n                q = F.pad(p, (0, dx - 1, 0, dy - 1))\n                mx = F.max_pool2d(q, (dy, dx), stride=1)\n                mn = -F.max_pool2d(-q, (dy, dx), stride=1)\n                av = F.avg_pool2d(q, (dy, dx), stride=1)\n            h = F.relu(mix(torch.cat([mx, mn, av], dim=1)))\n            res.append(out(h).flatten(1))\n        place = torch.cat(res, dim=1)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], dim=1))\n        logits = torch.cat([place, self.done_head(g)], dim=1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 65398,
+    "fb_ms": 132.81,
+    "flops_per_sample": 19882752,
+    "flops_ratio": 1.09,
+    "sha": "64530c3bfea1fdb1",
+    "recipe": {
+     "lr": 0.001,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 16,
+     "ppo_epochs": 2,
+     "ent_coef": 0.03,
+     "gamma": 0.95,
+     "gae_lambda": 0.9,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "ppo_epochs": 2,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 16,
+     "ent_coef": 0.03
+    },
+    "budget": {
+     "allowed_steps": 223862,
+     "n_updates": 109,
+     "batch": 2048,
+     "steps": 223232,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0088
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 7
+    },
+    "rule": "rowshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0,
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 65398,
+    "flops_ratio": 1.09,
+    "train_steps": 223232,
+    "wall_s": 76.3,
+    "sha": "64530c3bfea1fdb1",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r3c1",
+   "round": 3,
+   "name": "local + fully connected action head",
+   "hypothesis": "Adds a learned flatten\u2192MLP\u2192action-logits path, summed with a local 3x3 conv head. If this world maps action indices to cells differently from the obs layout (transposed, flipped or permuted), only the FC path can learn the mapping. If the mapping is standard, the local head still works. Uses coordinate channels and about 1x the starting compute. Refuted if train and dev success stay at 0 like every earlier trial.",
+   "code": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {\"ppo_epochs\": 2, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 16, \"ent_coef\": 0.01}\n\nW = 40\nFC = 256\n\n\ndef add_coords(obs):\n    B, C, Y, X = obs.shape\n    ys = torch.linspace(-1.0, 1.0, Y, device=obs.device, dtype=obs.dtype).view(1, 1, Y, 1).expand(B, 1, Y, X)\n    xs = torch.linspace(-1.0, 1.0, X, device=obs.device, dtype=obs.dtype).view(1, 1, 1, X).expand(B, 1, Y, X)\n    return torch.cat([obs, ys, xs], dim=1)\n\n\nclass Trunk(nn.Module):\n    def __init__(self, cin):\n        super().__init__()\n        self.col = nn.Sequential(\n            nn.Conv2d(cin + 2, 64, 1), nn.ReLU(),\n            nn.Conv2d(64, 48, 1), nn.ReLU())\n        self.c1 = nn.Conv2d(48, W, 3, padding=1)\n        self.c2 = nn.Conv2d(W, W, 3, padding=1)\n\n    def forward(self, obs):\n        c = self.col(add_coords(obs))\n        x = F.relu(self.c1(c))\n        return F.relu(x + self.c2(x))\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        Y = int(spec.Y)\n        X = int(spec.X)\n        self.T = int(spec.n_types)\n        self.trunk = Trunk(int(spec.in_channels))\n        self.loc = nn.Conv2d(W, 24, 3, padding=1)\n        self.loc_out = nn.Conv2d(24, self.T, 1)\n        sq = max(2, min(16, 1024 // (Y * X)))\n        self.sq = nn.Conv2d(W, sq, 1)\n        self.fc = nn.Linear(sq * Y * X, FC)\n        self.fc_out = nn.Linear(FC, int(spec.n_place))\n        nn.init.normal_(self.fc_out.weight, std=0.01)\n        nn.init.zeros_(self.fc_out.bias)\n        self.glob = nn.Sequential(nn.Linear(2 * W, 64), nn.ReLU())\n        self.done_head = nn.Linear(64 + FC, 1)\n        self.value_head = nn.Linear(64 + FC, 1)\n\n    def forward(self, obs, mask):\n        f = self.trunk(obs)\n        local = self.loc_out(F.relu(self.loc(f))).flatten(1)\n        h = F.relu(self.fc(F.relu(self.sq(f)).flatten(1)))\n        place = local + self.fc_out(h)\n        gp = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], dim=1))\n        g = torch.cat([gp, h], dim=1)\n        logits = torch.cat([place, self.done_head(g)], dim=1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 380238,
+    "fb_ms": 38.95,
+    "flops_per_sample": 19420928,
+    "flops_ratio": 1.06,
+    "sha": "f72d0d80fec668db",
+    "recipe": {
+     "lr": 0.001,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 16,
+     "ppo_epochs": 2,
+     "ent_coef": 0.01,
+     "gamma": 0.95,
+     "gae_lambda": 0.9,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "ppo_epochs": 2,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 16,
+     "ent_coef": 0.01
+    },
+    "budget": {
+     "allowed_steps": 229185,
+     "n_updates": 111,
+     "batch": 2048,
+     "steps": 227328,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0121
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 7
+    },
+    "rule": "rowshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0,
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 380238,
+    "flops_ratio": 1.06,
+    "train_steps": 227328,
+    "wall_s": 51.4,
+    "sha": "f72d0d80fec668db",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r3c2",
+   "round": 3,
+   "name": "dihedral multi-view local heads",
+   "hypothesis": "Applies each of the 8 flips and transposes to the feature map, uses a separate small 3x3 head for each view, and sums the logits. Each view stays local and translation-equivariant. Whichever view matches this world's action-index layout can learn fast, and the others can fade. Only 4 views are used if the grid is not square. Refuted if it stays at 0 while the FC head also fails; if FC works but this does not, the mapping is not a simple isometry.",
+   "code": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {\"ppo_epochs\": 2, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 16, \"ent_coef\": 0.01}\n\nW = 40\nP = 16\n\n\ndef add_coords(obs):\n    B, C, Y, X = obs.shape\n    ys = torch.linspace(-1.0, 1.0, Y, device=obs.device, dtype=obs.dtype).view(1, 1, Y, 1).expand(B, 1, Y, X)\n    xs = torch.linspace(-1.0, 1.0, X, device=obs.device, dtype=obs.dtype).view(1, 1, 1, X).expand(B, 1, Y, X)\n    return torch.cat([obs, ys, xs], dim=1)\n\n\nclass Trunk(nn.Module):\n    def __init__(self, cin):\n        super().__init__()\n        self.col = nn.Sequential(\n            nn.Conv2d(cin + 2, 64, 1), nn.ReLU(),\n            nn.Conv2d(64, 48, 1), nn.ReLU())\n        self.c1 = nn.Conv2d(48, W, 3, padding=1)\n        self.c2 = nn.Conv2d(W, W, 3, padding=1)\n\n    def forward(self, obs):\n        c = self.col(add_coords(obs))\n        x = F.relu(self.c1(c))\n        return F.relu(x + self.c2(x))\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        Y = int(spec.Y)\n        X = int(spec.X)\n        T = int(spec.n_types)\n        self.trunk = Trunk(int(spec.in_channels))\n        self.proj = nn.Conv2d(W, P, 1)\n        views = []\n        trs = [False, True] if Y == X else [False]\n        for tr in trs:\n            for fl in ([], [2], [3], [2, 3]):\n                views.append((tr, fl))\n        self.views = views\n        self.vconv = nn.ModuleList([nn.Conv2d(P, P, 3, padding=1) for _ in views])\n        self.vout = nn.ModuleList([nn.Conv2d(P, T, 1) for _ in views])\n        self.glob = nn.Sequential(nn.Linear(2 * W, 64), nn.ReLU())\n        self.done_head = nn.Linear(64, 1)\n        self.value_head = nn.Linear(64, 1)\n\n    def forward(self, obs, mask):\n        f = self.trunk(obs)\n        p = F.relu(self.proj(f))\n        place = None\n        for (tr, fl), conv, out in zip(self.views, self.vconv, self.vout):\n            v = p.transpose(2, 3) if tr else p\n            if len(fl) > 0:\n                v = torch.flip(v, fl)\n            o = out(F.relu(conv(v))).flatten(1)\n            place = o if place is None else place + o\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], dim=1))\n        logits = torch.cat([place, self.done_head(g)], dim=1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 61874,
+    "fb_ms": 61.31,
+    "flops_per_sample": 21371648,
+    "flops_ratio": 1.17,
+    "sha": "058ba187c6189325",
+    "recipe": {
+     "lr": 0.001,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 16,
+     "ppo_epochs": 2,
+     "ent_coef": 0.01,
+     "gamma": 0.95,
+     "gae_lambda": 0.9,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "ppo_epochs": 2,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 16,
+     "ent_coef": 0.01
+    },
+    "budget": {
+     "allowed_steps": 208266,
+     "n_updates": 101,
+     "batch": 2048,
+     "steps": 206848,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0092
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 6
+    },
+    "rule": "rowshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0,
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 61874,
+    "flops_ratio": 1.17,
+    "train_steps": 206848,
+    "wall_s": 62.4,
+    "sha": "058ba187c6189325",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r3c3",
+   "round": 3,
+   "name": "standard local net, long-horizon recipe",
+   "hypothesis": "Keeps the standard cell-to-action alignment: a coordinate trunk and a shared 3x3 head that does not depend on the anchor corner. It tests whether the failures come from optimisation: gamma 0.99, GAE lambda 0.95, lr 5e-4, 1 epoch, 64 envs x 32 steps, giving about 170 updates and more samples. The longer horizon credits the delayed exact-build bonus. Refuted if it stays at 0 while A or B succeed (then alignment is the cause), or if all three fail.",
+   "code": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {\"ppo_epochs\": 1, \"n_envs\": 64, \"rollout_len\": 32, \"n_minibatches\": 8, \"lr\": 0.0005, \"gamma\": 0.99, \"gae_lambda\": 0.95, \"ent_coef\": 0.01}\n\nW = 40\nH = 32\n\n\ndef add_coords(obs):\n    B, C, Y, X = obs.shape\n    ys = torch.linspace(-1.0, 1.0, Y, device=obs.device, dtype=obs.dtype).view(1, 1, Y, 1).expand(B, 1, Y, X)\n    xs = torch.linspace(-1.0, 1.0, X, device=obs.device, dtype=obs.dtype).view(1, 1, 1, X).expand(B, 1, Y, X)\n    return torch.cat([obs, ys, xs], dim=1)\n\n\nclass Trunk(nn.Module):\n    def __init__(self, cin):\n        super().__init__()\n        self.col = nn.Sequential(\n            nn.Conv2d(cin + 2, 64, 1), nn.ReLU(),\n            nn.Conv2d(64, 48, 1), nn.ReLU())\n        self.c1 = nn.Conv2d(48, W, 3, padding=1)\n        self.c2 = nn.Conv2d(W, W, 3, padding=1)\n\n    def forward(self, obs):\n        c = self.col(add_coords(obs))\n        x = F.relu(self.c1(c))\n        return F.relu(x + self.c2(x))\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        T = int(spec.n_types)\n        self.trunk = Trunk(int(spec.in_channels))\n        self.head = nn.Conv2d(W, H, 3, padding=1)\n        self.mid = nn.Conv2d(H, H, 1)\n        self.out = nn.Conv2d(H, T, 1)\n        self.glob = nn.Sequential(nn.Linear(2 * W, 64), nn.ReLU())\n        self.done_head = nn.Linear(64, 1)\n        self.value_head = nn.Linear(64, 1)\n\n    def forward(self, obs, mask):\n        f = self.trunk(obs)\n        h = F.relu(self.head(f))\n        h = F.relu(self.mid(h))\n        place = self.out(h).flatten(1)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], dim=1))\n        logits = torch.cat([place, self.done_head(g)], dim=1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 54854,
+    "fb_ms": 37.09,
+    "flops_per_sample": 18717440,
+    "flops_ratio": 1.02,
+    "sha": "dc8a0ab76e91b61a",
+    "recipe": {
+     "lr": 0.0005,
+     "n_envs": 64,
+     "rollout_len": 32,
+     "n_minibatches": 8,
+     "ppo_epochs": 1,
+     "ent_coef": 0.01,
+     "gamma": 0.99,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "ppo_epochs": 1,
+     "n_envs": 64,
+     "rollout_len": 32,
+     "n_minibatches": 8,
+     "lr": 0.0005,
+     "gamma": 0.99,
+     "gae_lambda": 0.95,
+     "ent_coef": 0.01
+    },
+    "budget": {
+     "allowed_steps": 416149,
+     "n_updates": 203,
+     "batch": 2048,
+     "steps": 415744,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0038
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 7
+    },
+    "rule": "rowshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0,
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 54854,
+    "flops_ratio": 1.02,
+    "train_steps": 415744,
+    "wall_s": 68.3,
+    "sha": "dc8a0ab76e91b61a",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r4c1",
+   "round": 4,
+   "name": "cell MLP + learned cell-to-action map",
+   "hypothesis": "No spatial convolutions. A deep per-cell MLP computes whether each cell is a good landing spot. A full learned linear map (K*Y*X to n_place) assigns those scores to action indices, so the net works under any permutation of observation cells or action indices. It uses less compute than the starting net, lr 2e-3, 2 epochs. Refuted if train and dev success stay at 0. That would point to the reward or dynamics rather than the action mapping.",
+   "code": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {\"ppo_epochs\": 2, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 16, \"lr\": 0.002, \"ent_coef\": 0.01}\n\nC1 = 128\nC2 = 128\nC3 = 64\nK = 8\nG = 128\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        Y = int(spec.Y)\n        X = int(spec.X)\n        cin = int(spec.in_channels)\n        self.col = nn.Sequential(\n            nn.Conv2d(cin, C1, 1), nn.ReLU(),\n            nn.Conv2d(C1, C2, 1), nn.ReLU(),\n            nn.Conv2d(C2, C3, 1), nn.ReLU())\n        self.sq = nn.Conv2d(C3, K, 1)\n        self.amap = nn.Linear(K * Y * X, int(spec.n_place))\n        self.glob = nn.Sequential(nn.Linear(2 * C3, G), nn.ReLU())\n        self.done_head = nn.Linear(G, 1)\n        self.value_head = nn.Linear(G, 1)\n\n    def forward(self, obs, mask):\n        c = self.col(obs)\n        s = self.sq(c).flatten(1)\n        place = self.amap(s)\n        g = self.glob(torch.cat([c.mean((2, 3)), c.amax((2, 3))], dim=1))\n        logits = torch.cat([place, self.done_head(g)], dim=1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 176970,
+    "fb_ms": 27.65,
+    "flops_per_sample": 11404800,
+    "flops_ratio": 0.62,
+    "sha": "1f52fe4cd9f2cd78",
+    "recipe": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 16,
+     "ppo_epochs": 2,
+     "ent_coef": 0.01,
+     "gamma": 0.95,
+     "gae_lambda": 0.9,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "ppo_epochs": 2,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 16,
+     "lr": 0.002,
+     "ent_coef": 0.01
+    },
+    "budget": {
+     "allowed_steps": 243419,
+     "n_updates": 118,
+     "batch": 2048,
+     "steps": 241664,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0111
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 8
+    },
+    "rule": "rowshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0068,
+    "dev_per_seed": [
+     0.0098,
+     0.0039
+    ],
+    "train_exact": 0.0036,
+    "params": 176970,
+    "flops_ratio": 0.62,
+    "train_steps": 241664,
+    "wall_s": 37.2,
+    "sha": "1f52fe4cd9f2cd78",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r4c2",
+   "round": 4,
+   "name": "conv trunk + learned cell-to-action map",
+   "hypothesis": "Uses a column MLP and two residual 3x3 convolutions, so it relies on spatial structure in the observation. Their features go through a full learned linear map to action indices, with no assumed alignment and no competing local head. Compute is about the starting net's. If this beats the pure cell-MLP map, the observation keeps spatial structure but the action indexing is remapped. Refuted if it stays at 0, or does worse than the cell-MLP map.",
+   "code": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {\"ppo_epochs\": 2, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 16, \"lr\": 0.002, \"ent_coef\": 0.01}\n\nW = 48\nK = 8\nG = 64\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        Y = int(spec.Y)\n        X = int(spec.X)\n        cin = int(spec.in_channels)\n        self.col = nn.Sequential(\n            nn.Conv2d(cin, 64, 1), nn.ReLU(),\n            nn.Conv2d(64, W, 1), nn.ReLU())\n        self.c1 = nn.Conv2d(W, W, 3, padding=1)\n        self.c2 = nn.Conv2d(W, W, 3, padding=1)\n        self.sq = nn.Conv2d(W, K, 1)\n        self.amap = nn.Linear(K * Y * X, int(spec.n_place))\n        self.glob = nn.Sequential(nn.Linear(2 * W, G), nn.ReLU())\n        self.done_head = nn.Linear(G, 1)\n        self.value_head = nn.Linear(G, 1)\n\n    def forward(self, obs, mask):\n        c = self.col(obs)\n        x = F.relu(c + self.c1(c))\n        f = F.relu(x + self.c2(x))\n        s = self.sq(f).flatten(1)\n        place = self.amap(s)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], dim=1))\n        logits = torch.cat([place, self.done_head(g)], dim=1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 184538,
+    "fb_ms": 29.1,
+    "flops_per_sample": 18518784,
+    "flops_ratio": 1.01,
+    "sha": "0e453f2338a38cf0",
+    "recipe": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 16,
+     "ppo_epochs": 2,
+     "ent_coef": 0.01,
+     "gamma": 0.95,
+     "gae_lambda": 0.9,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "ppo_epochs": 2,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 16,
+     "lr": 0.002,
+     "ent_coef": 0.01
+    },
+    "budget": {
+     "allowed_steps": 240350,
+     "n_updates": 117,
+     "batch": 2048,
+     "steps": 239616,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0079
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 7
+    },
+    "rule": "rowshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0029,
+    "dev_per_seed": [
+     0.0,
+     0.0059
+    ],
+    "train_exact": 0.0028,
+    "params": 184538,
+    "flops_ratio": 1.01,
+    "train_steps": 239616,
+    "wall_s": 49.3,
+    "sha": "0e453f2338a38cf0",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r4c3",
+   "round": 4,
+   "name": "conv trunk + action map + local head, 1 epoch",
+   "hypothesis": "Same as the conv trunk with the learned action map, plus a per-type 3x3 local head added to the logits, trained with 1 epoch for about 1.5x the samples. It covers both a standard alignment (local head) and a remapped one (linear map), and tests whether more samples help once the mapping can be learned. Refuted if it stays at 0. Scoring below the map-only version would mean the local head interferes.",
+   "code": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {\"ppo_epochs\": 1, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 16, \"lr\": 0.0015, \"ent_coef\": 0.01}\n\nW = 48\nK = 8\nH = 32\nG = 64\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        Y = int(spec.Y)\n        X = int(spec.X)\n        T = int(spec.n_types)\n        cin = int(spec.in_channels)\n        self.col = nn.Sequential(\n            nn.Conv2d(cin, 64, 1), nn.ReLU(),\n            nn.Conv2d(64, W, 1), nn.ReLU())\n        self.c1 = nn.Conv2d(W, W, 3, padding=1)\n        self.c2 = nn.Conv2d(W, W, 3, padding=1)\n        self.sq = nn.Conv2d(W, K, 1)\n        self.amap = nn.Linear(K * Y * X, int(spec.n_place))\n        self.loc = nn.Conv2d(W, H, 3, padding=1)\n        self.loc_out = nn.Conv2d(H, T, 1)\n        self.glob = nn.Sequential(nn.Linear(2 * W, G), nn.ReLU())\n        self.done_head = nn.Linear(G, 1)\n        self.value_head = nn.Linear(G, 1)\n\n    def forward(self, obs, mask):\n        c = self.col(obs)\n        x = F.relu(c + self.c1(c))\n        f = F.relu(x + self.c2(x))\n        s = self.sq(f).flatten(1)\n        local = self.loc_out(F.relu(self.loc(f))).flatten(1)\n        place = self.amap(s) + local\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], dim=1))\n        logits = torch.cat([place, self.done_head(g)], dim=1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 198526,
+    "fb_ms": 39.53,
+    "flops_per_sample": 23876352,
+    "flops_ratio": 1.31,
+    "sha": "c67efa3b765cb952",
+    "recipe": {
+     "lr": 0.0015,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 16,
+     "ppo_epochs": 1,
+     "ent_coef": 0.01,
+     "gamma": 0.95,
+     "gae_lambda": 0.9,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "ppo_epochs": 1,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 16,
+     "lr": 0.0015,
+     "ent_coef": 0.01
+    },
+    "budget": {
+     "allowed_steps": 326232,
+     "n_updates": 159,
+     "batch": 2048,
+     "steps": 325632,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0126
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 6
+    },
+    "rule": "rowshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0,
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 198526,
+    "flops_ratio": 1.31,
+    "train_steps": 325632,
+    "wall_s": 50.2,
+    "sha": "c67efa3b765cb952",
+    "readouts": null
+   }
+  }
+ ],
+ "rounds_done": 4,
+ "incumbent": "r4c1",
+ "analyses": {
+  "1": "There are no trials yet. The starting architecture scored 0.000 on both seeds. The default recipe gives only 32 PPO updates of 4,096 samples each, which is probably too few for exact builds. Fewer PPO epochs buy more samples, and smaller rollouts give more updates. So two candidates keep the starting network and test recipe changes (2 epochs vs 1). The third tests a structural idea that fits this task. A brick's outcome depends on which layer it lands on (the maximum build height under its footprint) and on whether the footprint cells at that layer are all target cells. So I score each placement separately per layer, using features shared across layers, and use a learned softmax gate over layers to pick the landing layer. That network uses fewer FLOPs than the starting one, so the budget does not shrink. It uses candidate A's recipe, so the two can be compared directly.",
+  "2": "Every trial so far scored 0 on dev and 0 on training success: the starting net with 2 epochs, the starting net with 1 epoch, and a per-layer gated net. Recipe changes alone (1 to 2 epochs, 230k to 400k samples) did not help, so sample count is probably not the bottleneck. My working guess is that the policy cannot reliably tell which placements are exactly right, i.e. that the brick lands in missing target cells and seals nothing below. That needs clean per-column features pooled over each footprint. The starting net only gets them after two 3x3 convolutions that blur neighbouring cells. A second risk is collapse onto DONE: random placements score negative, DONE scores 0. Entropy is the lever that can be pulled legitimately against that. This round tests three things. (1) A column MLP feeding footprint pooling directly. (2) A learned 3x3 placement head with no pooling, which still works if the anchor convention differs from the one described. (3) Net (1) with higher entropy.",
+  "3": "All six trials scored exactly 0, on both dev and training success. That includes two recipes (1 or 2 epochs), higher entropy, a per-layer network, a column MLP and a pooled head, and r2c2's anchor-agnostic 3x3 head. Seed noise cannot explain this. I see two likely causes. (1) Every network so far assumes action index t*Y*X + y*X + x lines up spatially with obs cell (y, x). If this world transposes or flips that mapping, no translation-equivariant head can learn, which would match the total failure. (2) Optimisation or credit assignment is too weak for exact builds at this budget. This round tests both. A adds a fully connected action head that can learn any cell-to-action mapping, on top of a local head. B adds one local head for each of the 8 flips and transposes of the grid. C keeps the standard alignment and changes only the recipe: longer horizon, lower lr, more updates.",
+  "4": "All 9 trials (18 seeds) scored 0 on dev, and their train success was also 0. That covers the starting net with 1, 2 or 4 epochs, entropy 0.005 to 0.03, gamma 0.95 or 0.99, per-layer gates, learned 3x3 per-type heads (which work for any anchor), and 8 dihedral views. In the world as described, a simple local rule should be easy to learn and would complete many targets: place a 1x1 brick where the landing cell is missing, then DONE. So local nets that handle isometries and anchor offsets failing every time suggests this world differs in a way local structure cannot fit. The likely cause is a mapping from action index to cell that is not an isometry, possibly with scrambled observation cells too. The only global head so far (r3c1, FC behind a 256-unit ReLU bottleneck, plus a competing local head) is weak evidence against this. The last round therefore tests direct learned linear maps from cells to actions, with and without spatial convolutions."
+ }
+}

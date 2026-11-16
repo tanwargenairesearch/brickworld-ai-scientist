@@ -1,0 +1,1532 @@
+{
+ "trials": [
+  {
+   "label": "r1c1",
+   "round": 1,
+   "name": "dihedral frame mixture",
+   "hypothesis": "The obs-to-action alignment may be one of the 8 dihedral frames (4 if not square). Each frame has its own small footprint-pool head per type, and a learned softmax (\u00d75) picks the frame. Per-frame weights now use einsum rather than grouped convs, which the counter seemed to overcount. Refuted if training and dev success both stay at 0 while the frame weights still commit to one frame.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nSTEM = 64\nCOL = 48\nWIDTH = 40\nSKIP = 24\nPROJ = 16\nHID = 16\nGH = 64\nSCALE = 5.0\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    if m.bias is not None:\n        nn.init.zeros_(m.bias)\n    return m\n\n\nclass GLin(nn.Module):\n    def __init__(self, G, cin, cout, gain):\n        super().__init__()\n        w = torch.empty(G, cin, cout)\n        for g in range(G):\n            nn.init.orthogonal_(w[g], gain)\n        self.w = nn.Parameter(w)\n        self.b = nn.Parameter(torch.zeros(G, cout))\n        self.G = G\n        self.cout = cout\n\n    def forward(self, x):\n        y = torch.einsum('bgcyx,gco->bgoyx', x, self.w)\n        return y + self.b.view(1, self.G, self.cout, 1, 1)\n\n\ndef dihedral(x, k):\n    if k >= 4:\n        x = x.transpose(-2, -1)\n    m = k % 4\n    if m == 1:\n        x = x.flip(-1)\n    elif m == 2:\n        x = x.flip(-2)\n    elif m == 3:\n        x = x.flip(-2).flip(-1)\n    return x\n\n\ndef wpool(q, dy, dx, top=True, left=True):\n    if dy * dx == 1:\n        return q, q, q\n    pad = ((0, dx - 1) if left else (dx - 1, 0)) + ((0, dy - 1) if top else (dy - 1, 0))\n    q = F.pad(q, pad)\n    mx = F.max_pool2d(q, (dy, dx), stride=1)\n    mn = -F.max_pool2d(-q, (dy, dx), stride=1)\n    av = F.avg_pool2d(q, (dy, dx), stride=1)\n    return mx, mn, av\n\n\nclass Base(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        c = spec.in_channels\n        self.s1 = ortho(nn.Conv2d(c, STEM, 1), math.sqrt(2))\n        self.s2 = ortho(nn.Conv2d(STEM, COL, 1), math.sqrt(2))\n        self.c1 = ortho(nn.Conv2d(COL, WIDTH, 3, padding=1), math.sqrt(2))\n        self.n1 = nn.GroupNorm(4, WIDTH)\n        self.c2 = ortho(nn.Conv2d(WIDTH, WIDTH, 3, padding=1), math.sqrt(2))\n        self.n2 = nn.GroupNorm(4, WIDTH)\n        self.skip = ortho(nn.Conv2d(c, SKIP, 1), 1.0)\n        self.ch = WIDTH + SKIP\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * self.ch, GH), math.sqrt(2)), nn.ReLU(),\n                                  ortho(nn.Linear(GH, GH), math.sqrt(2)), nn.ReLU())\n        self.done = ortho(nn.Linear(GH, 1), 0.01)\n        self.value = ortho(nn.Linear(GH, 1), 1.0)\n        self.tbias = ortho(nn.Linear(GH, spec.n_types), 0.01)\n\n    def features(self, obs):\n        s = F.relu(self.s2(F.relu(self.s1(obs))))\n        x = F.relu(self.n1(self.c1(s)))\n        x = F.relu(x + self.n2(self.c2(x)))\n        f = torch.cat([x, self.skip(obs)], 1)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], 1))\n        return f, g\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.base = Base(spec)\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        self.T = len(self.fps)\n        self.frames = list(range(8)) if spec.X == spec.Y else [0, 1, 2, 3]\n        nf = len(self.frames)\n        self.nf = nf\n        self.proj = ortho(nn.Conv2d(self.base.ch, PROJ, 1), math.sqrt(2))\n        self.mix = nn.ModuleList([GLin(nf, 3 * PROJ, HID, math.sqrt(2)) for _ in self.fps])\n        self.out = nn.ModuleList([GLin(nf, HID, 1, 0.01) for _ in self.fps])\n        self.alpha = nn.Parameter(torch.zeros(nf))\n\n    def forward(self, obs, mask):\n        f, g = self.base.features(obs)\n        p = self.proj(f)\n        B = p.shape[0]\n        nf = self.nf\n        u = torch.stack([dihedral(p, k) for k in self.frames], 1)\n        Yf, Xf = u.shape[-2], u.shape[-1]\n        u = u.reshape(B, nf * PROJ, Yf, Xf)\n        maps = []\n        for t, (dy, dx) in enumerate(self.fps):\n            mx, mn, av = wpool(u, dy, dx)\n            z = torch.cat([mx.reshape(B, nf, PROJ, Yf, Xf), mn.reshape(B, nf, PROJ, Yf, Xf),\n                           av.reshape(B, nf, PROJ, Yf, Xf)], 2)\n            h = F.relu(self.mix[t](z))\n            maps.append(self.out[t](h))\n        L = torch.cat(maps, 2).reshape(B, nf, -1)\n        w = torch.softmax(SCALE * self.alpha, 0)\n        place = (L * w.view(1, nf, 1)).sum(1)\n        tb = self.base.tbias(g).unsqueeze(2).expand(B, self.T, Yf * Xf).reshape(B, -1)\n        place = place + tb\n        logits = torch.cat([place, self.base.done(g)], 1)\n        return logits, self.base.value(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 76990,
+    "fb_ms": 114.71,
+    "flops_per_sample": 24056064,
+    "flops_ratio": 1.32,
+    "sha": "b9d8baac1f07259c",
+    "recipe": {
+     "lr": 0.001,
+     "n_envs": 256,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "ppo_epochs": 4,
+     "ent_coef": 0.01,
+     "gamma": 0.95,
+     "gae_lambda": 0.9,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": null,
+    "budget": {
+     "allowed_steps": 99629,
+     "n_updates": 24,
+     "batch": 4096,
+     "steps": 98304,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0101
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0973,
+     "short_run_updates": 6
+    },
+    "rule": "bookmirror"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.127,
+    "dev_per_seed": [
+     0.127
+    ],
+    "train_exact": 0.0671,
+    "params": 76990,
+    "flops_ratio": 1.32,
+    "train_steps": 98304,
+    "wall_s": 126.6,
+    "sha": "b9d8baac1f07259c",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r1c2",
+   "round": 1,
+   "name": "transposed+identity square kernels",
+   "hypothesis": "This repeats the World-6 fix. Two frames (identity and transposed; on non-square grids, rot180 replaces the transpose) each get a shared square conv the size of the largest footprint. Per-type 1x1 outputs and a learned type-mixing matrix (identity plus a zero-initialised delta) follow. A small dense term from the global features covers every action, including a moved DONE index. A \u00d75 softmax picks the frame. Refuted if dev is 0 while the frame mixture scores.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nSTEM = 64\nCOL = 48\nWIDTH = 40\nSKIP = 24\nSQ = 32\nGH = 64\nSCALE = 5.0\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    if m.bias is not None:\n        nn.init.zeros_(m.bias)\n    return m\n\n\ndef dihedral(x, k):\n    if k >= 4:\n        x = x.transpose(-2, -1)\n    m = k % 4\n    if m == 1:\n        x = x.flip(-1)\n    elif m == 2:\n        x = x.flip(-2)\n    elif m == 3:\n        x = x.flip(-2).flip(-1)\n    return x\n\n\nclass Base(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        c = spec.in_channels\n        self.s1 = ortho(nn.Conv2d(c, STEM, 1), math.sqrt(2))\n        self.s2 = ortho(nn.Conv2d(STEM, COL, 1), math.sqrt(2))\n        self.c1 = ortho(nn.Conv2d(COL, WIDTH, 3, padding=1), math.sqrt(2))\n        self.n1 = nn.GroupNorm(4, WIDTH)\n        self.c2 = ortho(nn.Conv2d(WIDTH, WIDTH, 3, padding=1), math.sqrt(2))\n        self.n2 = nn.GroupNorm(4, WIDTH)\n        self.skip = ortho(nn.Conv2d(c, SKIP, 1), 1.0)\n        self.ch = WIDTH + SKIP\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * self.ch, GH), math.sqrt(2)), nn.ReLU(),\n                                  ortho(nn.Linear(GH, GH), math.sqrt(2)), nn.ReLU())\n        self.done = ortho(nn.Linear(GH, 1), 0.01)\n        self.value = ortho(nn.Linear(GH, 1), 1.0)\n        self.tbias = ortho(nn.Linear(GH, spec.n_types), 0.01)\n\n    def features(self, obs):\n        s = F.relu(self.s2(F.relu(self.s1(obs))))\n        x = F.relu(self.n1(self.c1(s)))\n        x = F.relu(x + self.n2(self.c2(x)))\n        f = torch.cat([x, self.skip(obs)], 1)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], 1))\n        return f, g\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.base = Base(spec)\n        self.T = spec.n_types\n        self.K = max(max(int(a), int(b)) for a, b in spec.footprints)\n        self.frames = [0, 4] if spec.X == spec.Y else [0, 3]\n        nf = len(self.frames)\n        self.nf = nf\n        self.convs = nn.ModuleList([ortho(nn.Conv2d(self.base.ch, SQ, self.K), math.sqrt(2)) for _ in self.frames])\n        self.outs = nn.ModuleList([ortho(nn.Conv2d(SQ, self.T, 1), 0.01) for _ in self.frames])\n        self.tmix = nn.Parameter(torch.zeros(nf, self.T, self.T))\n        self.dense = ortho(nn.Linear(GH, spec.n_actions), 0.01)\n        self.alpha = nn.Parameter(torch.zeros(nf))\n\n    def forward(self, obs, mask):\n        f, g = self.base.features(obs)\n        B = f.shape[0]\n        K = self.K\n        eye = torch.eye(self.T, device=f.device, dtype=f.dtype)\n        maps = []\n        for i, k in enumerate(self.frames):\n            u = dihedral(f, k)\n            u = F.pad(u, (0, K - 1, 0, K - 1))\n            h = F.relu(self.convs[i](u))\n            m = self.outs[i](h)\n            M = eye + self.tmix[i]\n            m = torch.einsum('st,btyx->bsyx', M, m)\n            maps.append(m.reshape(B, -1))\n        L = torch.stack(maps, 1)\n        w = torch.softmax(SCALE * self.alpha, 0)\n        place = (L * w.view(1, self.nf, 1)).sum(1)\n        n = place.shape[1] // self.T\n        place = place + self.base.tbias(g).unsqueeze(2).expand(B, self.T, n).reshape(B, -1)\n        logits = torch.cat([place, self.base.done(g)], 1) + self.dense(g)\n        return logits, self.base.value(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 83761,
+    "fb_ms": 53.08,
+    "flops_per_sample": 20529792,
+    "flops_ratio": 1.12,
+    "sha": "b7bfa5e1e5ed24c6",
+    "recipe": {
+     "lr": 0.001,
+     "n_envs": 256,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "ppo_epochs": 4,
+     "ent_coef": 0.01,
+     "gamma": 0.95,
+     "gae_lambda": 0.9,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": null,
+    "budget": {
+     "allowed_steps": 116742,
+     "n_updates": 28,
+     "batch": 4096,
+     "steps": 114688,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.014
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0128,
+     "short_run_updates": 7
+    },
+    "rule": "bookmirror"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 83761,
+    "flops_ratio": 1.12,
+    "train_steps": 114688,
+    "wall_s": 69.1,
+    "sha": "b7bfa5e1e5ed24c6",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r1c3",
+   "round": 1,
+   "name": "flattening-order mixture",
+   "hypothesis": "The action index may decode type, y and x in a different order. Separate per-type footprint heads, one for each of the 6 orderings of (type, y, x), are flattened in their own order. A \u00d75 softmax picks one. This covers type-major, anchor-major and y/x-swapped layouts on any grid shape. Refuted if dev stays 0 while a frame or corner candidate scores, or if every candidate scores 0.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nSTEM = 64\nCOL = 48\nWIDTH = 40\nSKIP = 24\nPROJ = 16\nHID = 16\nGH = 64\nSCALE = 5.0\nORDERS = ((1, 2, 3), (1, 3, 2), (2, 3, 1), (3, 2, 1), (2, 1, 3), (3, 1, 2))\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    if m.bias is not None:\n        nn.init.zeros_(m.bias)\n    return m\n\n\ndef wpool(q, dy, dx, top=True, left=True):\n    if dy * dx == 1:\n        return q, q, q\n    pad = ((0, dx - 1) if left else (dx - 1, 0)) + ((0, dy - 1) if top else (dy - 1, 0))\n    q = F.pad(q, pad)\n    mx = F.max_pool2d(q, (dy, dx), stride=1)\n    mn = -F.max_pool2d(-q, (dy, dx), stride=1)\n    av = F.avg_pool2d(q, (dy, dx), stride=1)\n    return mx, mn, av\n\n\nclass Base(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        c = spec.in_channels\n        self.s1 = ortho(nn.Conv2d(c, STEM, 1), math.sqrt(2))\n        self.s2 = ortho(nn.Conv2d(STEM, COL, 1), math.sqrt(2))\n        self.c1 = ortho(nn.Conv2d(COL, WIDTH, 3, padding=1), math.sqrt(2))\n        self.n1 = nn.GroupNorm(4, WIDTH)\n        self.c2 = ortho(nn.Conv2d(WIDTH, WIDTH, 3, padding=1), math.sqrt(2))\n        self.n2 = nn.GroupNorm(4, WIDTH)\n        self.skip = ortho(nn.Conv2d(c, SKIP, 1), 1.0)\n        self.ch = WIDTH + SKIP\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * self.ch, GH), math.sqrt(2)), nn.ReLU(),\n                                  ortho(nn.Linear(GH, GH), math.sqrt(2)), nn.ReLU())\n        self.done = ortho(nn.Linear(GH, 1), 0.01)\n        self.value = ortho(nn.Linear(GH, 1), 1.0)\n        self.tbias = ortho(nn.Linear(GH, spec.n_types), 0.01)\n\n    def features(self, obs):\n        s = F.relu(self.s2(F.relu(self.s1(obs))))\n        x = F.relu(self.n1(self.c1(s)))\n        x = F.relu(x + self.n2(self.c2(x)))\n        f = torch.cat([x, self.skip(obs)], 1)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], 1))\n        return f, g\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.base = Base(spec)\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        self.T = len(self.fps)\n        no = len(ORDERS)\n        self.no = no\n        self.proj = ortho(nn.Conv2d(self.base.ch, PROJ, 1), math.sqrt(2))\n        self.mix = nn.ModuleList([ortho(nn.Conv2d(3 * PROJ, no * HID, 1), math.sqrt(2)) for _ in self.fps])\n        self.out = nn.ModuleList([ortho(nn.Conv2d(no * HID, no, 1, groups=no), 0.01) for _ in self.fps])\n        self.alpha = nn.Parameter(torch.zeros(no))\n\n    def forward(self, obs, mask):\n        f, g = self.base.features(obs)\n        p = self.proj(f)\n        B = p.shape[0]\n        per_t = []\n        for t, (dy, dx) in enumerate(self.fps):\n            mx, mn, av = wpool(p, dy, dx)\n            h = F.relu(self.mix[t](torch.cat([mx, mn, av], 1)))\n            per_t.append(self.out[t](h))\n        L = torch.stack(per_t, 2)\n        L = L + self.base.tbias(g).view(B, 1, self.T, 1, 1)\n        maps = [L[:, k].permute(0, ORDERS[k][0], ORDERS[k][1], ORDERS[k][2]).reshape(B, -1) for k in range(self.no)]\n        Lm = torch.stack(maps, 1)\n        w = torch.softmax(SCALE * self.alpha, 0)\n        place = (Lm * w.view(1, self.no, 1)).sum(1)\n        logits = torch.cat([place, self.base.done(g)], 1)\n        return logits, self.base.value(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 70580,
+    "fb_ms": 70.63,
+    "flops_per_sample": 21893376,
+    "flops_ratio": 1.2,
+    "sha": "cbac767d7c92e964",
+    "recipe": {
+     "lr": 0.001,
+     "n_envs": 256,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "ppo_epochs": 4,
+     "ent_coef": 0.01,
+     "gamma": 0.95,
+     "gae_lambda": 0.9,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": null,
+    "budget": {
+     "allowed_steps": 109471,
+     "n_updates": 26,
+     "batch": 4096,
+     "steps": 106496,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0092
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0201,
+     "short_run_updates": 6
+    },
+    "rule": "bookmirror"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 70580,
+    "flops_ratio": 1.2,
+    "train_steps": 106496,
+    "wall_s": 90.9,
+    "sha": "cbac767d7c92e964",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r1c4",
+   "round": 1,
+   "name": "anchor-corner + 3x3 window",
+   "hypothesis": "The anchor cell may be a corner of the brick other than top-left, or shifted by one cell. Each type gets separate footprint-pooling heads anchored at each of the 4 corners, plus a 3x3-window conv head that can learn one-cell shifts. A \u00d75 softmax over the 5 hypotheses lets the net commit to one. Refuted if dev is 0 while candidates that change the frame or order score above 0.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nSTEM = 64\nCOL = 48\nWIDTH = 40\nSKIP = 24\nPROJ = 16\nHID = 16\nW3 = 24\nGH = 64\nSCALE = 5.0\nCORNERS = ((True, True), (True, False), (False, True), (False, False))\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    if m.bias is not None:\n        nn.init.zeros_(m.bias)\n    return m\n\n\ndef wpool(q, dy, dx, top=True, left=True):\n    if dy * dx == 1:\n        return q, q, q\n    pad = ((0, dx - 1) if left else (dx - 1, 0)) + ((0, dy - 1) if top else (dy - 1, 0))\n    q = F.pad(q, pad)\n    mx = F.max_pool2d(q, (dy, dx), stride=1)\n    mn = -F.max_pool2d(-q, (dy, dx), stride=1)\n    av = F.avg_pool2d(q, (dy, dx), stride=1)\n    return mx, mn, av\n\n\nclass Base(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        c = spec.in_channels\n        self.s1 = ortho(nn.Conv2d(c, STEM, 1), math.sqrt(2))\n        self.s2 = ortho(nn.Conv2d(STEM, COL, 1), math.sqrt(2))\n        self.c1 = ortho(nn.Conv2d(COL, WIDTH, 3, padding=1), math.sqrt(2))\n        self.n1 = nn.GroupNorm(4, WIDTH)\n        self.c2 = ortho(nn.Conv2d(WIDTH, WIDTH, 3, padding=1), math.sqrt(2))\n        self.n2 = nn.GroupNorm(4, WIDTH)\n        self.skip = ortho(nn.Conv2d(c, SKIP, 1), 1.0)\n        self.ch = WIDTH + SKIP\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * self.ch, GH), math.sqrt(2)), nn.ReLU(),\n                                  ortho(nn.Linear(GH, GH), math.sqrt(2)), nn.ReLU())\n        self.done = ortho(nn.Linear(GH, 1), 0.01)\n        self.value = ortho(nn.Linear(GH, 1), 1.0)\n        self.tbias = ortho(nn.Linear(GH, spec.n_types), 0.01)\n\n    def features(self, obs):\n        s = F.relu(self.s2(F.relu(self.s1(obs))))\n        x = F.relu(self.n1(self.c1(s)))\n        x = F.relu(x + self.n2(self.c2(x)))\n        f = torch.cat([x, self.skip(obs)], 1)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], 1))\n        return f, g\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.base = Base(spec)\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        self.T = len(self.fps)\n        nc = len(CORNERS)\n        self.nc = nc\n        self.proj = ortho(nn.Conv2d(self.base.ch, PROJ, 1), math.sqrt(2))\n        self.mix = nn.ModuleList([ortho(nn.Conv2d(nc * 3 * PROJ, nc * HID, 1, groups=nc), math.sqrt(2)) for _ in self.fps])\n        self.out = nn.ModuleList([ortho(nn.Conv2d(nc * HID, nc, 1, groups=nc), 0.01) for _ in self.fps])\n        self.c3 = ortho(nn.Conv2d(self.base.ch, W3, 3, padding=1), math.sqrt(2))\n        self.o3 = ortho(nn.Conv2d(W3, self.T, 1), 0.01)\n        self.alpha = nn.Parameter(torch.zeros(nc + 1))\n\n    def forward(self, obs, mask):\n        f, g = self.base.features(obs)\n        p = self.proj(f)\n        B = p.shape[0]\n        per_t = []\n        for t, (dy, dx) in enumerate(self.fps):\n            zs = []\n            for top, left in CORNERS:\n                mx, mn, av = wpool(p, dy, dx, top, left)\n                zs.append(torch.cat([mx, mn, av], 1))\n            h = F.relu(self.mix[t](torch.cat(zs, 1)))\n            per_t.append(self.out[t](h))\n        Lc = torch.stack(per_t, 2)\n        L3 = self.o3(F.relu(self.c3(f))).unsqueeze(1)\n        L = torch.cat([Lc, L3], 1).reshape(B, self.nc + 1, -1)\n        w = torch.softmax(SCALE * self.alpha, 0)\n        place = (L * w.view(1, self.nc + 1, 1)).sum(1)\n        n = place.shape[1] // self.T\n        place = place + self.base.tbias(g).unsqueeze(2).expand(B, self.T, n).reshape(B, -1)\n        logits = torch.cat([place, self.base.done(g)], 1)\n        return logits, self.base.value(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 78119,
+    "fb_ms": 120.54,
+    "flops_per_sample": 29401344,
+    "flops_ratio": 1.61,
+    "sha": "bcbb164d4e97b5ff",
+    "recipe": {
+     "lr": 0.001,
+     "n_envs": 256,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "ppo_epochs": 4,
+     "ent_coef": 0.01,
+     "gamma": 0.95,
+     "gae_lambda": 0.9,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": null,
+    "budget": {
+     "allowed_steps": 81516,
+     "n_updates": 19,
+     "batch": 4096,
+     "steps": 77824,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0081
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0195,
+     "short_run_updates": 4
+    },
+    "rule": "bookmirror"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 78119,
+    "flops_ratio": 1.61,
+    "train_steps": 77824,
+    "wall_s": 74.9,
+    "sha": "bcbb164d4e97b5ff",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r1c5",
+   "round": 1,
+   "name": "type permutation x frames",
+   "hypothesis": "The hidden change may swap which footprint belongs to which action type, on top of a frame misalignment. Per-frame, per-type heads (einsum weights, not grouped convs) are remapped by a learned T\u00d7T softmax assignment, then mixed over frames. Refuted if training and dev stay at 0 while the assignment and frame weights commit.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nSTEM = 64\nCOL = 48\nWIDTH = 40\nSKIP = 24\nPROJ = 16\nHID = 16\nGH = 64\nSCALE = 5.0\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    if m.bias is not None:\n        nn.init.zeros_(m.bias)\n    return m\n\n\nclass GLin(nn.Module):\n    def __init__(self, G, cin, cout, gain):\n        super().__init__()\n        w = torch.empty(G, cin, cout)\n        for g in range(G):\n            nn.init.orthogonal_(w[g], gain)\n        self.w = nn.Parameter(w)\n        self.b = nn.Parameter(torch.zeros(G, cout))\n        self.G = G\n        self.cout = cout\n\n    def forward(self, x):\n        y = torch.einsum('bgcyx,gco->bgoyx', x, self.w)\n        return y + self.b.view(1, self.G, self.cout, 1, 1)\n\n\ndef dihedral(x, k):\n    if k >= 4:\n        x = x.transpose(-2, -1)\n    m = k % 4\n    if m == 1:\n        x = x.flip(-1)\n    elif m == 2:\n        x = x.flip(-2)\n    elif m == 3:\n        x = x.flip(-2).flip(-1)\n    return x\n\n\ndef wpool(q, dy, dx, top=True, left=True):\n    if dy * dx == 1:\n        return q, q, q\n    pad = ((0, dx - 1) if left else (dx - 1, 0)) + ((0, dy - 1) if top else (dy - 1, 0))\n    q = F.pad(q, pad)\n    mx = F.max_pool2d(q, (dy, dx), stride=1)\n    mn = -F.max_pool2d(-q, (dy, dx), stride=1)\n    av = F.avg_pool2d(q, (dy, dx), stride=1)\n    return mx, mn, av\n\n\nclass Base(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        c = spec.in_channels\n        self.s1 = ortho(nn.Conv2d(c, STEM, 1), math.sqrt(2))\n        self.s2 = ortho(nn.Conv2d(STEM, COL, 1), math.sqrt(2))\n        self.c1 = ortho(nn.Conv2d(COL, WIDTH, 3, padding=1), math.sqrt(2))\n        self.n1 = nn.GroupNorm(4, WIDTH)\n        self.c2 = ortho(nn.Conv2d(WIDTH, WIDTH, 3, padding=1), math.sqrt(2))\n        self.n2 = nn.GroupNorm(4, WIDTH)\n        self.skip = ortho(nn.Conv2d(c, SKIP, 1), 1.0)\n        self.ch = WIDTH + SKIP\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * self.ch, GH), math.sqrt(2)), nn.ReLU(),\n                                  ortho(nn.Linear(GH, GH), math.sqrt(2)), nn.ReLU())\n        self.done = ortho(nn.Linear(GH, 1), 0.01)\n        self.value = ortho(nn.Linear(GH, 1), 1.0)\n        self.tbias = ortho(nn.Linear(GH, spec.n_types), 0.01)\n\n    def features(self, obs):\n        s = F.relu(self.s2(F.relu(self.s1(obs))))\n        x = F.relu(self.n1(self.c1(s)))\n        x = F.relu(x + self.n2(self.c2(x)))\n        f = torch.cat([x, self.skip(obs)], 1)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], 1))\n        return f, g\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.base = Base(spec)\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        self.T = len(self.fps)\n        self.frames = list(range(8)) if spec.X == spec.Y else [0, 1, 2, 3]\n        nf = len(self.frames)\n        self.nf = nf\n        self.proj = ortho(nn.Conv2d(self.base.ch, PROJ, 1), math.sqrt(2))\n        self.mix = nn.ModuleList([GLin(nf, 3 * PROJ, HID, math.sqrt(2)) for _ in self.fps])\n        self.out = nn.ModuleList([GLin(nf, HID, 1, 0.01) for _ in self.fps])\n        self.assign = nn.Parameter(torch.zeros(self.T, self.T))\n        self.alpha = nn.Parameter(torch.zeros(nf))\n\n    def forward(self, obs, mask):\n        f, g = self.base.features(obs)\n        p = self.proj(f)\n        B = p.shape[0]\n        nf = self.nf\n        u = torch.stack([dihedral(p, k) for k in self.frames], 1)\n        Yf, Xf = u.shape[-2], u.shape[-1]\n        u = u.reshape(B, nf * PROJ, Yf, Xf)\n        maps = []\n        for t, (dy, dx) in enumerate(self.fps):\n            mx, mn, av = wpool(u, dy, dx)\n            z = torch.cat([mx.reshape(B, nf, PROJ, Yf, Xf), mn.reshape(B, nf, PROJ, Yf, Xf),\n                           av.reshape(B, nf, PROJ, Yf, Xf)], 2)\n            h = F.relu(self.mix[t](z))\n            maps.append(self.out[t](h))\n        H = torch.cat(maps, 2)\n        S = torch.softmax(SCALE * self.assign, 1)\n        L = torch.einsum('tf,bkfyx->bktyx', S, H).reshape(B, nf, -1)\n        w = torch.softmax(SCALE * self.alpha, 0)\n        place = (L * w.view(1, nf, 1)).sum(1)\n        place = place + self.base.tbias(g).unsqueeze(2).expand(B, self.T, Yf * Xf).reshape(B, -1)\n        logits = torch.cat([place, self.base.done(g)], 1)\n        return logits, self.base.value(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 77006,
+    "fb_ms": 116.38,
+    "flops_per_sample": 24105216,
+    "flops_ratio": 1.32,
+    "sha": "eaf2b143f5facc96",
+    "recipe": {
+     "lr": 0.001,
+     "n_envs": 256,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "ppo_epochs": 4,
+     "ent_coef": 0.01,
+     "gamma": 0.95,
+     "gae_lambda": 0.9,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": null,
+    "budget": {
+     "allowed_steps": 99426,
+     "n_updates": 24,
+     "batch": 4096,
+     "steps": 98304,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0178
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.1931,
+     "short_run_updates": 6
+    },
+    "rule": "bookmirror"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.127,
+    "dev_per_seed": [
+     0.127
+    ],
+    "train_exact": 0.0849,
+    "params": 77006,
+    "flops_ratio": 1.32,
+    "train_steps": 98304,
+    "wall_s": 112.4,
+    "sha": "eaf2b143f5facc96",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r1c6",
+   "round": 1,
+   "name": "factorised union frame x corner x order",
+   "hypothesis": "Covers anchor corner (4), footprint orientation (2), dihedral output frame and flattening order (type-major against anchor-major), each with its own factorised softmax. Corner and orientation heads now use einsum per-group weights instead of grouped convs, so r is about 1.27. Refuted if training and dev both stay at 0. That would point to a layout outside this union, such as an anchor shift or swapped channel roles.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nSTEM = 64\nCOL = 48\nWIDTH = 40\nSKIP = 24\nPROJ = 16\nHID = 16\nGH = 64\nSCALE = 5.0\nCORNERS = ((True, True), (True, False), (False, True), (False, False))\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    if m.bias is not None:\n        nn.init.zeros_(m.bias)\n    return m\n\n\nclass GLin(nn.Module):\n    def __init__(self, G, cin, cout, gain):\n        super().__init__()\n        w = torch.empty(G, cin, cout)\n        for g in range(G):\n            nn.init.orthogonal_(w[g], gain)\n        self.w = nn.Parameter(w)\n        self.b = nn.Parameter(torch.zeros(G, cout))\n        self.G = G\n        self.cout = cout\n\n    def forward(self, x):\n        y = torch.einsum('bgcyx,gco->bgoyx', x, self.w)\n        return y + self.b.view(1, self.G, self.cout, 1, 1)\n\n\ndef dihedral(x, k):\n    if k >= 4:\n        x = x.transpose(-2, -1)\n    m = k % 4\n    if m == 1:\n        x = x.flip(-1)\n    elif m == 2:\n        x = x.flip(-2)\n    elif m == 3:\n        x = x.flip(-2).flip(-1)\n    return x\n\n\ndef wpool(q, dy, dx, top=True, left=True):\n    if dy * dx == 1:\n        return q, q, q\n    pad = ((0, dx - 1) if left else (dx - 1, 0)) + ((0, dy - 1) if top else (dy - 1, 0))\n    q = F.pad(q, pad)\n    mx = F.max_pool2d(q, (dy, dx), stride=1)\n    mn = -F.max_pool2d(-q, (dy, dx), stride=1)\n    av = F.avg_pool2d(q, (dy, dx), stride=1)\n    return mx, mn, av\n\n\nclass Base(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        c = spec.in_channels\n        self.s1 = ortho(nn.Conv2d(c, STEM, 1), math.sqrt(2))\n        self.s2 = ortho(nn.Conv2d(STEM, COL, 1), math.sqrt(2))\n        self.c1 = ortho(nn.Conv2d(COL, WIDTH, 3, padding=1), math.sqrt(2))\n        self.n1 = nn.GroupNorm(4, WIDTH)\n        self.c2 = ortho(nn.Conv2d(WIDTH, WIDTH, 3, padding=1), math.sqrt(2))\n        self.n2 = nn.GroupNorm(4, WIDTH)\n        self.skip = ortho(nn.Conv2d(c, SKIP, 1), 1.0)\n        self.ch = WIDTH + SKIP\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * self.ch, GH), math.sqrt(2)), nn.ReLU(),\n                                  ortho(nn.Linear(GH, GH), math.sqrt(2)), nn.ReLU())\n        self.done = ortho(nn.Linear(GH, 1), 0.01)\n        self.value = ortho(nn.Linear(GH, 1), 1.0)\n        self.tbias = ortho(nn.Linear(GH, spec.n_types), 0.01)\n\n    def features(self, obs):\n        s = F.relu(self.s2(F.relu(self.s1(obs))))\n        x = F.relu(self.n1(self.c1(s)))\n        x = F.relu(x + self.n2(self.c2(x)))\n        f = torch.cat([x, self.skip(obs)], 1)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], 1))\n        return f, g\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.base = Base(spec)\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        self.T = len(self.fps)\n        sq = spec.X == spec.Y\n        self.frames = list(range(8)) if sq else [0, 1, 2, 3]\n        self.no = 2 if sq else 1\n        G = len(CORNERS) * self.no\n        self.G = G\n        self.proj = ortho(nn.Conv2d(self.base.ch, PROJ, 1), math.sqrt(2))\n        self.mix = nn.ModuleList([GLin(G, 3 * PROJ, HID, math.sqrt(2)) for _ in self.fps])\n        self.out = nn.ModuleList([GLin(G, HID, 1, 0.01) for _ in self.fps])\n        self.af = nn.Parameter(torch.zeros(len(self.frames)))\n        self.ac = nn.Parameter(torch.zeros(len(CORNERS)))\n        self.ao = nn.Parameter(torch.zeros(2))\n\n    def forward(self, obs, mask):\n        f, g = self.base.features(obs)\n        p = self.proj(f)\n        B, _, Y, X = p.shape\n        nc = len(CORNERS)\n        per_t = []\n        for t, (dy, dx) in enumerate(self.fps):\n            zs = []\n            for top, left in CORNERS:\n                for o in range(self.no):\n                    a, b = (dy, dx) if o == 0 else (dx, dy)\n                    mx, mn, av = wpool(p, a, b, top, left)\n                    zs.append(torch.cat([mx, mn, av], 1))\n            z = torch.stack(zs, 1)\n            h = F.relu(self.mix[t](z))\n            per_t.append(self.out[t](h))\n        O = torch.cat(per_t, 2).reshape(B, nc, self.no, self.T, Y, X)\n        wc = torch.softmax(SCALE * self.ac, 0)\n        wf = torch.softmax(SCALE * self.af, 0)\n        wo = torch.softmax(SCALE * self.ao, 0)\n        Oc = (O * wc.view(1, nc, 1, 1, 1, 1)).sum(1)\n        tb = self.base.tbias(g).view(B, self.T, 1, 1)\n        place = None\n        for i, k in enumerate(self.frames):\n            o = 1 if k >= 4 else 0\n            A = dihedral(Oc[:, o] + tb, k)\n            tm = A.reshape(B, -1)\n            am = A.permute(0, 2, 3, 1).reshape(B, -1)\n            term = wf[i] * (wo[0] * tm + wo[1] * am)\n            place = term if place is None else place + term\n        logits = torch.cat([place, self.base.done(g)], 1)\n        return logits, self.base.value(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 76996,
+    "fb_ms": 125.84,
+    "flops_per_sample": 24056064,
+    "flops_ratio": 1.32,
+    "sha": "2a7e1d38e7f498f9",
+    "recipe": {
+     "lr": 0.001,
+     "n_envs": 256,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "ppo_epochs": 4,
+     "ent_coef": 0.01,
+     "gamma": 0.95,
+     "gae_lambda": 0.9,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": null,
+    "budget": {
+     "allowed_steps": 99629,
+     "n_updates": 24,
+     "batch": 4096,
+     "steps": 98304,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0086
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0252,
+     "short_run_updates": 6
+    },
+    "rule": "bookmirror"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.1367,
+    "dev_per_seed": [
+     0.1367
+    ],
+    "train_exact": 0.1025,
+    "params": 76996,
+    "flops_ratio": 1.32,
+    "train_steps": 98304,
+    "wall_s": 173.7,
+    "sha": "2a7e1d38e7f498f9",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r2c1",
+   "round": 2,
+   "name": "dedup union, default recipe",
+   "hypothesis": "Same hypotheses as r1c6 (frame \u00d7 corner \u00d7 order). The 13 distinct footprint-window heads are computed once and shared across frames, so r drops from 1.32 to about 0.97. That gives about 131k samples instead of 98k. If more samples help at this level, dev should beat 0.137. Refuted if dev drops to 0, which would mean sharing heads across frames hurts. A small drop is within seed noise.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nSTEM = 64\nCOL = 48\nWIDTH = 40\nSKIP = 24\nPROJ = 16\nHID = 16\nGH = 64\nSCALE = 5.0\nCORNERS = ((True, True), (True, False), (False, True), (False, False))\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    if m.bias is not None:\n        nn.init.zeros_(m.bias)\n    return m\n\n\ndef dihedral(x, k):\n    if k >= 4:\n        x = x.transpose(-2, -1)\n    m = k % 4\n    if m == 1:\n        x = x.flip(-1)\n    elif m == 2:\n        x = x.flip(-2)\n    elif m == 3:\n        x = x.flip(-2).flip(-1)\n    return x\n\n\ndef wpool(q, dy, dx, top=True, left=True):\n    if dy * dx == 1:\n        return q, q, q\n    pad = ((0, dx - 1) if left else (dx - 1, 0)) + ((0, dy - 1) if top else (dy - 1, 0))\n    q = F.pad(q, pad)\n    mx = F.max_pool2d(q, (dy, dx), stride=1)\n    mn = -F.max_pool2d(-q, (dy, dx), stride=1)\n    av = F.avg_pool2d(q, (dy, dx), stride=1)\n    return mx, mn, av\n\n\ndef vkey(t, a, b, top, left):\n    if a == 1:\n        top = True\n    if b == 1:\n        left = True\n    return (t, a, b, top, left)\n\n\nclass Base(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        c = spec.in_channels\n        self.s1 = ortho(nn.Conv2d(c, STEM, 1), math.sqrt(2))\n        self.s2 = ortho(nn.Conv2d(STEM, COL, 1), math.sqrt(2))\n        self.c1 = ortho(nn.Conv2d(COL, WIDTH, 3, padding=1), math.sqrt(2))\n        self.n1 = nn.GroupNorm(4, WIDTH)\n        self.c2 = ortho(nn.Conv2d(WIDTH, WIDTH, 3, padding=1), math.sqrt(2))\n        self.n2 = nn.GroupNorm(4, WIDTH)\n        self.skip = ortho(nn.Conv2d(c, SKIP, 1), 1.0)\n        self.ch = WIDTH + SKIP\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * self.ch, GH), math.sqrt(2)), nn.ReLU(),\n                                  ortho(nn.Linear(GH, GH), math.sqrt(2)), nn.ReLU())\n        self.done = ortho(nn.Linear(GH, 1), 0.01)\n        self.value = ortho(nn.Linear(GH, 1), 1.0)\n        self.tbias = ortho(nn.Linear(GH, spec.n_types), 0.01)\n\n    def features(self, obs):\n        s = F.relu(self.s2(F.relu(self.s1(obs))))\n        x = F.relu(self.n1(self.c1(s)))\n        x = F.relu(x + self.n2(self.c2(x)))\n        f = torch.cat([x, self.skip(obs)], 1)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], 1))\n        return f, g\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.base = Base(spec)\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        self.T = len(self.fps)\n        sq = spec.X == spec.Y\n        self.frames = list(range(8)) if sq else [0, 1, 2, 3]\n        self.no = 2 if sq else 1\n        keys = []\n        sel = []\n        for top, left in CORNERS:\n            row = []\n            for o in range(self.no):\n                rt = []\n                for t, (dy, dx) in enumerate(self.fps):\n                    a, b = (dy, dx) if o == 0 else (dx, dy)\n                    k = vkey(t, a, b, top, left)\n                    if k not in keys:\n                        keys.append(k)\n                    rt.append(keys.index(k))\n                row.append(rt)\n            sel.append(row)\n        self.keys = keys\n        self.sel = sel\n        self.proj = ortho(nn.Conv2d(self.base.ch, PROJ, 1), math.sqrt(2))\n        self.mix = nn.ModuleList([ortho(nn.Conv2d(3 * PROJ, HID, 1), math.sqrt(2)) for _ in keys])\n        self.out = nn.ModuleList([ortho(nn.Conv2d(HID, 1, 1), 0.01) for _ in keys])\n        self.af = nn.Parameter(torch.zeros(len(self.frames)))\n        self.ac = nn.Parameter(torch.zeros(len(CORNERS)))\n        self.ao = nn.Parameter(torch.zeros(2))\n\n    def forward(self, obs, mask):\n        f, g = self.base.features(obs)\n        p = self.proj(f)\n        B = p.shape[0]\n        H = []\n        for key, mix, out in zip(self.keys, self.mix, self.out):\n            t, a, b, top, left = key\n            mx, mn, av = wpool(p, a, b, top, left)\n            H.append(out(F.relu(mix(torch.cat([mx, mn, av], 1)))))\n        wc = torch.softmax(SCALE * self.ac, 0)\n        wf = torch.softmax(SCALE * self.af, 0)\n        wo = torch.softmax(SCALE * self.ao, 0)\n        tb = self.base.tbias(g).view(B, self.T, 1, 1)\n        Oc = []\n        for o in range(self.no):\n            acc = None\n            for c in range(len(CORNERS)):\n                m = torch.cat([H[i] for i in self.sel[c][o]], 1)\n                acc = wc[c] * m if acc is None else acc + wc[c] * m\n            Oc.append(acc + tb)\n        place = None\n        for i, k in enumerate(self.frames):\n            o = 1 if k >= 4 else 0\n            A = dihedral(Oc[o], k)\n            tm = A.reshape(B, -1)\n            am = A.permute(0, 2, 3, 1).reshape(B, -1)\n            term = wf[i] * (wo[0] * tm + wo[1] * am)\n            place = term if place is None else place + term\n        logits = torch.cat([place, self.base.done(g)], 1)\n        return logits, self.base.value(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 61777,
+    "fb_ms": 90.99,
+    "flops_per_sample": 18336000,
+    "flops_ratio": 1.0,
+    "sha": "0137336d4ed32fe3",
+    "recipe": {
+     "lr": 0.001,
+     "n_envs": 256,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "ppo_epochs": 4,
+     "ent_coef": 0.01,
+     "gamma": 0.95,
+     "gae_lambda": 0.9,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": null,
+    "budget": {
+     "allowed_steps": 130709,
+     "n_updates": 31,
+     "batch": 4096,
+     "steps": 126976,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0131
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0207,
+     "short_run_updates": 7
+    },
+    "rule": "bookmirror"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.1836,
+    "dev_per_seed": [
+     0.1836
+    ],
+    "train_exact": 0.1823,
+    "params": 61777,
+    "flops_ratio": 1.0,
+    "train_steps": 126976,
+    "wall_s": 140.5,
+    "sha": "0137336d4ed32fe3",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r2c2",
+   "round": 2,
+   "name": "dedup union, 1 epoch long rollout",
+   "hypothesis": "With r \u2264 1, a single PPO epoch on 128\u00d764 rollouts with 64 minibatches and gamma 0.995 gives about 426k samples, 3.2 times the default. The +1 exact-build bonus at episode end is also discounted less. If the agent is short of samples and credit assignment, dev should rise clearly above 0.14. Refuted if dev falls to about 0 while the default-recipe sibling scores, which would mean one epoch is too sample-inefficient here.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {\"ppo_epochs\": 1, \"n_envs\": 128, \"rollout_len\": 64, \"n_minibatches\": 64, \"gamma\": 0.995}\n\nSTEM = 64\nCOL = 48\nWIDTH = 40\nSKIP = 24\nPROJ = 16\nHID = 16\nGH = 64\nSCALE = 5.0\nCORNERS = ((True, True), (True, False), (False, True), (False, False))\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    if m.bias is not None:\n        nn.init.zeros_(m.bias)\n    return m\n\n\ndef dihedral(x, k):\n    if k >= 4:\n        x = x.transpose(-2, -1)\n    m = k % 4\n    if m == 1:\n        x = x.flip(-1)\n    elif m == 2:\n        x = x.flip(-2)\n    elif m == 3:\n        x = x.flip(-2).flip(-1)\n    return x\n\n\ndef wpool(q, dy, dx, top=True, left=True):\n    if dy * dx == 1:\n        return q, q, q\n    pad = ((0, dx - 1) if left else (dx - 1, 0)) + ((0, dy - 1) if top else (dy - 1, 0))\n    q = F.pad(q, pad)\n    mx = F.max_pool2d(q, (dy, dx), stride=1)\n    mn = -F.max_pool2d(-q, (dy, dx), stride=1)\n    av = F.avg_pool2d(q, (dy, dx), stride=1)\n    return mx, mn, av\n\n\ndef vkey(t, a, b, top, left):\n    if a == 1:\n        top = True\n    if b == 1:\n        left = True\n    return (t, a, b, top, left)\n\n\nclass Base(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        c = spec.in_channels\n        self.s1 = ortho(nn.Conv2d(c, STEM, 1), math.sqrt(2))\n        self.s2 = ortho(nn.Conv2d(STEM, COL, 1), math.sqrt(2))\n        self.c1 = ortho(nn.Conv2d(COL, WIDTH, 3, padding=1), math.sqrt(2))\n        self.n1 = nn.GroupNorm(4, WIDTH)\n        self.c2 = ortho(nn.Conv2d(WIDTH, WIDTH, 3, padding=1), math.sqrt(2))\n        self.n2 = nn.GroupNorm(4, WIDTH)\n        self.skip = ortho(nn.Conv2d(c, SKIP, 1), 1.0)\n        self.ch = WIDTH + SKIP\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * self.ch, GH), math.sqrt(2)), nn.ReLU(),\n                                  ortho(nn.Linear(GH, GH), math.sqrt(2)), nn.ReLU())\n        self.done = ortho(nn.Linear(GH, 1), 0.01)\n        self.value = ortho(nn.Linear(GH, 1), 1.0)\n        self.tbias = ortho(nn.Linear(GH, spec.n_types), 0.01)\n\n    def features(self, obs):\n        s = F.relu(self.s2(F.relu(self.s1(obs))))\n        x = F.relu(self.n1(self.c1(s)))\n        x = F.relu(x + self.n2(self.c2(x)))\n        f = torch.cat([x, self.skip(obs)], 1)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], 1))\n        return f, g\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.base = Base(spec)\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        self.T = len(self.fps)\n        sq = spec.X == spec.Y\n        self.frames = list(range(8)) if sq else [0, 1, 2, 3]\n        self.no = 2 if sq else 1\n        keys = []\n        sel = []\n        for top, left in CORNERS:\n            row = []\n            for o in range(self.no):\n                rt = []\n                for t, (dy, dx) in enumerate(self.fps):\n                    a, b = (dy, dx) if o == 0 else (dx, dy)\n                    k = vkey(t, a, b, top, left)\n                    if k not in keys:\n                        keys.append(k)\n                    rt.append(keys.index(k))\n                row.append(rt)\n            sel.append(row)\n        self.keys = keys\n        self.sel = sel\n        self.proj = ortho(nn.Conv2d(self.base.ch, PROJ, 1), math.sqrt(2))\n        self.mix = nn.ModuleList([ortho(nn.Conv2d(3 * PROJ, HID, 1), math.sqrt(2)) for _ in keys])\n        self.out = nn.ModuleList([ortho(nn.Conv2d(HID, 1, 1), 0.01) for _ in keys])\n        self.af = nn.Parameter(torch.zeros(len(self.frames)))\n        self.ac = nn.Parameter(torch.zeros(len(CORNERS)))\n        self.ao = nn.Parameter(torch.zeros(2))\n\n    def forward(self, obs, mask):\n        f, g = self.base.features(obs)\n        p = self.proj(f)\n        B = p.shape[0]\n        H = []\n        for key, mix, out in zip(self.keys, self.mix, self.out):\n            t, a, b, top, left = key\n            mx, mn, av = wpool(p, a, b, top, left)\n            H.append(out(F.relu(mix(torch.cat([mx, mn, av], 1)))))\n        wc = torch.softmax(SCALE * self.ac, 0)\n        wf = torch.softmax(SCALE * self.af, 0)\n        wo = torch.softmax(SCALE * self.ao, 0)\n        tb = self.base.tbias(g).view(B, self.T, 1, 1)\n        Oc = []\n        for o in range(self.no):\n            acc = None\n            for c in range(len(CORNERS)):\n                m = torch.cat([H[i] for i in self.sel[c][o]], 1)\n                acc = wc[c] * m if acc is None else acc + wc[c] * m\n            Oc.append(acc + tb)\n        place = None\n        for i, k in enumerate(self.frames):\n            o = 1 if k >= 4 else 0\n            A = dihedral(Oc[o], k)\n            tm = A.reshape(B, -1)\n            am = A.permute(0, 2, 3, 1).reshape(B, -1)\n            term = wf[i] * (wo[0] * tm + wo[1] * am)\n            place = term if place is None else place + term\n        logits = torch.cat([place, self.base.done(g)], 1)\n        return logits, self.base.value(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 61777,
+    "fb_ms": 93.61,
+    "flops_per_sample": 18336000,
+    "flops_ratio": 1.0,
+    "sha": "cdc10daa5f740571",
+    "recipe": {
+     "lr": 0.001,
+     "n_envs": 128,
+     "rollout_len": 64,
+     "n_minibatches": 64,
+     "ppo_epochs": 1,
+     "ent_coef": 0.01,
+     "gamma": 0.995,
+     "gae_lambda": 0.9,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "ppo_epochs": 1,
+     "n_envs": 128,
+     "rollout_len": 64,
+     "n_minibatches": 64,
+     "gamma": 0.995
+    },
+    "budget": {
+     "allowed_steps": 424806,
+     "n_updates": 51,
+     "batch": 8192,
+     "steps": 417792,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0131
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0207,
+     "short_run_updates": 7
+    },
+    "rule": "bookmirror"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.3535,
+    "dev_per_seed": [
+     0.3535
+    ],
+    "train_exact": 0.3599,
+    "params": 61777,
+    "flops_ratio": 1.0,
+    "train_steps": 417792,
+    "wall_s": 157.1,
+    "sha": "cdc10daa5f740571",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r2c3",
+   "round": 2,
+   "name": "dedup union, 2 epochs",
+   "hypothesis": "This is the middle-ground recipe: 2 epochs, 128 envs, rollout 16, 16 minibatches, gamma 0.97, lambda 0.95, entropy 0.005. At r \u2264 1 it gives about 243k samples and about 118 updates, so more samples than default with more gradient reuse than 1 epoch. Lower entropy should help the frame softmax commit. Refuted if dev falls to about 0 while the default and 1-epoch siblings score.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {\"ppo_epochs\": 2, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 16, \"gamma\": 0.97, \"gae_lambda\": 0.95, \"ent_coef\": 0.005}\n\nSTEM = 64\nCOL = 48\nWIDTH = 40\nSKIP = 24\nPROJ = 16\nHID = 16\nGH = 64\nSCALE = 5.0\nCORNERS = ((True, True), (True, False), (False, True), (False, False))\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    if m.bias is not None:\n        nn.init.zeros_(m.bias)\n    return m\n\n\ndef dihedral(x, k):\n    if k >= 4:\n        x = x.transpose(-2, -1)\n    m = k % 4\n    if m == 1:\n        x = x.flip(-1)\n    elif m == 2:\n        x = x.flip(-2)\n    elif m == 3:\n        x = x.flip(-2).flip(-1)\n    return x\n\n\ndef wpool(q, dy, dx, top=True, left=True):\n    if dy * dx == 1:\n        return q, q, q\n    pad = ((0, dx - 1) if left else (dx - 1, 0)) + ((0, dy - 1) if top else (dy - 1, 0))\n    q = F.pad(q, pad)\n    mx = F.max_pool2d(q, (dy, dx), stride=1)\n    mn = -F.max_pool2d(-q, (dy, dx), stride=1)\n    av = F.avg_pool2d(q, (dy, dx), stride=1)\n    return mx, mn, av\n\n\ndef vkey(t, a, b, top, left):\n    if a == 1:\n        top = True\n    if b == 1:\n        left = True\n    return (t, a, b, top, left)\n\n\nclass Base(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        c = spec.in_channels\n        self.s1 = ortho(nn.Conv2d(c, STEM, 1), math.sqrt(2))\n        self.s2 = ortho(nn.Conv2d(STEM, COL, 1), math.sqrt(2))\n        self.c1 = ortho(nn.Conv2d(COL, WIDTH, 3, padding=1), math.sqrt(2))\n        self.n1 = nn.GroupNorm(4, WIDTH)\n        self.c2 = ortho(nn.Conv2d(WIDTH, WIDTH, 3, padding=1), math.sqrt(2))\n        self.n2 = nn.GroupNorm(4, WIDTH)\n        self.skip = ortho(nn.Conv2d(c, SKIP, 1), 1.0)\n        self.ch = WIDTH + SKIP\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * self.ch, GH), math.sqrt(2)), nn.ReLU(),\n                                  ortho(nn.Linear(GH, GH), math.sqrt(2)), nn.ReLU())\n        self.done = ortho(nn.Linear(GH, 1), 0.01)\n        self.value = ortho(nn.Linear(GH, 1), 1.0)\n        self.tbias = ortho(nn.Linear(GH, spec.n_types), 0.01)\n\n    def features(self, obs):\n        s = F.relu(self.s2(F.relu(self.s1(obs))))\n        x = F.relu(self.n1(self.c1(s)))\n        x = F.relu(x + self.n2(self.c2(x)))\n        f = torch.cat([x, self.skip(obs)], 1)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], 1))\n        return f, g\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.base = Base(spec)\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        self.T = len(self.fps)\n        sq = spec.X == spec.Y\n        self.frames = list(range(8)) if sq else [0, 1, 2, 3]\n        self.no = 2 if sq else 1\n        keys = []\n        sel = []\n        for top, left in CORNERS:\n            row = []\n            for o in range(self.no):\n                rt = []\n                for t, (dy, dx) in enumerate(self.fps):\n                    a, b = (dy, dx) if o == 0 else (dx, dy)\n                    k = vkey(t, a, b, top, left)\n                    if k not in keys:\n                        keys.append(k)\n                    rt.append(keys.index(k))\n                row.append(rt)\n            sel.append(row)\n        self.keys = keys\n        self.sel = sel\n        self.proj = ortho(nn.Conv2d(self.base.ch, PROJ, 1), math.sqrt(2))\n        self.mix = nn.ModuleList([ortho(nn.Conv2d(3 * PROJ, HID, 1), math.sqrt(2)) for _ in keys])\n        self.out = nn.ModuleList([ortho(nn.Conv2d(HID, 1, 1), 0.01) for _ in keys])\n        self.af = nn.Parameter(torch.zeros(len(self.frames)))\n        self.ac = nn.Parameter(torch.zeros(len(CORNERS)))\n        self.ao = nn.Parameter(torch.zeros(2))\n\n    def forward(self, obs, mask):\n        f, g = self.base.features(obs)\n        p = self.proj(f)\n        B = p.shape[0]\n        H = []\n        for key, mix, out in zip(self.keys, self.mix, self.out):\n            t, a, b, top, left = key\n            mx, mn, av = wpool(p, a, b, top, left)\n            H.append(out(F.relu(mix(torch.cat([mx, mn, av], 1)))))\n        wc = torch.softmax(SCALE * self.ac, 0)\n        wf = torch.softmax(SCALE * self.af, 0)\n        wo = torch.softmax(SCALE * self.ao, 0)\n        tb = self.base.tbias(g).view(B, self.T, 1, 1)\n        Oc = []\n        for o in range(self.no):\n            acc = None\n            for c in range(len(CORNERS)):\n                m = torch.cat([H[i] for i in self.sel[c][o]], 1)\n                acc = wc[c] * m if acc is None else acc + wc[c] * m\n            Oc.append(acc + tb)\n        place = None\n        for i, k in enumerate(self.frames):\n            o = 1 if k >= 4 else 0\n            A = dihedral(Oc[o], k)\n            tm = A.reshape(B, -1)\n            am = A.permute(0, 2, 3, 1).reshape(B, -1)\n            term = wf[i] * (wo[0] * tm + wo[1] * am)\n            place = term if place is None else place + term\n        logits = torch.cat([place, self.base.done(g)], 1)\n        return logits, self.base.value(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 61777,
+    "fb_ms": 94.33,
+    "flops_per_sample": 18336000,
+    "flops_ratio": 1.0,
+    "sha": "2afa14ae83ea0794",
+    "recipe": {
+     "lr": 0.001,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 16,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "ppo_epochs": 2,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 16,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "ent_coef": 0.005
+    },
+    "budget": {
+     "allowed_steps": 242746,
+     "n_updates": 118,
+     "batch": 2048,
+     "steps": 241664,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0131
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0207,
+     "short_run_updates": 7
+    },
+    "rule": "bookmirror"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.4199,
+    "dev_per_seed": [
+     0.4199
+    ],
+    "train_exact": 0.4343,
+    "params": 61777,
+    "flops_ratio": 1.0,
+    "train_steps": 241664,
+    "wall_s": 145.5,
+    "sha": "2afa14ae83ea0794",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r2c4",
+   "round": 2,
+   "name": "dedup union, lr 1.5e-3",
+   "hypothesis": "The shared-head union with the default recipe except lr 1.5e-3. At about 31 updates of 4 epochs, a larger step size may speed up committing to the frame and learning to build. Refuted if dev is clearly below the default-lr sibling or falls to 0. That would mean optimisation is already at its stability limit.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {\"lr\": 0.0015}\n\nSTEM = 64\nCOL = 48\nWIDTH = 40\nSKIP = 24\nPROJ = 16\nHID = 16\nGH = 64\nSCALE = 5.0\nCORNERS = ((True, True), (True, False), (False, True), (False, False))\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    if m.bias is not None:\n        nn.init.zeros_(m.bias)\n    return m\n\n\ndef dihedral(x, k):\n    if k >= 4:\n        x = x.transpose(-2, -1)\n    m = k % 4\n    if m == 1:\n        x = x.flip(-1)\n    elif m == 2:\n        x = x.flip(-2)\n    elif m == 3:\n        x = x.flip(-2).flip(-1)\n    return x\n\n\ndef wpool(q, dy, dx, top=True, left=True):\n    if dy * dx == 1:\n        return q, q, q\n    pad = ((0, dx - 1) if left else (dx - 1, 0)) + ((0, dy - 1) if top else (dy - 1, 0))\n    q = F.pad(q, pad)\n    mx = F.max_pool2d(q, (dy, dx), stride=1)\n    mn = -F.max_pool2d(-q, (dy, dx), stride=1)\n    av = F.avg_pool2d(q, (dy, dx), stride=1)\n    return mx, mn, av\n\n\ndef vkey(t, a, b, top, left):\n    if a == 1:\n        top = True\n    if b == 1:\n        left = True\n    return (t, a, b, top, left)\n\n\nclass Base(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        c = spec.in_channels\n        self.s1 = ortho(nn.Conv2d(c, STEM, 1), math.sqrt(2))\n        self.s2 = ortho(nn.Conv2d(STEM, COL, 1), math.sqrt(2))\n        self.c1 = ortho(nn.Conv2d(COL, WIDTH, 3, padding=1), math.sqrt(2))\n        self.n1 = nn.GroupNorm(4, WIDTH)\n        self.c2 = ortho(nn.Conv2d(WIDTH, WIDTH, 3, padding=1), math.sqrt(2))\n        self.n2 = nn.GroupNorm(4, WIDTH)\n        self.skip = ortho(nn.Conv2d(c, SKIP, 1), 1.0)\n        self.ch = WIDTH + SKIP\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * self.ch, GH), math.sqrt(2)), nn.ReLU(),\n                                  ortho(nn.Linear(GH, GH), math.sqrt(2)), nn.ReLU())\n        self.done = ortho(nn.Linear(GH, 1), 0.01)\n        self.value = ortho(nn.Linear(GH, 1), 1.0)\n        self.tbias = ortho(nn.Linear(GH, spec.n_types), 0.01)\n\n    def features(self, obs):\n        s = F.relu(self.s2(F.relu(self.s1(obs))))\n        x = F.relu(self.n1(self.c1(s)))\n        x = F.relu(x + self.n2(self.c2(x)))\n        f = torch.cat([x, self.skip(obs)], 1)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], 1))\n        return f, g\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.base = Base(spec)\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        self.T = len(self.fps)\n        sq = spec.X == spec.Y\n        self.frames = list(range(8)) if sq else [0, 1, 2, 3]\n        self.no = 2 if sq else 1\n        keys = []\n        sel = []\n        for top, left in CORNERS:\n            row = []\n            for o in range(self.no):\n                rt = []\n                for t, (dy, dx) in enumerate(self.fps):\n                    a, b = (dy, dx) if o == 0 else (dx, dy)\n                    k = vkey(t, a, b, top, left)\n                    if k not in keys:\n                        keys.append(k)\n                    rt.append(keys.index(k))\n                row.append(rt)\n            sel.append(row)\n        self.keys = keys\n        self.sel = sel\n        self.proj = ortho(nn.Conv2d(self.base.ch, PROJ, 1), math.sqrt(2))\n        self.mix = nn.ModuleList([ortho(nn.Conv2d(3 * PROJ, HID, 1), math.sqrt(2)) for _ in keys])\n        self.out = nn.ModuleList([ortho(nn.Conv2d(HID, 1, 1), 0.01) for _ in keys])\n        self.af = nn.Parameter(torch.zeros(len(self.frames)))\n        self.ac = nn.Parameter(torch.zeros(len(CORNERS)))\n        self.ao = nn.Parameter(torch.zeros(2))\n\n    def forward(self, obs, mask):\n        f, g = self.base.features(obs)\n        p = self.proj(f)\n        B = p.shape[0]\n        H = []\n        for key, mix, out in zip(self.keys, self.mix, self.out):\n            t, a, b, top, left = key\n            mx, mn, av = wpool(p, a, b, top, left)\n            H.append(out(F.relu(mix(torch.cat([mx, mn, av], 1)))))\n        wc = torch.softmax(SCALE * self.ac, 0)\n        wf = torch.softmax(SCALE * self.af, 0)\n        wo = torch.softmax(SCALE * self.ao, 0)\n        tb = self.base.tbias(g).view(B, self.T, 1, 1)\n        Oc = []\n        for o in range(self.no):\n            acc = None\n            for c in range(len(CORNERS)):\n                m = torch.cat([H[i] for i in self.sel[c][o]], 1)\n                acc = wc[c] * m if acc is None else acc + wc[c] * m\n            Oc.append(acc + tb)\n        place = None\n        for i, k in enumerate(self.frames):\n            o = 1 if k >= 4 else 0\n            A = dihedral(Oc[o], k)\n            tm = A.reshape(B, -1)\n            am = A.permute(0, 2, 3, 1).reshape(B, -1)\n            term = wf[i] * (wo[0] * tm + wo[1] * am)\n            place = term if place is None else place + term\n        logits = torch.cat([place, self.base.done(g)], 1)\n        return logits, self.base.value(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 61777,
+    "fb_ms": 93.69,
+    "flops_per_sample": 18336000,
+    "flops_ratio": 1.0,
+    "sha": "a5ca8f1756a4bca0",
+    "recipe": {
+     "lr": 0.0015,
+     "n_envs": 256,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "ppo_epochs": 4,
+     "ent_coef": 0.01,
+     "gamma": 0.95,
+     "gae_lambda": 0.9,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "lr": 0.0015
+    },
+    "budget": {
+     "allowed_steps": 130709,
+     "n_updates": 31,
+     "batch": 4096,
+     "steps": 126976,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0131
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0207,
+     "short_run_updates": 7
+    },
+    "rule": "bookmirror"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.627,
+    "dev_per_seed": [
+     0.627
+    ],
+    "train_exact": 0.527,
+    "params": 61777,
+    "flops_ratio": 1.0,
+    "train_steps": 126976,
+    "wall_s": 150.3,
+    "sha": "a5ca8f1756a4bca0",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r2c5",
+   "round": 2,
+   "name": "dedup pure frames, default recipe",
+   "hypothesis": "Exact dihedral-frame semantics, as in r1c1. Each frame maps to its own window shape and corner, and the 13 distinct heads are shared, so r is about 0.97. There is only one factor (frame), so commitment should be cleaner than the 3-factor union, which matters for the 4-seed retrain. Refuted if dev falls to 0 while the dedup union with the default recipe scores. That would mean the true layout needs a corner that is not tied to the frame.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nSTEM = 64\nCOL = 48\nWIDTH = 40\nSKIP = 24\nPROJ = 16\nHID = 16\nGH = 64\nSCALE = 5.0\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    if m.bias is not None:\n        nn.init.zeros_(m.bias)\n    return m\n\n\ndef dihedral(x, k):\n    if k >= 4:\n        x = x.transpose(-2, -1)\n    m = k % 4\n    if m == 1:\n        x = x.flip(-1)\n    elif m == 2:\n        x = x.flip(-2)\n    elif m == 3:\n        x = x.flip(-2).flip(-1)\n    return x\n\n\ndef wpool(q, dy, dx, top=True, left=True):\n    if dy * dx == 1:\n        return q, q, q\n    pad = ((0, dx - 1) if left else (dx - 1, 0)) + ((0, dy - 1) if top else (dy - 1, 0))\n    q = F.pad(q, pad)\n    mx = F.max_pool2d(q, (dy, dx), stride=1)\n    mn = -F.max_pool2d(-q, (dy, dx), stride=1)\n    av = F.avg_pool2d(q, (dy, dx), stride=1)\n    return mx, mn, av\n\n\ndef vkey(t, a, b, top, left):\n    if a == 1:\n        top = True\n    if b == 1:\n        left = True\n    return (t, a, b, top, left)\n\n\nclass Base(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        c = spec.in_channels\n        self.s1 = ortho(nn.Conv2d(c, STEM, 1), math.sqrt(2))\n        self.s2 = ortho(nn.Conv2d(STEM, COL, 1), math.sqrt(2))\n        self.c1 = ortho(nn.Conv2d(COL, WIDTH, 3, padding=1), math.sqrt(2))\n        self.n1 = nn.GroupNorm(4, WIDTH)\n        self.c2 = ortho(nn.Conv2d(WIDTH, WIDTH, 3, padding=1), math.sqrt(2))\n        self.n2 = nn.GroupNorm(4, WIDTH)\n        self.skip = ortho(nn.Conv2d(c, SKIP, 1), 1.0)\n        self.ch = WIDTH + SKIP\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * self.ch, GH), math.sqrt(2)), nn.ReLU(),\n                                  ortho(nn.Linear(GH, GH), math.sqrt(2)), nn.ReLU())\n        self.done = ortho(nn.Linear(GH, 1), 0.01)\n        self.value = ortho(nn.Linear(GH, 1), 1.0)\n        self.tbias = ortho(nn.Linear(GH, spec.n_types), 0.01)\n\n    def features(self, obs):\n        s = F.relu(self.s2(F.relu(self.s1(obs))))\n        x = F.relu(self.n1(self.c1(s)))\n        x = F.relu(x + self.n2(self.c2(x)))\n        f = torch.cat([x, self.skip(obs)], 1)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], 1))\n        return f, g\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.base = Base(spec)\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        self.T = len(self.fps)\n        self.frames = list(range(8)) if spec.X == spec.Y else [0, 1, 2, 3]\n        keys = []\n        sel = []\n        for k in self.frames:\n            tr = k >= 4\n            m = k % 4\n            fx = m in (1, 3)\n            fy = m in (2, 3)\n            rt = []\n            for t, (dy, dx) in enumerate(self.fps):\n                if tr:\n                    key = vkey(t, dx, dy, not fx, not fy)\n                else:\n                    key = vkey(t, dy, dx, not fy, not fx)\n                if key not in keys:\n                    keys.append(key)\n                rt.append(keys.index(key))\n            sel.append(rt)\n        self.keys = keys\n        self.sel = sel\n        self.proj = ortho(nn.Conv2d(self.base.ch, PROJ, 1), math.sqrt(2))\n        self.mix = nn.ModuleList([ortho(nn.Conv2d(3 * PROJ, HID, 1), math.sqrt(2)) for _ in keys])\n        self.out = nn.ModuleList([ortho(nn.Conv2d(HID, 1, 1), 0.01) for _ in keys])\n        self.af = nn.Parameter(torch.zeros(len(self.frames)))\n\n    def forward(self, obs, mask):\n        f, g = self.base.features(obs)\n        p = self.proj(f)\n        B = p.shape[0]\n        H = []\n        for key, mix, out in zip(self.keys, self.mix, self.out):\n            t, a, b, top, left = key\n            mx, mn, av = wpool(p, a, b, top, left)\n            H.append(out(F.relu(mix(torch.cat([mx, mn, av], 1)))))\n        wf = torch.softmax(SCALE * self.af, 0)\n        tb = self.base.tbias(g).view(B, self.T, 1, 1)\n        place = None\n        for i, k in enumerate(self.frames):\n            A = torch.cat([H[j] for j in self.sel[i]], 1) + tb\n            term = wf[i] * dihedral(A, k).reshape(B, -1)\n            place = term if place is None else place + term\n        logits = torch.cat([place, self.base.done(g)], 1)\n        return logits, self.base.value(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 61771,
+    "fb_ms": 90.21,
+    "flops_per_sample": 18336000,
+    "flops_ratio": 1.0,
+    "sha": "8437401cb7b6405e",
+    "recipe": {
+     "lr": 0.001,
+     "n_envs": 256,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "ppo_epochs": 4,
+     "ent_coef": 0.01,
+     "gamma": 0.95,
+     "gae_lambda": 0.9,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": null,
+    "budget": {
+     "allowed_steps": 130709,
+     "n_updates": 31,
+     "batch": 4096,
+     "steps": 126976,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0024
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0232,
+     "short_run_updates": 7
+    },
+    "rule": "bookmirror"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.4473,
+    "dev_per_seed": [
+     0.4473
+    ],
+    "train_exact": 0.3458,
+    "params": 61771,
+    "flops_ratio": 1.0,
+    "train_steps": 126976,
+    "wall_s": 133.5,
+    "sha": "8437401cb7b6405e",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r2c6",
+   "round": 2,
+   "name": "dedup pure frames, 1 epoch",
+   "hypothesis": "The shared-head pure-frame net with 1 PPO epoch, 128\u00d764 rollouts, 64 minibatches and gamma 0.995. That gives about 426k samples and less discounting of the end-of-episode exact-build bonus. Together with the union 1-epoch sibling, this tests whether the 3.2-times sample gain pays off for either head. Refuted if both 1-epoch runs fall to about 0 while their default-recipe siblings score.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {\"ppo_epochs\": 1, \"n_envs\": 128, \"rollout_len\": 64, \"n_minibatches\": 64, \"gamma\": 0.995}\n\nSTEM = 64\nCOL = 48\nWIDTH = 40\nSKIP = 24\nPROJ = 16\nHID = 16\nGH = 64\nSCALE = 5.0\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    if m.bias is not None:\n        nn.init.zeros_(m.bias)\n    return m\n\n\ndef dihedral(x, k):\n    if k >= 4:\n        x = x.transpose(-2, -1)\n    m = k % 4\n    if m == 1:\n        x = x.flip(-1)\n    elif m == 2:\n        x = x.flip(-2)\n    elif m == 3:\n        x = x.flip(-2).flip(-1)\n    return x\n\n\ndef wpool(q, dy, dx, top=True, left=True):\n    if dy * dx == 1:\n        return q, q, q\n    pad = ((0, dx - 1) if left else (dx - 1, 0)) + ((0, dy - 1) if top else (dy - 1, 0))\n    q = F.pad(q, pad)\n    mx = F.max_pool2d(q, (dy, dx), stride=1)\n    mn = -F.max_pool2d(-q, (dy, dx), stride=1)\n    av = F.avg_pool2d(q, (dy, dx), stride=1)\n    return mx, mn, av\n\n\ndef vkey(t, a, b, top, left):\n    if a == 1:\n        top = True\n    if b == 1:\n        left = True\n    return (t, a, b, top, left)\n\n\nclass Base(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        c = spec.in_channels\n        self.s1 = ortho(nn.Conv2d(c, STEM, 1), math.sqrt(2))\n        self.s2 = ortho(nn.Conv2d(STEM, COL, 1), math.sqrt(2))\n        self.c1 = ortho(nn.Conv2d(COL, WIDTH, 3, padding=1), math.sqrt(2))\n        self.n1 = nn.GroupNorm(4, WIDTH)\n        self.c2 = ortho(nn.Conv2d(WIDTH, WIDTH, 3, padding=1), math.sqrt(2))\n        self.n2 = nn.GroupNorm(4, WIDTH)\n        self.skip = ortho(nn.Conv2d(c, SKIP, 1), 1.0)\n        self.ch = WIDTH + SKIP\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * self.ch, GH), math.sqrt(2)), nn.ReLU(),\n                                  ortho(nn.Linear(GH, GH), math.sqrt(2)), nn.ReLU())\n        self.done = ortho(nn.Linear(GH, 1), 0.01)\n        self.value = ortho(nn.Linear(GH, 1), 1.0)\n        self.tbias = ortho(nn.Linear(GH, spec.n_types), 0.01)\n\n    def features(self, obs):\n        s = F.relu(self.s2(F.relu(self.s1(obs))))\n        x = F.relu(self.n1(self.c1(s)))\n        x = F.relu(x + self.n2(self.c2(x)))\n        f = torch.cat([x, self.skip(obs)], 1)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], 1))\n        return f, g\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.base = Base(spec)\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        self.T = len(self.fps)\n        self.frames = list(range(8)) if spec.X == spec.Y else [0, 1, 2, 3]\n        keys = []\n        sel = []\n        for k in self.frames:\n            tr = k >= 4\n            m = k % 4\n            fx = m in (1, 3)\n            fy = m in (2, 3)\n            rt = []\n            for t, (dy, dx) in enumerate(self.fps):\n                if tr:\n                    key = vkey(t, dx, dy, not fx, not fy)\n                else:\n                    key = vkey(t, dy, dx, not fy, not fx)\n                if key not in keys:\n                    keys.append(key)\n                rt.append(keys.index(key))\n            sel.append(rt)\n        self.keys = keys\n        self.sel = sel\n        self.proj = ortho(nn.Conv2d(self.base.ch, PROJ, 1), math.sqrt(2))\n        self.mix = nn.ModuleList([ortho(nn.Conv2d(3 * PROJ, HID, 1), math.sqrt(2)) for _ in keys])\n        self.out = nn.ModuleList([ortho(nn.Conv2d(HID, 1, 1), 0.01) for _ in keys])\n        self.af = nn.Parameter(torch.zeros(len(self.frames)))\n\n    def forward(self, obs, mask):\n        f, g = self.base.features(obs)\n        p = self.proj(f)\n        B = p.shape[0]\n        H = []\n        for key, mix, out in zip(self.keys, self.mix, self.out):\n            t, a, b, top, left = key\n            mx, mn, av = wpool(p, a, b, top, left)\n            H.append(out(F.relu(mix(torch.cat([mx, mn, av], 1)))))\n        wf = torch.softmax(SCALE * self.af, 0)\n        tb = self.base.tbias(g).view(B, self.T, 1, 1)\n        place = None\n        for i, k in enumerate(self.frames):\n            A = torch.cat([H[j] for j in self.sel[i]], 1) + tb\n            term = wf[i] * dihedral(A, k).reshape(B, -1)\n            place = term if place is None else place + term\n        logits = torch.cat([place, self.base.done(g)], 1)\n        return logits, self.base.value(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 61771,
+    "fb_ms": 87.88,
+    "flops_per_sample": 18336000,
+    "flops_ratio": 1.0,
+    "sha": "24307585ec2924c4",
+    "recipe": {
+     "lr": 0.001,
+     "n_envs": 128,
+     "rollout_len": 64,
+     "n_minibatches": 64,
+     "ppo_epochs": 1,
+     "ent_coef": 0.01,
+     "gamma": 0.995,
+     "gae_lambda": 0.9,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "ppo_epochs": 1,
+     "n_envs": 128,
+     "rollout_len": 64,
+     "n_minibatches": 64,
+     "gamma": 0.995
+    },
+    "budget": {
+     "allowed_steps": 424806,
+     "n_updates": 51,
+     "batch": 8192,
+     "steps": 417792,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0024
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0232,
+     "short_run_updates": 7
+    },
+    "rule": "bookmirror"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.5449,
+    "dev_per_seed": [
+     0.5449
+    ],
+    "train_exact": 0.5464,
+    "params": 61771,
+    "flops_ratio": 1.0,
+    "train_steps": 417792,
+    "wall_s": 144.3,
+    "sha": "24307585ec2924c4",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r3c1",
+   "round": 3,
+   "name": "union lr 3e-3",
+   "hypothesis": "lr 1.5e-3 raised the union from 0.18 to 0.63 under the default recipe, which suggests too few effective updates (31). Doubling lr again should speed up committing to the frame and learning to build. Refuted if dev falls well below 0.63 or to 0, which would mean 1.5e-3 is near the stability limit.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {\"lr\": 0.003}\n\nSTEM = 64\nCOL = 48\nWIDTH = 40\nSKIP = 24\nPROJ = 16\nHID = 16\nGH = 64\nSCALE = 5.0\nCORNERS = ((True, True), (True, False), (False, True), (False, False))\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    if m.bias is not None:\n        nn.init.zeros_(m.bias)\n    return m\n\n\ndef dihedral(x, k):\n    if k >= 4:\n        x = x.transpose(-2, -1)\n    m = k % 4\n    if m == 1:\n        x = x.flip(-1)\n    elif m == 2:\n        x = x.flip(-2)\n    elif m == 3:\n        x = x.flip(-2).flip(-1)\n    return x\n\n\ndef wpool(q, dy, dx, top=True, left=True):\n    if dy * dx == 1:\n        return q, q, q\n    pad = ((0, dx - 1) if left else (dx - 1, 0)) + ((0, dy - 1) if top else (dy - 1, 0))\n    q = F.pad(q, pad)\n    mx = F.max_pool2d(q, (dy, dx), stride=1)\n    mn = -F.max_pool2d(-q, (dy, dx), stride=1)\n    av = F.avg_pool2d(q, (dy, dx), stride=1)\n    return mx, mn, av\n\n\ndef vkey(t, a, b, top, left):\n    if a == 1:\n        top = True\n    if b == 1:\n        left = True\n    return (t, a, b, top, left)\n\n\nclass Base(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        c = spec.in_channels\n        self.s1 = ortho(nn.Conv2d(c, STEM, 1), math.sqrt(2))\n        self.s2 = ortho(nn.Conv2d(STEM, COL, 1), math.sqrt(2))\n        self.c1 = ortho(nn.Conv2d(COL, WIDTH, 3, padding=1), math.sqrt(2))\n        self.n1 = nn.GroupNorm(4, WIDTH)\n        self.c2 = ortho(nn.Conv2d(WIDTH, WIDTH, 3, padding=1), math.sqrt(2))\n        self.n2 = nn.GroupNorm(4, WIDTH)\n        self.skip = ortho(nn.Conv2d(c, SKIP, 1), 1.0)\n        self.ch = WIDTH + SKIP\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * self.ch, GH), math.sqrt(2)), nn.ReLU(),\n                                  ortho(nn.Linear(GH, GH), math.sqrt(2)), nn.ReLU())\n        self.done = ortho(nn.Linear(GH, 1), 0.01)\n        self.value = ortho(nn.Linear(GH, 1), 1.0)\n        self.tbias = ortho(nn.Linear(GH, spec.n_types), 0.01)\n\n    def features(self, obs):\n        s = F.relu(self.s2(F.relu(self.s1(obs))))\n        x = F.relu(self.n1(self.c1(s)))\n        x = F.relu(x + self.n2(self.c2(x)))\n        f = torch.cat([x, self.skip(obs)], 1)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], 1))\n        return f, g\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.base = Base(spec)\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        self.T = len(self.fps)\n        sq = spec.X == spec.Y\n        self.frames = list(range(8)) if sq else [0, 1, 2, 3]\n        self.no = 2 if sq else 1\n        keys = []\n        sel = []\n        for top, left in CORNERS:\n            row = []\n            for o in range(self.no):\n                rt = []\n                for t, (dy, dx) in enumerate(self.fps):\n                    a, b = (dy, dx) if o == 0 else (dx, dy)\n                    k = vkey(t, a, b, top, left)\n                    if k not in keys:\n                        keys.append(k)\n                    rt.append(keys.index(k))\n                row.append(rt)\n            sel.append(row)\n        self.keys = keys\n        self.sel = sel\n        self.proj = ortho(nn.Conv2d(self.base.ch, PROJ, 1), math.sqrt(2))\n        self.mix = nn.ModuleList([ortho(nn.Conv2d(3 * PROJ, HID, 1), math.sqrt(2)) for _ in keys])\n        self.out = nn.ModuleList([ortho(nn.Conv2d(HID, 1, 1), 0.01) for _ in keys])\n        self.af = nn.Parameter(torch.zeros(len(self.frames)))\n        self.ac = nn.Parameter(torch.zeros(len(CORNERS)))\n        self.ao = nn.Parameter(torch.zeros(2))\n\n    def forward(self, obs, mask):\n        f, g = self.base.features(obs)\n        p = self.proj(f)\n        B = p.shape[0]\n        H = []\n        for key, mix, out in zip(self.keys, self.mix, self.out):\n            t, a, b, top, left = key\n            mx, mn, av = wpool(p, a, b, top, left)\n            H.append(out(F.relu(mix(torch.cat([mx, mn, av], 1)))))\n        wc = torch.softmax(SCALE * self.ac, 0)\n        wf = torch.softmax(SCALE * self.af, 0)\n        wo = torch.softmax(SCALE * self.ao, 0)\n        tb = self.base.tbias(g).view(B, self.T, 1, 1)\n        Oc = []\n        for o in range(self.no):\n            acc = None\n            for c in range(len(CORNERS)):\n                m = torch.cat([H[i] for i in self.sel[c][o]], 1)\n                acc = wc[c] * m if acc is None else acc + wc[c] * m\n            Oc.append(acc + tb)\n        place = None\n        for i, k in enumerate(self.frames):\n            o = 1 if k >= 4 else 0\n            A = dihedral(Oc[o], k)\n            tm = A.reshape(B, -1)\n            am = A.permute(0, 2, 3, 1).reshape(B, -1)\n            term = wf[i] * (wo[0] * tm + wo[1] * am)\n            place = term if place is None else place + term\n        logits = torch.cat([place, self.base.done(g)], 1)\n        return logits, self.base.value(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 61777,
+    "fb_ms": 94.13,
+    "flops_per_sample": 18336000,
+    "flops_ratio": 1.0,
+    "sha": "a6f917165577cc65",
+    "recipe": {
+     "lr": 0.003,
+     "n_envs": 256,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "ppo_epochs": 4,
+     "ent_coef": 0.01,
+     "gamma": 0.95,
+     "gae_lambda": 0.9,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "lr": 0.003
+    },
+    "budget": {
+     "allowed_steps": 130709,
+     "n_updates": 31,
+     "batch": 4096,
+     "steps": 126976,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0131
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0207,
+     "short_run_updates": 7
+    },
+    "rule": "bookmirror"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.3789,
+    "dev_per_seed": [
+     0.3789
+    ],
+    "train_exact": 0.3718,
+    "params": 61777,
+    "flops_ratio": 1.0,
+    "train_steps": 126976,
+    "wall_s": 131.8,
+    "sha": "a6f917165577cc65",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r3c2",
+   "round": 3,
+   "name": "pure frames lr 1.5e-3",
+   "hypothesis": "The lr 1.5e-3 gain seen on the union should carry over to the pure-frame head (0.447 at the default lr). That head has one factor to commit to, which should help the 4-seed retrain. Refuted if dev stays at or below about 0.45, which would mean the union gain was seed luck or depended on the union.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {\"lr\": 0.0015}\n\nSTEM = 64\nCOL = 48\nWIDTH = 40\nSKIP = 24\nPROJ = 16\nHID = 16\nGH = 64\nSCALE = 5.0\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    if m.bias is not None:\n        nn.init.zeros_(m.bias)\n    return m\n\n\ndef dihedral(x, k):\n    if k >= 4:\n        x = x.transpose(-2, -1)\n    m = k % 4\n    if m == 1:\n        x = x.flip(-1)\n    elif m == 2:\n        x = x.flip(-2)\n    elif m == 3:\n        x = x.flip(-2).flip(-1)\n    return x\n\n\ndef wpool(q, dy, dx, top=True, left=True):\n    if dy * dx == 1:\n        return q, q, q\n    pad = ((0, dx - 1) if left else (dx - 1, 0)) + ((0, dy - 1) if top else (dy - 1, 0))\n    q = F.pad(q, pad)\n    mx = F.max_pool2d(q, (dy, dx), stride=1)\n    mn = -F.max_pool2d(-q, (dy, dx), stride=1)\n    av = F.avg_pool2d(q, (dy, dx), stride=1)\n    return mx, mn, av\n\n\ndef vkey(t, a, b, top, left):\n    if a == 1:\n        top = True\n    if b == 1:\n        left = True\n    return (t, a, b, top, left)\n\n\nclass Base(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        c = spec.in_channels\n        self.s1 = ortho(nn.Conv2d(c, STEM, 1), math.sqrt(2))\n        self.s2 = ortho(nn.Conv2d(STEM, COL, 1), math.sqrt(2))\n        self.c1 = ortho(nn.Conv2d(COL, WIDTH, 3, padding=1), math.sqrt(2))\n        self.n1 = nn.GroupNorm(4, WIDTH)\n        self.c2 = ortho(nn.Conv2d(WIDTH, WIDTH, 3, padding=1), math.sqrt(2))\n        self.n2 = nn.GroupNorm(4, WIDTH)\n        self.skip = ortho(nn.Conv2d(c, SKIP, 1), 1.0)\n        self.ch = WIDTH + SKIP\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * self.ch, GH), math.sqrt(2)), nn.ReLU(),\n                                  ortho(nn.Linear(GH, GH), math.sqrt(2)), nn.ReLU())\n        self.done = ortho(nn.Linear(GH, 1), 0.01)\n        self.value = ortho(nn.Linear(GH, 1), 1.0)\n        self.tbias = ortho(nn.Linear(GH, spec.n_types), 0.01)\n\n    def features(self, obs):\n        s = F.relu(self.s2(F.relu(self.s1(obs))))\n        x = F.relu(self.n1(self.c1(s)))\n        x = F.relu(x + self.n2(self.c2(x)))\n        f = torch.cat([x, self.skip(obs)], 1)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], 1))\n        return f, g\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.base = Base(spec)\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        self.T = len(self.fps)\n        self.frames = list(range(8)) if spec.X == spec.Y else [0, 1, 2, 3]\n        keys = []\n        sel = []\n        for k in self.frames:\n            tr = k >= 4\n            m = k % 4\n            fx = m in (1, 3)\n            fy = m in (2, 3)\n            rt = []\n            for t, (dy, dx) in enumerate(self.fps):\n                if tr:\n                    key = vkey(t, dx, dy, not fx, not fy)\n                else:\n                    key = vkey(t, dy, dx, not fy, not fx)\n                if key not in keys:\n                    keys.append(key)\n                rt.append(keys.index(key))\n            sel.append(rt)\n        self.keys = keys\n        self.sel = sel\n        self.proj = ortho(nn.Conv2d(self.base.ch, PROJ, 1), math.sqrt(2))\n        self.mix = nn.ModuleList([ortho(nn.Conv2d(3 * PROJ, HID, 1), math.sqrt(2)) for _ in keys])\n        self.out = nn.ModuleList([ortho(nn.Conv2d(HID, 1, 1), 0.01) for _ in keys])\n        self.af = nn.Parameter(torch.zeros(len(self.frames)))\n\n    def forward(self, obs, mask):\n        f, g = self.base.features(obs)\n        p = self.proj(f)\n        B = p.shape[0]\n        H = []\n        for key, mix, out in zip(self.keys, self.mix, self.out):\n            t, a, b, top, left = key\n            mx, mn, av = wpool(p, a, b, top, left)\n            H.append(out(F.relu(mix(torch.cat([mx, mn, av], 1)))))\n        wf = torch.softmax(SCALE * self.af, 0)\n        tb = self.base.tbias(g).view(B, self.T, 1, 1)\n        place = None\n        for i, k in enumerate(self.frames):\n            A = torch.cat([H[j] for j in self.sel[i]], 1) + tb\n            term = wf[i] * dihedral(A, k).reshape(B, -1)\n            place = term if place is None else place + term\n        logits = torch.cat([place, self.base.done(g)], 1)\n        return logits, self.base.value(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 61771,
+    "fb_ms": 96.52,
+    "flops_per_sample": 18336000,
+    "flops_ratio": 1.0,
+    "sha": "8aa4284184e80d44",
+    "recipe": {
+     "lr": 0.0015,
+     "n_envs": 256,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "ppo_epochs": 4,
+     "ent_coef": 0.01,
+     "gamma": 0.95,
+     "gae_lambda": 0.9,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "lr": 0.0015
+    },
+    "budget": {
+     "allowed_steps": 130709,
+     "n_updates": 31,
+     "batch": 4096,
+     "steps": 126976,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0024
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0232,
+     "short_run_updates": 7
+    },
+    "rule": "bookmirror"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.5195,
+    "dev_per_seed": [
+     0.5195
+    ],
+    "train_exact": 0.4416,
+    "params": 61771,
+    "flops_ratio": 1.0,
+    "train_steps": 126976,
+    "wall_s": 127.4,
+    "sha": "8aa4284184e80d44",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r3c3",
+   "round": 3,
+   "name": "pure frames 1 epoch lr 2e-3",
+   "hypothesis": "The 1-epoch long-rollout recipe gave pure frames 0.545 from about 418k samples. A single epoch reuses each sample once, so a larger step (2e-3) should be safe and speed up learning. Refuted if dev drops below about 0.45 or to 0, which would mean 1 epoch is unstable at higher lr.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {\"ppo_epochs\": 1, \"n_envs\": 128, \"rollout_len\": 64, \"n_minibatches\": 64, \"gamma\": 0.995, \"lr\": 0.002}\n\nSTEM = 64\nCOL = 48\nWIDTH = 40\nSKIP = 24\nPROJ = 16\nHID = 16\nGH = 64\nSCALE = 5.0\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    if m.bias is not None:\n        nn.init.zeros_(m.bias)\n    return m\n\n\ndef dihedral(x, k):\n    if k >= 4:\n        x = x.transpose(-2, -1)\n    m = k % 4\n    if m == 1:\n        x = x.flip(-1)\n    elif m == 2:\n        x = x.flip(-2)\n    elif m == 3:\n        x = x.flip(-2).flip(-1)\n    return x\n\n\ndef wpool(q, dy, dx, top=True, left=True):\n    if dy * dx == 1:\n        return q, q, q\n    pad = ((0, dx - 1) if left else (dx - 1, 0)) + ((0, dy - 1) if top else (dy - 1, 0))\n    q = F.pad(q, pad)\n    mx = F.max_pool2d(q, (dy, dx), stride=1)\n    mn = -F.max_pool2d(-q, (dy, dx), stride=1)\n    av = F.avg_pool2d(q, (dy, dx), stride=1)\n    return mx, mn, av\n\n\ndef vkey(t, a, b, top, left):\n    if a == 1:\n        top = True\n    if b == 1:\n        left = True\n    return (t, a, b, top, left)\n\n\nclass Base(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        c = spec.in_channels\n        self.s1 = ortho(nn.Conv2d(c, STEM, 1), math.sqrt(2))\n        self.s2 = ortho(nn.Conv2d(STEM, COL, 1), math.sqrt(2))\n        self.c1 = ortho(nn.Conv2d(COL, WIDTH, 3, padding=1), math.sqrt(2))\n        self.n1 = nn.GroupNorm(4, WIDTH)\n        self.c2 = ortho(nn.Conv2d(WIDTH, WIDTH, 3, padding=1), math.sqrt(2))\n        self.n2 = nn.GroupNorm(4, WIDTH)\n        self.skip = ortho(nn.Conv2d(c, SKIP, 1), 1.0)\n        self.ch = WIDTH + SKIP\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * self.ch, GH), math.sqrt(2)), nn.ReLU(),\n                                  ortho(nn.Linear(GH, GH), math.sqrt(2)), nn.ReLU())\n        self.done = ortho(nn.Linear(GH, 1), 0.01)\n        self.value = ortho(nn.Linear(GH, 1), 1.0)\n        self.tbias = ortho(nn.Linear(GH, spec.n_types), 0.01)\n\n    def features(self, obs):\n        s = F.relu(self.s2(F.relu(self.s1(obs))))\n        x = F.relu(self.n1(self.c1(s)))\n        x = F.relu(x + self.n2(self.c2(x)))\n        f = torch.cat([x, self.skip(obs)], 1)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], 1))\n        return f, g\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.base = Base(spec)\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        self.T = len(self.fps)\n        self.frames = list(range(8)) if spec.X == spec.Y else [0, 1, 2, 3]\n        keys = []\n        sel = []\n        for k in self.frames:\n            tr = k >= 4\n            m = k % 4\n            fx = m in (1, 3)\n            fy = m in (2, 3)\n            rt = []\n            for t, (dy, dx) in enumerate(self.fps):\n                if tr:\n                    key = vkey(t, dx, dy, not fx, not fy)\n                else:\n                    key = vkey(t, dy, dx, not fy, not fx)\n                if key not in keys:\n                    keys.append(key)\n                rt.append(keys.index(key))\n            sel.append(rt)\n        self.keys = keys\n        self.sel = sel\n        self.proj = ortho(nn.Conv2d(self.base.ch, PROJ, 1), math.sqrt(2))\n        self.mix = nn.ModuleList([ortho(nn.Conv2d(3 * PROJ, HID, 1), math.sqrt(2)) for _ in keys])\n        self.out = nn.ModuleList([ortho(nn.Conv2d(HID, 1, 1), 0.01) for _ in keys])\n        self.af = nn.Parameter(torch.zeros(len(self.frames)))\n\n    def forward(self, obs, mask):\n        f, g = self.base.features(obs)\n        p = self.proj(f)\n        B = p.shape[0]\n        H = []\n        for key, mix, out in zip(self.keys, self.mix, self.out):\n            t, a, b, top, left = key\n            mx, mn, av = wpool(p, a, b, top, left)\n            H.append(out(F.relu(mix(torch.cat([mx, mn, av], 1)))))\n        wf = torch.softmax(SCALE * self.af, 0)\n        tb = self.base.tbias(g).view(B, self.T, 1, 1)\n        place = None\n        for i, k in enumerate(self.frames):\n            A = torch.cat([H[j] for j in self.sel[i]], 1) + tb\n            term = wf[i] * dihedral(A, k).reshape(B, -1)\n            place = term if place is None else place + term\n        logits = torch.cat([place, self.base.done(g)], 1)\n        return logits, self.base.value(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 61771,
+    "fb_ms": 96.69,
+    "flops_per_sample": 18336000,
+    "flops_ratio": 1.0,
+    "sha": "81047b609ffa7728",
+    "recipe": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 64,
+     "n_minibatches": 64,
+     "ppo_epochs": 1,
+     "ent_coef": 0.01,
+     "gamma": 0.995,
+     "gae_lambda": 0.9,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "ppo_epochs": 1,
+     "n_envs": 128,
+     "rollout_len": 64,
+     "n_minibatches": 64,
+     "gamma": 0.995,
+     "lr": 0.002
+    },
+    "budget": {
+     "allowed_steps": 424806,
+     "n_updates": 51,
+     "batch": 8192,
+     "steps": 417792,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0024
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0232,
+     "short_run_updates": 7
+    },
+    "rule": "bookmirror"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.957,
+    "dev_per_seed": [
+     0.957
+    ],
+    "train_exact": 0.9192,
+    "params": 61771,
+    "flops_ratio": 1.0,
+    "train_steps": 417792,
+    "wall_s": 141.6,
+    "sha": "81047b609ffa7728",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r3c4",
+   "round": 3,
+   "name": "union lr 1.5e-3, 64 minibatches",
+   "hypothesis": "Starts from the best trial and makes one change: 64 minibatches of 64 samples instead of 32. That doubles gradient steps per update (about 7.9k in total) at the same sample count. If optimisation steps are the bottleneck, dev should exceed 0.63. Refuted if dev drops clearly, which would mean noisier small minibatches hurt PPO here.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {\"lr\": 0.0015, \"n_minibatches\": 64}\n\nSTEM = 64\nCOL = 48\nWIDTH = 40\nSKIP = 24\nPROJ = 16\nHID = 16\nGH = 64\nSCALE = 5.0\nCORNERS = ((True, True), (True, False), (False, True), (False, False))\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    if m.bias is not None:\n        nn.init.zeros_(m.bias)\n    return m\n\n\ndef dihedral(x, k):\n    if k >= 4:\n        x = x.transpose(-2, -1)\n    m = k % 4\n    if m == 1:\n        x = x.flip(-1)\n    elif m == 2:\n        x = x.flip(-2)\n    elif m == 3:\n        x = x.flip(-2).flip(-1)\n    return x\n\n\ndef wpool(q, dy, dx, top=True, left=True):\n    if dy * dx == 1:\n        return q, q, q\n    pad = ((0, dx - 1) if left else (dx - 1, 0)) + ((0, dy - 1) if top else (dy - 1, 0))\n    q = F.pad(q, pad)\n    mx = F.max_pool2d(q, (dy, dx), stride=1)\n    mn = -F.max_pool2d(-q, (dy, dx), stride=1)\n    av = F.avg_pool2d(q, (dy, dx), stride=1)\n    return mx, mn, av\n\n\ndef vkey(t, a, b, top, left):\n    if a == 1:\n        top = True\n    if b == 1:\n        left = True\n    return (t, a, b, top, left)\n\n\nclass Base(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        c = spec.in_channels\n        self.s1 = ortho(nn.Conv2d(c, STEM, 1), math.sqrt(2))\n        self.s2 = ortho(nn.Conv2d(STEM, COL, 1), math.sqrt(2))\n        self.c1 = ortho(nn.Conv2d(COL, WIDTH, 3, padding=1), math.sqrt(2))\n        self.n1 = nn.GroupNorm(4, WIDTH)\n        self.c2 = ortho(nn.Conv2d(WIDTH, WIDTH, 3, padding=1), math.sqrt(2))\n        self.n2 = nn.GroupNorm(4, WIDTH)\n        self.skip = ortho(nn.Conv2d(c, SKIP, 1), 1.0)\n        self.ch = WIDTH + SKIP\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * self.ch, GH), math.sqrt(2)), nn.ReLU(),\n                                  ortho(nn.Linear(GH, GH), math.sqrt(2)), nn.ReLU())\n        self.done = ortho(nn.Linear(GH, 1), 0.01)\n        self.value = ortho(nn.Linear(GH, 1), 1.0)\n        self.tbias = ortho(nn.Linear(GH, spec.n_types), 0.01)\n\n    def features(self, obs):\n        s = F.relu(self.s2(F.relu(self.s1(obs))))\n        x = F.relu(self.n1(self.c1(s)))\n        x = F.relu(x + self.n2(self.c2(x)))\n        f = torch.cat([x, self.skip(obs)], 1)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], 1))\n        return f, g\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.base = Base(spec)\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        self.T = len(self.fps)\n        sq = spec.X == spec.Y\n        self.frames = list(range(8)) if sq else [0, 1, 2, 3]\n        self.no = 2 if sq else 1\n        keys = []\n        sel = []\n        for top, left in CORNERS:\n            row = []\n            for o in range(self.no):\n                rt = []\n                for t, (dy, dx) in enumerate(self.fps):\n                    a, b = (dy, dx) if o == 0 else (dx, dy)\n                    k = vkey(t, a, b, top, left)\n                    if k not in keys:\n                        keys.append(k)\n                    rt.append(keys.index(k))\n                row.append(rt)\n            sel.append(row)\n        self.keys = keys\n        self.sel = sel\n        self.proj = ortho(nn.Conv2d(self.base.ch, PROJ, 1), math.sqrt(2))\n        self.mix = nn.ModuleList([ortho(nn.Conv2d(3 * PROJ, HID, 1), math.sqrt(2)) for _ in keys])\n        self.out = nn.ModuleList([ortho(nn.Conv2d(HID, 1, 1), 0.01) for _ in keys])\n        self.af = nn.Parameter(torch.zeros(len(self.frames)))\n        self.ac = nn.Parameter(torch.zeros(len(CORNERS)))\n        self.ao = nn.Parameter(torch.zeros(2))\n\n    def forward(self, obs, mask):\n        f, g = self.base.features(obs)\n        p = self.proj(f)\n        B = p.shape[0]\n        H = []\n        for key, mix, out in zip(self.keys, self.mix, self.out):\n            t, a, b, top, left = key\n            mx, mn, av = wpool(p, a, b, top, left)\n            H.append(out(F.relu(mix(torch.cat([mx, mn, av], 1)))))\n        wc = torch.softmax(SCALE * self.ac, 0)\n        wf = torch.softmax(SCALE * self.af, 0)\n        wo = torch.softmax(SCALE * self.ao, 0)\n        tb = self.base.tbias(g).view(B, self.T, 1, 1)\n        Oc = []\n        for o in range(self.no):\n            acc = None\n            for c in range(len(CORNERS)):\n                m = torch.cat([H[i] for i in self.sel[c][o]], 1)\n                acc = wc[c] * m if acc is None else acc + wc[c] * m\n            Oc.append(acc + tb)\n        place = None\n        for i, k in enumerate(self.frames):\n            o = 1 if k >= 4 else 0\n            A = dihedral(Oc[o], k)\n            tm = A.reshape(B, -1)\n            am = A.permute(0, 2, 3, 1).reshape(B, -1)\n            term = wf[i] * (wo[0] * tm + wo[1] * am)\n            place = term if place is None else place + term\n        logits = torch.cat([place, self.base.done(g)], 1)\n        return logits, self.base.value(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 61777,
+    "fb_ms": 93.64,
+    "flops_per_sample": 18336000,
+    "flops_ratio": 1.0,
+    "sha": "b57af872a9bb6112",
+    "recipe": {
+     "lr": 0.0015,
+     "n_envs": 256,
+     "rollout_len": 16,
+     "n_minibatches": 64,
+     "ppo_epochs": 4,
+     "ent_coef": 0.01,
+     "gamma": 0.95,
+     "gae_lambda": 0.9,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "lr": 0.0015,
+     "n_minibatches": 64
+    },
+    "budget": {
+     "allowed_steps": 130709,
+     "n_updates": 31,
+     "batch": 4096,
+     "steps": 126976,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0131
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0207,
+     "short_run_updates": 7
+    },
+    "rule": "bookmirror"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.5488,
+    "dev_per_seed": [
+     0.5488
+    ],
+    "train_exact": 0.452,
+    "params": 61777,
+    "flops_ratio": 1.0,
+    "train_steps": 126976,
+    "wall_s": 208.4,
+    "sha": "b57af872a9bb6112",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r3c5",
+   "round": 3,
+   "name": "pure frames 2 epochs lr 2e-3",
+   "hypothesis": "The 2-epoch recipe (128 envs, rollout 16, gamma 0.97, lambda 0.95, entropy 0.005) gave the union 0.42 from about 242k samples. Adding lr 2e-3 on the pure-frame head combines more samples, moderate reuse and a faster step. Refuted if dev falls below about 0.45, which would mean the 2-epoch recipe is not better than default plus higher lr.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {\"ppo_epochs\": 2, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 16, \"gamma\": 0.97, \"gae_lambda\": 0.95, \"ent_coef\": 0.005, \"lr\": 0.002}\n\nSTEM = 64\nCOL = 48\nWIDTH = 40\nSKIP = 24\nPROJ = 16\nHID = 16\nGH = 64\nSCALE = 5.0\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    if m.bias is not None:\n        nn.init.zeros_(m.bias)\n    return m\n\n\ndef dihedral(x, k):\n    if k >= 4:\n        x = x.transpose(-2, -1)\n    m = k % 4\n    if m == 1:\n        x = x.flip(-1)\n    elif m == 2:\n        x = x.flip(-2)\n    elif m == 3:\n        x = x.flip(-2).flip(-1)\n    return x\n\n\ndef wpool(q, dy, dx, top=True, left=True):\n    if dy * dx == 1:\n        return q, q, q\n    pad = ((0, dx - 1) if left else (dx - 1, 0)) + ((0, dy - 1) if top else (dy - 1, 0))\n    q = F.pad(q, pad)\n    mx = F.max_pool2d(q, (dy, dx), stride=1)\n    mn = -F.max_pool2d(-q, (dy, dx), stride=1)\n    av = F.avg_pool2d(q, (dy, dx), stride=1)\n    return mx, mn, av\n\n\ndef vkey(t, a, b, top, left):\n    if a == 1:\n        top = True\n    if b == 1:\n        left = True\n    return (t, a, b, top, left)\n\n\nclass Base(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        c = spec.in_channels\n        self.s1 = ortho(nn.Conv2d(c, STEM, 1), math.sqrt(2))\n        self.s2 = ortho(nn.Conv2d(STEM, COL, 1), math.sqrt(2))\n        self.c1 = ortho(nn.Conv2d(COL, WIDTH, 3, padding=1), math.sqrt(2))\n        self.n1 = nn.GroupNorm(4, WIDTH)\n        self.c2 = ortho(nn.Conv2d(WIDTH, WIDTH, 3, padding=1), math.sqrt(2))\n        self.n2 = nn.GroupNorm(4, WIDTH)\n        self.skip = ortho(nn.Conv2d(c, SKIP, 1), 1.0)\n        self.ch = WIDTH + SKIP\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * self.ch, GH), math.sqrt(2)), nn.ReLU(),\n                                  ortho(nn.Linear(GH, GH), math.sqrt(2)), nn.ReLU())\n        self.done = ortho(nn.Linear(GH, 1), 0.01)\n        self.value = ortho(nn.Linear(GH, 1), 1.0)\n        self.tbias = ortho(nn.Linear(GH, spec.n_types), 0.01)\n\n    def features(self, obs):\n        s = F.relu(self.s2(F.relu(self.s1(obs))))\n        x = F.relu(self.n1(self.c1(s)))\n        x = F.relu(x + self.n2(self.c2(x)))\n        f = torch.cat([x, self.skip(obs)], 1)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], 1))\n        return f, g\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.base = Base(spec)\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        self.T = len(self.fps)\n        self.frames = list(range(8)) if spec.X == spec.Y else [0, 1, 2, 3]\n        keys = []\n        sel = []\n        for k in self.frames:\n            tr = k >= 4\n            m = k % 4\n            fx = m in (1, 3)\n            fy = m in (2, 3)\n            rt = []\n            for t, (dy, dx) in enumerate(self.fps):\n                if tr:\n                    key = vkey(t, dx, dy, not fx, not fy)\n                else:\n                    key = vkey(t, dy, dx, not fy, not fx)\n                if key not in keys:\n                    keys.append(key)\n                rt.append(keys.index(key))\n            sel.append(rt)\n        self.keys = keys\n        self.sel = sel\n        self.proj = ortho(nn.Conv2d(self.base.ch, PROJ, 1), math.sqrt(2))\n        self.mix = nn.ModuleList([ortho(nn.Conv2d(3 * PROJ, HID, 1), math.sqrt(2)) for _ in keys])\n        self.out = nn.ModuleList([ortho(nn.Conv2d(HID, 1, 1), 0.01) for _ in keys])\n        self.af = nn.Parameter(torch.zeros(len(self.frames)))\n\n    def forward(self, obs, mask):\n        f, g = self.base.features(obs)\n        p = self.proj(f)\n        B = p.shape[0]\n        H = []\n        for key, mix, out in zip(self.keys, self.mix, self.out):\n            t, a, b, top, left = key\n            mx, mn, av = wpool(p, a, b, top, left)\n            H.append(out(F.relu(mix(torch.cat([mx, mn, av], 1)))))\n        wf = torch.softmax(SCALE * self.af, 0)\n        tb = self.base.tbias(g).view(B, self.T, 1, 1)\n        place = None\n        for i, k in enumerate(self.frames):\n            A = torch.cat([H[j] for j in self.sel[i]], 1) + tb\n            term = wf[i] * dihedral(A, k).reshape(B, -1)\n            place = term if place is None else place + term\n        logits = torch.cat([place, self.base.done(g)], 1)\n        return logits, self.base.value(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 61771,
+    "fb_ms": 93.36,
+    "flops_per_sample": 18336000,
+    "flops_ratio": 1.0,
+    "sha": "a98e5bfd76b84aa3",
+    "recipe": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 16,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "ppo_epochs": 2,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 16,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "ent_coef": 0.005,
+     "lr": 0.002
+    },
+    "budget": {
+     "allowed_steps": 242746,
+     "n_updates": 118,
+     "batch": 2048,
+     "steps": 241664,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0024
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0232,
+     "short_run_updates": 7
+    },
+    "rule": "bookmirror"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.9688,
+    "dev_per_seed": [
+     0.9688
+    ],
+    "train_exact": 0.9529,
+    "params": 61771,
+    "flops_ratio": 1.0,
+    "train_steps": 241664,
+    "wall_s": 132.3,
+    "sha": "a98e5bfd76b84aa3",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r3c6",
+   "round": 3,
+   "name": "union 1 epoch lr 2e-3",
+   "hypothesis": "The union with 1 epoch scored 0.35 at lr 1e-3, while lr 1.5e-3 helped the union under the default recipe. A single epoch over 418k samples at lr 2e-3 tests whether the union's 1-epoch result was step-size limited. Refuted if dev stays at or below about 0.35, which would mean the default recipe suits the union better.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {\"ppo_epochs\": 1, \"n_envs\": 128, \"rollout_len\": 64, \"n_minibatches\": 64, \"gamma\": 0.995, \"lr\": 0.002}\n\nSTEM = 64\nCOL = 48\nWIDTH = 40\nSKIP = 24\nPROJ = 16\nHID = 16\nGH = 64\nSCALE = 5.0\nCORNERS = ((True, True), (True, False), (False, True), (False, False))\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    if m.bias is not None:\n        nn.init.zeros_(m.bias)\n    return m\n\n\ndef dihedral(x, k):\n    if k >= 4:\n        x = x.transpose(-2, -1)\n    m = k % 4\n    if m == 1:\n        x = x.flip(-1)\n    elif m == 2:\n        x = x.flip(-2)\n    elif m == 3:\n        x = x.flip(-2).flip(-1)\n    return x\n\n\ndef wpool(q, dy, dx, top=True, left=True):\n    if dy * dx == 1:\n        return q, q, q\n    pad = ((0, dx - 1) if left else (dx - 1, 0)) + ((0, dy - 1) if top else (dy - 1, 0))\n    q = F.pad(q, pad)\n    mx = F.max_pool2d(q, (dy, dx), stride=1)\n    mn = -F.max_pool2d(-q, (dy, dx), stride=1)\n    av = F.avg_pool2d(q, (dy, dx), stride=1)\n    return mx, mn, av\n\n\ndef vkey(t, a, b, top, left):\n    if a == 1:\n        top = True\n    if b == 1:\n        left = True\n    return (t, a, b, top, left)\n\n\nclass Base(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        c = spec.in_channels\n        self.s1 = ortho(nn.Conv2d(c, STEM, 1), math.sqrt(2))\n        self.s2 = ortho(nn.Conv2d(STEM, COL, 1), math.sqrt(2))\n        self.c1 = ortho(nn.Conv2d(COL, WIDTH, 3, padding=1), math.sqrt(2))\n        self.n1 = nn.GroupNorm(4, WIDTH)\n        self.c2 = ortho(nn.Conv2d(WIDTH, WIDTH, 3, padding=1), math.sqrt(2))\n        self.n2 = nn.GroupNorm(4, WIDTH)\n        self.skip = ortho(nn.Conv2d(c, SKIP, 1), 1.0)\n        self.ch = WIDTH + SKIP\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * self.ch, GH), math.sqrt(2)), nn.ReLU(),\n                                  ortho(nn.Linear(GH, GH), math.sqrt(2)), nn.ReLU())\n        self.done = ortho(nn.Linear(GH, 1), 0.01)\n        self.value = ortho(nn.Linear(GH, 1), 1.0)\n        self.tbias = ortho(nn.Linear(GH, spec.n_types), 0.01)\n\n    def features(self, obs):\n        s = F.relu(self.s2(F.relu(self.s1(obs))))\n        x = F.relu(self.n1(self.c1(s)))\n        x = F.relu(x + self.n2(self.c2(x)))\n        f = torch.cat([x, self.skip(obs)], 1)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], 1))\n        return f, g\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.base = Base(spec)\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        self.T = len(self.fps)\n        sq = spec.X == spec.Y\n        self.frames = list(range(8)) if sq else [0, 1, 2, 3]\n        self.no = 2 if sq else 1\n        keys = []\n        sel = []\n        for top, left in CORNERS:\n            row = []\n            for o in range(self.no):\n                rt = []\n                for t, (dy, dx) in enumerate(self.fps):\n                    a, b = (dy, dx) if o == 0 else (dx, dy)\n                    k = vkey(t, a, b, top, left)\n                    if k not in keys:\n                        keys.append(k)\n                    rt.append(keys.index(k))\n                row.append(rt)\n            sel.append(row)\n        self.keys = keys\n        self.sel = sel\n        self.proj = ortho(nn.Conv2d(self.base.ch, PROJ, 1), math.sqrt(2))\n        self.mix = nn.ModuleList([ortho(nn.Conv2d(3 * PROJ, HID, 1), math.sqrt(2)) for _ in keys])\n        self.out = nn.ModuleList([ortho(nn.Conv2d(HID, 1, 1), 0.01) for _ in keys])\n        self.af = nn.Parameter(torch.zeros(len(self.frames)))\n        self.ac = nn.Parameter(torch.zeros(len(CORNERS)))\n        self.ao = nn.Parameter(torch.zeros(2))\n\n    def forward(self, obs, mask):\n        f, g = self.base.features(obs)\n        p = self.proj(f)\n        B = p.shape[0]\n        H = []\n        for key, mix, out in zip(self.keys, self.mix, self.out):\n            t, a, b, top, left = key\n            mx, mn, av = wpool(p, a, b, top, left)\n            H.append(out(F.relu(mix(torch.cat([mx, mn, av], 1)))))\n        wc = torch.softmax(SCALE * self.ac, 0)\n        wf = torch.softmax(SCALE * self.af, 0)\n        wo = torch.softmax(SCALE * self.ao, 0)\n        tb = self.base.tbias(g).view(B, self.T, 1, 1)\n        Oc = []\n        for o in range(self.no):\n            acc = None\n            for c in range(len(CORNERS)):\n                m = torch.cat([H[i] for i in self.sel[c][o]], 1)\n                acc = wc[c] * m if acc is None else acc + wc[c] * m\n            Oc.append(acc + tb)\n        place = None\n        for i, k in enumerate(self.frames):\n            o = 1 if k >= 4 else 0\n            A = dihedral(Oc[o], k)\n            tm = A.reshape(B, -1)\n            am = A.permute(0, 2, 3, 1).reshape(B, -1)\n            term = wf[i] * (wo[0] * tm + wo[1] * am)\n            place = term if place is None else place + term\n        logits = torch.cat([place, self.base.done(g)], 1)\n        return logits, self.base.value(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 61777,
+    "fb_ms": 90.6,
+    "flops_per_sample": 18336000,
+    "flops_ratio": 1.0,
+    "sha": "07ea27ff632acfff",
+    "recipe": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 64,
+     "n_minibatches": 64,
+     "ppo_epochs": 1,
+     "ent_coef": 0.01,
+     "gamma": 0.995,
+     "gae_lambda": 0.9,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "ppo_epochs": 1,
+     "n_envs": 128,
+     "rollout_len": 64,
+     "n_minibatches": 64,
+     "gamma": 0.995,
+     "lr": 0.002
+    },
+    "budget": {
+     "allowed_steps": 424806,
+     "n_updates": 51,
+     "batch": 8192,
+     "steps": 417792,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0131
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0207,
+     "short_run_updates": 7
+    },
+    "rule": "bookmirror"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.8867,
+    "dev_per_seed": [
+     0.8867
+    ],
+    "train_exact": 0.8699,
+    "params": 61777,
+    "flops_ratio": 1.0,
+    "train_steps": 417792,
+    "wall_s": 147.3,
+    "sha": "07ea27ff632acfff",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r4c1",
+   "round": 4,
+   "name": "pure frames 2ep lr 3e-3",
+   "hypothesis": "Starts from the best trial (r3c5) and changes one thing: lr 2e-3 becomes 3e-3. Raising lr has helped at every step so far (1e-3 \u2192 1.5e-3 \u2192 2e-3), and the linear decay keeps the late updates stable. Refuted if dev falls clearly below about 0.9, which would mean 2e-3 is already the stability limit for 2 epochs.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {\"ppo_epochs\": 2, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 16, \"gamma\": 0.97, \"gae_lambda\": 0.95, \"ent_coef\": 0.005, \"lr\": 0.003}\n\nSTEM = 64\nCOL = 48\nWIDTH = 40\nSKIP = 24\nPROJ = 16\nHID = 16\nGH = 64\nSCALE = 5.0\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    if m.bias is not None:\n        nn.init.zeros_(m.bias)\n    return m\n\n\ndef dihedral(x, k):\n    if k >= 4:\n        x = x.transpose(-2, -1)\n    m = k % 4\n    if m == 1:\n        x = x.flip(-1)\n    elif m == 2:\n        x = x.flip(-2)\n    elif m == 3:\n        x = x.flip(-2).flip(-1)\n    return x\n\n\ndef wpool(q, dy, dx, top=True, left=True):\n    if dy * dx == 1:\n        return q, q, q\n    pad = ((0, dx - 1) if left else (dx - 1, 0)) + ((0, dy - 1) if top else (dy - 1, 0))\n    q = F.pad(q, pad)\n    mx = F.max_pool2d(q, (dy, dx), stride=1)\n    mn = -F.max_pool2d(-q, (dy, dx), stride=1)\n    av = F.avg_pool2d(q, (dy, dx), stride=1)\n    return mx, mn, av\n\n\ndef vkey(t, a, b, top, left):\n    if a == 1:\n        top = True\n    if b == 1:\n        left = True\n    return (t, a, b, top, left)\n\n\nclass Base(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        c = spec.in_channels\n        self.s1 = ortho(nn.Conv2d(c, STEM, 1), math.sqrt(2))\n        self.s2 = ortho(nn.Conv2d(STEM, COL, 1), math.sqrt(2))\n        self.c1 = ortho(nn.Conv2d(COL, WIDTH, 3, padding=1), math.sqrt(2))\n        self.n1 = nn.GroupNorm(4, WIDTH)\n        self.c2 = ortho(nn.Conv2d(WIDTH, WIDTH, 3, padding=1), math.sqrt(2))\n        self.n2 = nn.GroupNorm(4, WIDTH)\n        self.skip = ortho(nn.Conv2d(c, SKIP, 1), 1.0)\n        self.ch = WIDTH + SKIP\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * self.ch, GH), math.sqrt(2)), nn.ReLU(),\n                                  ortho(nn.Linear(GH, GH), math.sqrt(2)), nn.ReLU())\n        self.done = ortho(nn.Linear(GH, 1), 0.01)\n        self.value = ortho(nn.Linear(GH, 1), 1.0)\n        self.tbias = ortho(nn.Linear(GH, spec.n_types), 0.01)\n\n    def features(self, obs):\n        s = F.relu(self.s2(F.relu(self.s1(obs))))\n        x = F.relu(self.n1(self.c1(s)))\n        x = F.relu(x + self.n2(self.c2(x)))\n        f = torch.cat([x, self.skip(obs)], 1)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], 1))\n        return f, g\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.base = Base(spec)\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        self.T = len(self.fps)\n        self.frames = list(range(8)) if spec.X == spec.Y else [0, 1, 2, 3]\n        keys = []\n        sel = []\n        for k in self.frames:\n            tr = k >= 4\n            m = k % 4\n            fx = m in (1, 3)\n            fy = m in (2, 3)\n            rt = []\n            for t, (dy, dx) in enumerate(self.fps):\n                if tr:\n                    key = vkey(t, dx, dy, not fx, not fy)\n                else:\n                    key = vkey(t, dy, dx, not fy, not fx)\n                if key not in keys:\n                    keys.append(key)\n                rt.append(keys.index(key))\n            sel.append(rt)\n        self.keys = keys\n        self.sel = sel\n        self.proj = ortho(nn.Conv2d(self.base.ch, PROJ, 1), math.sqrt(2))\n        self.mix = nn.ModuleList([ortho(nn.Conv2d(3 * PROJ, HID, 1), math.sqrt(2)) for _ in keys])\n        self.out = nn.ModuleList([ortho(nn.Conv2d(HID, 1, 1), 0.01) for _ in keys])\n        self.af = nn.Parameter(torch.zeros(len(self.frames)))\n\n    def forward(self, obs, mask):\n        f, g = self.base.features(obs)\n        p = self.proj(f)\n        B = p.shape[0]\n        H = []\n        for key, mix, out in zip(self.keys, self.mix, self.out):\n            t, a, b, top, left = key\n            mx, mn, av = wpool(p, a, b, top, left)\n            H.append(out(F.relu(mix(torch.cat([mx, mn, av], 1)))))\n        wf = torch.softmax(SCALE * self.af, 0)\n        tb = self.base.tbias(g).view(B, self.T, 1, 1)\n        place = None\n        for i, k in enumerate(self.frames):\n            A = torch.cat([H[j] for j in self.sel[i]], 1) + tb\n            term = wf[i] * dihedral(A, k).reshape(B, -1)\n            place = term if place is None else place + term\n        logits = torch.cat([place, self.base.done(g)], 1)\n        return logits, self.base.value(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 61771,
+    "fb_ms": 94.72,
+    "flops_per_sample": 18336000,
+    "flops_ratio": 1.0,
+    "sha": "9272f4e695bc5b9f",
+    "recipe": {
+     "lr": 0.003,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 16,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "ppo_epochs": 2,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 16,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "ent_coef": 0.005,
+     "lr": 0.003
+    },
+    "budget": {
+     "allowed_steps": 242746,
+     "n_updates": 118,
+     "batch": 2048,
+     "steps": 241664,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0024
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0232,
+     "short_run_updates": 7
+    },
+    "rule": "bookmirror"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.9668,
+    "dev_per_seed": [
+     0.9668
+    ],
+    "train_exact": 0.9337,
+    "params": 61771,
+    "flops_ratio": 1.0,
+    "train_steps": 241664,
+    "wall_s": 129.6,
+    "sha": "9272f4e695bc5b9f",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r4c2",
+   "round": 4,
+   "name": "pure frames 1ep lr 3e-3",
+   "hypothesis": "Starts from r3c3 (1 epoch, 418k samples, 0.957) and changes one thing: lr 2e-3 becomes 3e-3. With one epoch each sample is used once, so a larger step should be safe and should speed up building competence. Refuted if dev falls below about 0.9, which would mean the higher lr destabilises single-epoch PPO.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {\"ppo_epochs\": 1, \"n_envs\": 128, \"rollout_len\": 64, \"n_minibatches\": 64, \"gamma\": 0.995, \"lr\": 0.003}\n\nSTEM = 64\nCOL = 48\nWIDTH = 40\nSKIP = 24\nPROJ = 16\nHID = 16\nGH = 64\nSCALE = 5.0\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    if m.bias is not None:\n        nn.init.zeros_(m.bias)\n    return m\n\n\ndef dihedral(x, k):\n    if k >= 4:\n        x = x.transpose(-2, -1)\n    m = k % 4\n    if m == 1:\n        x = x.flip(-1)\n    elif m == 2:\n        x = x.flip(-2)\n    elif m == 3:\n        x = x.flip(-2).flip(-1)\n    return x\n\n\ndef wpool(q, dy, dx, top=True, left=True):\n    if dy * dx == 1:\n        return q, q, q\n    pad = ((0, dx - 1) if left else (dx - 1, 0)) + ((0, dy - 1) if top else (dy - 1, 0))\n    q = F.pad(q, pad)\n    mx = F.max_pool2d(q, (dy, dx), stride=1)\n    mn = -F.max_pool2d(-q, (dy, dx), stride=1)\n    av = F.avg_pool2d(q, (dy, dx), stride=1)\n    return mx, mn, av\n\n\ndef vkey(t, a, b, top, left):\n    if a == 1:\n        top = True\n    if b == 1:\n        left = True\n    return (t, a, b, top, left)\n\n\nclass Base(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        c = spec.in_channels\n        self.s1 = ortho(nn.Conv2d(c, STEM, 1), math.sqrt(2))\n        self.s2 = ortho(nn.Conv2d(STEM, COL, 1), math.sqrt(2))\n        self.c1 = ortho(nn.Conv2d(COL, WIDTH, 3, padding=1), math.sqrt(2))\n        self.n1 = nn.GroupNorm(4, WIDTH)\n        self.c2 = ortho(nn.Conv2d(WIDTH, WIDTH, 3, padding=1), math.sqrt(2))\n        self.n2 = nn.GroupNorm(4, WIDTH)\n        self.skip = ortho(nn.Conv2d(c, SKIP, 1), 1.0)\n        self.ch = WIDTH + SKIP\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * self.ch, GH), math.sqrt(2)), nn.ReLU(),\n                                  ortho(nn.Linear(GH, GH), math.sqrt(2)), nn.ReLU())\n        self.done = ortho(nn.Linear(GH, 1), 0.01)\n        self.value = ortho(nn.Linear(GH, 1), 1.0)\n        self.tbias = ortho(nn.Linear(GH, spec.n_types), 0.01)\n\n    def features(self, obs):\n        s = F.relu(self.s2(F.relu(self.s1(obs))))\n        x = F.relu(self.n1(self.c1(s)))\n        x = F.relu(x + self.n2(self.c2(x)))\n        f = torch.cat([x, self.skip(obs)], 1)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], 1))\n        return f, g\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.base = Base(spec)\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        self.T = len(self.fps)\n        self.frames = list(range(8)) if spec.X == spec.Y else [0, 1, 2, 3]\n        keys = []\n        sel = []\n        for k in self.frames:\n            tr = k >= 4\n            m = k % 4\n            fx = m in (1, 3)\n            fy = m in (2, 3)\n            rt = []\n            for t, (dy, dx) in enumerate(self.fps):\n                if tr:\n                    key = vkey(t, dx, dy, not fx, not fy)\n                else:\n                    key = vkey(t, dy, dx, not fy, not fx)\n                if key not in keys:\n                    keys.append(key)\n                rt.append(keys.index(key))\n            sel.append(rt)\n        self.keys = keys\n        self.sel = sel\n        self.proj = ortho(nn.Conv2d(self.base.ch, PROJ, 1), math.sqrt(2))\n        self.mix = nn.ModuleList([ortho(nn.Conv2d(3 * PROJ, HID, 1), math.sqrt(2)) for _ in keys])\n        self.out = nn.ModuleList([ortho(nn.Conv2d(HID, 1, 1), 0.01) for _ in keys])\n        self.af = nn.Parameter(torch.zeros(len(self.frames)))\n\n    def forward(self, obs, mask):\n        f, g = self.base.features(obs)\n        p = self.proj(f)\n        B = p.shape[0]\n        H = []\n        for key, mix, out in zip(self.keys, self.mix, self.out):\n            t, a, b, top, left = key\n            mx, mn, av = wpool(p, a, b, top, left)\n            H.append(out(F.relu(mix(torch.cat([mx, mn, av], 1)))))\n        wf = torch.softmax(SCALE * self.af, 0)\n        tb = self.base.tbias(g).view(B, self.T, 1, 1)\n        place = None\n        for i, k in enumerate(self.frames):\n            A = torch.cat([H[j] for j in self.sel[i]], 1) + tb\n            term = wf[i] * dihedral(A, k).reshape(B, -1)\n            place = term if place is None else place + term\n        logits = torch.cat([place, self.base.done(g)], 1)\n        return logits, self.base.value(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 61771,
+    "fb_ms": 93.72,
+    "flops_per_sample": 18336000,
+    "flops_ratio": 1.0,
+    "sha": "64cf7ddf3e80bba7",
+    "recipe": {
+     "lr": 0.003,
+     "n_envs": 128,
+     "rollout_len": 64,
+     "n_minibatches": 64,
+     "ppo_epochs": 1,
+     "ent_coef": 0.01,
+     "gamma": 0.995,
+     "gae_lambda": 0.9,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "ppo_epochs": 1,
+     "n_envs": 128,
+     "rollout_len": 64,
+     "n_minibatches": 64,
+     "gamma": 0.995,
+     "lr": 0.003
+    },
+    "budget": {
+     "allowed_steps": 424806,
+     "n_updates": 51,
+     "batch": 8192,
+     "steps": 417792,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0024
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0232,
+     "short_run_updates": 7
+    },
+    "rule": "bookmirror"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.9648,
+    "dev_per_seed": [
+     0.9648
+    ],
+    "train_exact": 0.9392,
+    "params": 61771,
+    "flops_ratio": 1.0,
+    "train_steps": 417792,
+    "wall_s": 132.8,
+    "sha": "64cf7ddf3e80bba7",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r4c3",
+   "round": 4,
+   "name": "pure frames 2ep 32 minibatches",
+   "hypothesis": "Starts from r3c5 and changes one thing: 16 minibatches become 32 (64 samples each). That doubles the gradient steps at the same sample count and lr 2e-3, which should speed the late refinement where training success is about 0.95. Refuted if dev drops clearly below 0.9, which would mean noisier small minibatches hurt.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {\"ppo_epochs\": 2, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 32, \"gamma\": 0.97, \"gae_lambda\": 0.95, \"ent_coef\": 0.005, \"lr\": 0.002}\n\nSTEM = 64\nCOL = 48\nWIDTH = 40\nSKIP = 24\nPROJ = 16\nHID = 16\nGH = 64\nSCALE = 5.0\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    if m.bias is not None:\n        nn.init.zeros_(m.bias)\n    return m\n\n\ndef dihedral(x, k):\n    if k >= 4:\n        x = x.transpose(-2, -1)\n    m = k % 4\n    if m == 1:\n        x = x.flip(-1)\n    elif m == 2:\n        x = x.flip(-2)\n    elif m == 3:\n        x = x.flip(-2).flip(-1)\n    return x\n\n\ndef wpool(q, dy, dx, top=True, left=True):\n    if dy * dx == 1:\n        return q, q, q\n    pad = ((0, dx - 1) if left else (dx - 1, 0)) + ((0, dy - 1) if top else (dy - 1, 0))\n    q = F.pad(q, pad)\n    mx = F.max_pool2d(q, (dy, dx), stride=1)\n    mn = -F.max_pool2d(-q, (dy, dx), stride=1)\n    av = F.avg_pool2d(q, (dy, dx), stride=1)\n    return mx, mn, av\n\n\ndef vkey(t, a, b, top, left):\n    if a == 1:\n        top = True\n    if b == 1:\n        left = True\n    return (t, a, b, top, left)\n\n\nclass Base(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        c = spec.in_channels\n        self.s1 = ortho(nn.Conv2d(c, STEM, 1), math.sqrt(2))\n        self.s2 = ortho(nn.Conv2d(STEM, COL, 1), math.sqrt(2))\n        self.c1 = ortho(nn.Conv2d(COL, WIDTH, 3, padding=1), math.sqrt(2))\n        self.n1 = nn.GroupNorm(4, WIDTH)\n        self.c2 = ortho(nn.Conv2d(WIDTH, WIDTH, 3, padding=1), math.sqrt(2))\n        self.n2 = nn.GroupNorm(4, WIDTH)\n        self.skip = ortho(nn.Conv2d(c, SKIP, 1), 1.0)\n        self.ch = WIDTH + SKIP\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * self.ch, GH), math.sqrt(2)), nn.ReLU(),\n                                  ortho(nn.Linear(GH, GH), math.sqrt(2)), nn.ReLU())\n        self.done = ortho(nn.Linear(GH, 1), 0.01)\n        self.value = ortho(nn.Linear(GH, 1), 1.0)\n        self.tbias = ortho(nn.Linear(GH, spec.n_types), 0.01)\n\n    def features(self, obs):\n        s = F.relu(self.s2(F.relu(self.s1(obs))))\n        x = F.relu(self.n1(self.c1(s)))\n        x = F.relu(x + self.n2(self.c2(x)))\n        f = torch.cat([x, self.skip(obs)], 1)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], 1))\n        return f, g\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.base = Base(spec)\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        self.T = len(self.fps)\n        self.frames = list(range(8)) if spec.X == spec.Y else [0, 1, 2, 3]\n        keys = []\n        sel = []\n        for k in self.frames:\n            tr = k >= 4\n            m = k % 4\n            fx = m in (1, 3)\n            fy = m in (2, 3)\n            rt = []\n            for t, (dy, dx) in enumerate(self.fps):\n                if tr:\n                    key = vkey(t, dx, dy, not fx, not fy)\n                else:\n                    key = vkey(t, dy, dx, not fy, not fx)\n                if key not in keys:\n                    keys.append(key)\n                rt.append(keys.index(key))\n            sel.append(rt)\n        self.keys = keys\n        self.sel = sel\n        self.proj = ortho(nn.Conv2d(self.base.ch, PROJ, 1), math.sqrt(2))\n        self.mix = nn.ModuleList([ortho(nn.Conv2d(3 * PROJ, HID, 1), math.sqrt(2)) for _ in keys])\n        self.out = nn.ModuleList([ortho(nn.Conv2d(HID, 1, 1), 0.01) for _ in keys])\n        self.af = nn.Parameter(torch.zeros(len(self.frames)))\n\n    def forward(self, obs, mask):\n        f, g = self.base.features(obs)\n        p = self.proj(f)\n        B = p.shape[0]\n        H = []\n        for key, mix, out in zip(self.keys, self.mix, self.out):\n            t, a, b, top, left = key\n            mx, mn, av = wpool(p, a, b, top, left)\n            H.append(out(F.relu(mix(torch.cat([mx, mn, av], 1)))))\n        wf = torch.softmax(SCALE * self.af, 0)\n        tb = self.base.tbias(g).view(B, self.T, 1, 1)\n        place = None\n        for i, k in enumerate(self.frames):\n            A = torch.cat([H[j] for j in self.sel[i]], 1) + tb\n            term = wf[i] * dihedral(A, k).reshape(B, -1)\n            place = term if place is None else place + term\n        logits = torch.cat([place, self.base.done(g)], 1)\n        return logits, self.base.value(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 61771,
+    "fb_ms": 95.91,
+    "flops_per_sample": 18336000,
+    "flops_ratio": 1.0,
+    "sha": "092f3f297e22eb71",
+    "recipe": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "ppo_epochs": 2,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "ent_coef": 0.005,
+     "lr": 0.002
+    },
+    "budget": {
+     "allowed_steps": 242746,
+     "n_updates": 118,
+     "batch": 2048,
+     "steps": 241664,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0024
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0232,
+     "short_run_updates": 7
+    },
+    "rule": "bookmirror"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.9746,
+    "dev_per_seed": [
+     0.9746
+    ],
+    "train_exact": 0.9391,
+    "params": 61771,
+    "flops_ratio": 1.0,
+    "train_steps": 241664,
+    "wall_s": 187.6,
+    "sha": "092f3f297e22eb71",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r4c4",
+   "round": 4,
+   "name": "pure frames 1ep, 2ep advantage settings",
+   "hypothesis": "Starts from r3c3 (1 epoch, lr 2e-3) but uses the advantage and entropy settings of the 2-epoch winner: gamma 0.97, lambda 0.95, entropy 0.005. This tests whether lower entropy (cleaner commitment) plus a shorter horizon add to the 3.2-times sample count. Refuted if dev drops clearly below 0.957, which would mean gamma 0.995 matters for one epoch.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {\"ppo_epochs\": 1, \"n_envs\": 128, \"rollout_len\": 64, \"n_minibatches\": 64, \"gamma\": 0.97, \"gae_lambda\": 0.95, \"ent_coef\": 0.005, \"lr\": 0.002}\n\nSTEM = 64\nCOL = 48\nWIDTH = 40\nSKIP = 24\nPROJ = 16\nHID = 16\nGH = 64\nSCALE = 5.0\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    if m.bias is not None:\n        nn.init.zeros_(m.bias)\n    return m\n\n\ndef dihedral(x, k):\n    if k >= 4:\n        x = x.transpose(-2, -1)\n    m = k % 4\n    if m == 1:\n        x = x.flip(-1)\n    elif m == 2:\n        x = x.flip(-2)\n    elif m == 3:\n        x = x.flip(-2).flip(-1)\n    return x\n\n\ndef wpool(q, dy, dx, top=True, left=True):\n    if dy * dx == 1:\n        return q, q, q\n    pad = ((0, dx - 1) if left else (dx - 1, 0)) + ((0, dy - 1) if top else (dy - 1, 0))\n    q = F.pad(q, pad)\n    mx = F.max_pool2d(q, (dy, dx), stride=1)\n    mn = -F.max_pool2d(-q, (dy, dx), stride=1)\n    av = F.avg_pool2d(q, (dy, dx), stride=1)\n    return mx, mn, av\n\n\ndef vkey(t, a, b, top, left):\n    if a == 1:\n        top = True\n    if b == 1:\n        left = True\n    return (t, a, b, top, left)\n\n\nclass Base(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        c = spec.in_channels\n        self.s1 = ortho(nn.Conv2d(c, STEM, 1), math.sqrt(2))\n        self.s2 = ortho(nn.Conv2d(STEM, COL, 1), math.sqrt(2))\n        self.c1 = ortho(nn.Conv2d(COL, WIDTH, 3, padding=1), math.sqrt(2))\n        self.n1 = nn.GroupNorm(4, WIDTH)\n        self.c2 = ortho(nn.Conv2d(WIDTH, WIDTH, 3, padding=1), math.sqrt(2))\n        self.n2 = nn.GroupNorm(4, WIDTH)\n        self.skip = ortho(nn.Conv2d(c, SKIP, 1), 1.0)\n        self.ch = WIDTH + SKIP\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * self.ch, GH), math.sqrt(2)), nn.ReLU(),\n                                  ortho(nn.Linear(GH, GH), math.sqrt(2)), nn.ReLU())\n        self.done = ortho(nn.Linear(GH, 1), 0.01)\n        self.value = ortho(nn.Linear(GH, 1), 1.0)\n        self.tbias = ortho(nn.Linear(GH, spec.n_types), 0.01)\n\n    def features(self, obs):\n        s = F.relu(self.s2(F.relu(self.s1(obs))))\n        x = F.relu(self.n1(self.c1(s)))\n        x = F.relu(x + self.n2(self.c2(x)))\n        f = torch.cat([x, self.skip(obs)], 1)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], 1))\n        return f, g\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.base = Base(spec)\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        self.T = len(self.fps)\n        self.frames = list(range(8)) if spec.X == spec.Y else [0, 1, 2, 3]\n        keys = []\n        sel = []\n        for k in self.frames:\n            tr = k >= 4\n            m = k % 4\n            fx = m in (1, 3)\n            fy = m in (2, 3)\n            rt = []\n            for t, (dy, dx) in enumerate(self.fps):\n                if tr:\n                    key = vkey(t, dx, dy, not fx, not fy)\n                else:\n                    key = vkey(t, dy, dx, not fy, not fx)\n                if key not in keys:\n                    keys.append(key)\n                rt.append(keys.index(key))\n            sel.append(rt)\n        self.keys = keys\n        self.sel = sel\n        self.proj = ortho(nn.Conv2d(self.base.ch, PROJ, 1), math.sqrt(2))\n        self.mix = nn.ModuleList([ortho(nn.Conv2d(3 * PROJ, HID, 1), math.sqrt(2)) for _ in keys])\n        self.out = nn.ModuleList([ortho(nn.Conv2d(HID, 1, 1), 0.01) for _ in keys])\n        self.af = nn.Parameter(torch.zeros(len(self.frames)))\n\n    def forward(self, obs, mask):\n        f, g = self.base.features(obs)\n        p = self.proj(f)\n        B = p.shape[0]\n        H = []\n        for key, mix, out in zip(self.keys, self.mix, self.out):\n            t, a, b, top, left = key\n            mx, mn, av = wpool(p, a, b, top, left)\n            H.append(out(F.relu(mix(torch.cat([mx, mn, av], 1)))))\n        wf = torch.softmax(SCALE * self.af, 0)\n        tb = self.base.tbias(g).view(B, self.T, 1, 1)\n        place = None\n        for i, k in enumerate(self.frames):\n            A = torch.cat([H[j] for j in self.sel[i]], 1) + tb\n            term = wf[i] * dihedral(A, k).reshape(B, -1)\n            place = term if place is None else place + term\n        logits = torch.cat([place, self.base.done(g)], 1)\n        return logits, self.base.value(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 61771,
+    "fb_ms": 95.0,
+    "flops_per_sample": 18336000,
+    "flops_ratio": 1.0,
+    "sha": "f746f1e4ccb0ea60",
+    "recipe": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 64,
+     "n_minibatches": 64,
+     "ppo_epochs": 1,
+     "ent_coef": 0.005,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "ppo_epochs": 1,
+     "n_envs": 128,
+     "rollout_len": 64,
+     "n_minibatches": 64,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "ent_coef": 0.005,
+     "lr": 0.002
+    },
+    "budget": {
+     "allowed_steps": 424806,
+     "n_updates": 51,
+     "batch": 8192,
+     "steps": 417792,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0024
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0232,
+     "short_run_updates": 7
+    },
+    "rule": "bookmirror"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.5645,
+    "dev_per_seed": [
+     0.5645
+    ],
+    "train_exact": 0.4829,
+    "params": 61771,
+    "flops_ratio": 1.0,
+    "train_steps": 417792,
+    "wall_s": 140.9,
+    "sha": "f746f1e4ccb0ea60",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r4c5",
+   "round": 4,
+   "name": "pure frames 2ep gamma 0.99",
+   "hypothesis": "Starts from r3c5 and changes one thing: gamma 0.97 becomes 0.99. The +1 exact-build bonus comes at the end of episodes of up to 33 placements. With gamma 0.97 it is discounted to about 0.4 over 30 steps, which weakens credit for early bricks. Refuted if dev drops clearly below 0.9, which would mean the noisier long-horizon returns hurt.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {\"ppo_epochs\": 2, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 16, \"gamma\": 0.99, \"gae_lambda\": 0.95, \"ent_coef\": 0.005, \"lr\": 0.002}\n\nSTEM = 64\nCOL = 48\nWIDTH = 40\nSKIP = 24\nPROJ = 16\nHID = 16\nGH = 64\nSCALE = 5.0\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    if m.bias is not None:\n        nn.init.zeros_(m.bias)\n    return m\n\n\ndef dihedral(x, k):\n    if k >= 4:\n        x = x.transpose(-2, -1)\n    m = k % 4\n    if m == 1:\n        x = x.flip(-1)\n    elif m == 2:\n        x = x.flip(-2)\n    elif m == 3:\n        x = x.flip(-2).flip(-1)\n    return x\n\n\ndef wpool(q, dy, dx, top=True, left=True):\n    if dy * dx == 1:\n        return q, q, q\n    pad = ((0, dx - 1) if left else (dx - 1, 0)) + ((0, dy - 1) if top else (dy - 1, 0))\n    q = F.pad(q, pad)\n    mx = F.max_pool2d(q, (dy, dx), stride=1)\n    mn = -F.max_pool2d(-q, (dy, dx), stride=1)\n    av = F.avg_pool2d(q, (dy, dx), stride=1)\n    return mx, mn, av\n\n\ndef vkey(t, a, b, top, left):\n    if a == 1:\n        top = True\n    if b == 1:\n        left = True\n    return (t, a, b, top, left)\n\n\nclass Base(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        c = spec.in_channels\n        self.s1 = ortho(nn.Conv2d(c, STEM, 1), math.sqrt(2))\n        self.s2 = ortho(nn.Conv2d(STEM, COL, 1), math.sqrt(2))\n        self.c1 = ortho(nn.Conv2d(COL, WIDTH, 3, padding=1), math.sqrt(2))\n        self.n1 = nn.GroupNorm(4, WIDTH)\n        self.c2 = ortho(nn.Conv2d(WIDTH, WIDTH, 3, padding=1), math.sqrt(2))\n        self.n2 = nn.GroupNorm(4, WIDTH)\n        self.skip = ortho(nn.Conv2d(c, SKIP, 1), 1.0)\n        self.ch = WIDTH + SKIP\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * self.ch, GH), math.sqrt(2)), nn.ReLU(),\n                                  ortho(nn.Linear(GH, GH), math.sqrt(2)), nn.ReLU())\n        self.done = ortho(nn.Linear(GH, 1), 0.01)\n        self.value = ortho(nn.Linear(GH, 1), 1.0)\n        self.tbias = ortho(nn.Linear(GH, spec.n_types), 0.01)\n\n    def features(self, obs):\n        s = F.relu(self.s2(F.relu(self.s1(obs))))\n        x = F.relu(self.n1(self.c1(s)))\n        x = F.relu(x + self.n2(self.c2(x)))\n        f = torch.cat([x, self.skip(obs)], 1)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], 1))\n        return f, g\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.base = Base(spec)\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        self.T = len(self.fps)\n        self.frames = list(range(8)) if spec.X == spec.Y else [0, 1, 2, 3]\n        keys = []\n        sel = []\n        for k in self.frames:\n            tr = k >= 4\n            m = k % 4\n            fx = m in (1, 3)\n            fy = m in (2, 3)\n            rt = []\n            for t, (dy, dx) in enumerate(self.fps):\n                if tr:\n                    key = vkey(t, dx, dy, not fx, not fy)\n                else:\n                    key = vkey(t, dy, dx, not fy, not fx)\n                if key not in keys:\n                    keys.append(key)\n                rt.append(keys.index(key))\n            sel.append(rt)\n        self.keys = keys\n        self.sel = sel\n        self.proj = ortho(nn.Conv2d(self.base.ch, PROJ, 1), math.sqrt(2))\n        self.mix = nn.ModuleList([ortho(nn.Conv2d(3 * PROJ, HID, 1), math.sqrt(2)) for _ in keys])\n        self.out = nn.ModuleList([ortho(nn.Conv2d(HID, 1, 1), 0.01) for _ in keys])\n        self.af = nn.Parameter(torch.zeros(len(self.frames)))\n\n    def forward(self, obs, mask):\n        f, g = self.base.features(obs)\n        p = self.proj(f)\n        B = p.shape[0]\n        H = []\n        for key, mix, out in zip(self.keys, self.mix, self.out):\n            t, a, b, top, left = key\n            mx, mn, av = wpool(p, a, b, top, left)\n            H.append(out(F.relu(mix(torch.cat([mx, mn, av], 1)))))\n        wf = torch.softmax(SCALE * self.af, 0)\n        tb = self.base.tbias(g).view(B, self.T, 1, 1)\n        place = None\n        for i, k in enumerate(self.frames):\n            A = torch.cat([H[j] for j in self.sel[i]], 1) + tb\n            term = wf[i] * dihedral(A, k).reshape(B, -1)\n            place = term if place is None else place + term\n        logits = torch.cat([place, self.base.done(g)], 1)\n        return logits, self.base.value(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 61771,
+    "fb_ms": 97.83,
+    "flops_per_sample": 18336000,
+    "flops_ratio": 1.0,
+    "sha": "dda1a5470cbeb789",
+    "recipe": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 16,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.99,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "ppo_epochs": 2,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 16,
+     "gamma": 0.99,
+     "gae_lambda": 0.95,
+     "ent_coef": 0.005,
+     "lr": 0.002
+    },
+    "budget": {
+     "allowed_steps": 242746,
+     "n_updates": 118,
+     "batch": 2048,
+     "steps": 241664,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0024
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0232,
+     "short_run_updates": 7
+    },
+    "rule": "bookmirror"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.9727,
+    "dev_per_seed": [
+     0.9727
+    ],
+    "train_exact": 0.9519,
+    "params": 61771,
+    "flops_ratio": 1.0,
+    "train_steps": 241664,
+    "wall_s": 142.3,
+    "sha": "dda1a5470cbeb789",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r4c6",
+   "round": 4,
+   "name": "pure frames 3 epochs lr 2e-3",
+   "hypothesis": "Starts from r3c5 and changes one thing: 2 PPO epochs become 3. That gives about 170k samples (down from 242k) but more reuse per sample, which tests where the samples-versus-reuse optimum lies at lr 2e-3. Refuted if dev drops clearly below 0.9, which would confirm that fewer epochs with more samples is better here.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {\"ppo_epochs\": 3, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 16, \"gamma\": 0.97, \"gae_lambda\": 0.95, \"ent_coef\": 0.005, \"lr\": 0.002}\n\nSTEM = 64\nCOL = 48\nWIDTH = 40\nSKIP = 24\nPROJ = 16\nHID = 16\nGH = 64\nSCALE = 5.0\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    if m.bias is not None:\n        nn.init.zeros_(m.bias)\n    return m\n\n\ndef dihedral(x, k):\n    if k >= 4:\n        x = x.transpose(-2, -1)\n    m = k % 4\n    if m == 1:\n        x = x.flip(-1)\n    elif m == 2:\n        x = x.flip(-2)\n    elif m == 3:\n        x = x.flip(-2).flip(-1)\n    return x\n\n\ndef wpool(q, dy, dx, top=True, left=True):\n    if dy * dx == 1:\n        return q, q, q\n    pad = ((0, dx - 1) if left else (dx - 1, 0)) + ((0, dy - 1) if top else (dy - 1, 0))\n    q = F.pad(q, pad)\n    mx = F.max_pool2d(q, (dy, dx), stride=1)\n    mn = -F.max_pool2d(-q, (dy, dx), stride=1)\n    av = F.avg_pool2d(q, (dy, dx), stride=1)\n    return mx, mn, av\n\n\ndef vkey(t, a, b, top, left):\n    if a == 1:\n        top = True\n    if b == 1:\n        left = True\n    return (t, a, b, top, left)\n\n\nclass Base(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        c = spec.in_channels\n        self.s1 = ortho(nn.Conv2d(c, STEM, 1), math.sqrt(2))\n        self.s2 = ortho(nn.Conv2d(STEM, COL, 1), math.sqrt(2))\n        self.c1 = ortho(nn.Conv2d(COL, WIDTH, 3, padding=1), math.sqrt(2))\n        self.n1 = nn.GroupNorm(4, WIDTH)\n        self.c2 = ortho(nn.Conv2d(WIDTH, WIDTH, 3, padding=1), math.sqrt(2))\n        self.n2 = nn.GroupNorm(4, WIDTH)\n        self.skip = ortho(nn.Conv2d(c, SKIP, 1), 1.0)\n        self.ch = WIDTH + SKIP\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * self.ch, GH), math.sqrt(2)), nn.ReLU(),\n                                  ortho(nn.Linear(GH, GH), math.sqrt(2)), nn.ReLU())\n        self.done = ortho(nn.Linear(GH, 1), 0.01)\n        self.value = ortho(nn.Linear(GH, 1), 1.0)\n        self.tbias = ortho(nn.Linear(GH, spec.n_types), 0.01)\n\n    def features(self, obs):\n        s = F.relu(self.s2(F.relu(self.s1(obs))))\n        x = F.relu(self.n1(self.c1(s)))\n        x = F.relu(x + self.n2(self.c2(x)))\n        f = torch.cat([x, self.skip(obs)], 1)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], 1))\n        return f, g\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.base = Base(spec)\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        self.T = len(self.fps)\n        self.frames = list(range(8)) if spec.X == spec.Y else [0, 1, 2, 3]\n        keys = []\n        sel = []\n        for k in self.frames:\n            tr = k >= 4\n            m = k % 4\n            fx = m in (1, 3)\n            fy = m in (2, 3)\n            rt = []\n            for t, (dy, dx) in enumerate(self.fps):\n                if tr:\n                    key = vkey(t, dx, dy, not fx, not fy)\n                else:\n                    key = vkey(t, dy, dx, not fy, not fx)\n                if key not in keys:\n                    keys.append(key)\n                rt.append(keys.index(key))\n            sel.append(rt)\n        self.keys = keys\n        self.sel = sel\n        self.proj = ortho(nn.Conv2d(self.base.ch, PROJ, 1), math.sqrt(2))\n        self.mix = nn.ModuleList([ortho(nn.Conv2d(3 * PROJ, HID, 1), math.sqrt(2)) for _ in keys])\n        self.out = nn.ModuleList([ortho(nn.Conv2d(HID, 1, 1), 0.01) for _ in keys])\n        self.af = nn.Parameter(torch.zeros(len(self.frames)))\n\n    def forward(self, obs, mask):\n        f, g = self.base.features(obs)\n        p = self.proj(f)\n        B = p.shape[0]\n        H = []\n        for key, mix, out in zip(self.keys, self.mix, self.out):\n            t, a, b, top, left = key\n            mx, mn, av = wpool(p, a, b, top, left)\n            H.append(out(F.relu(mix(torch.cat([mx, mn, av], 1)))))\n        wf = torch.softmax(SCALE * self.af, 0)\n        tb = self.base.tbias(g).view(B, self.T, 1, 1)\n        place = None\n        for i, k in enumerate(self.frames):\n            A = torch.cat([H[j] for j in self.sel[i]], 1) + tb\n            term = wf[i] * dihedral(A, k).reshape(B, -1)\n            place = term if place is None else place + term\n        logits = torch.cat([place, self.base.done(g)], 1)\n        return logits, self.base.value(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 61771,
+    "fb_ms": 94.57,
+    "flops_per_sample": 18336000,
+    "flops_ratio": 1.0,
+    "sha": "7963280db0c0436f",
+    "recipe": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 16,
+     "ppo_epochs": 3,
+     "ent_coef": 0.005,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "ppo_epochs": 3,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 16,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "ent_coef": 0.005,
+     "lr": 0.002
+    },
+    "budget": {
+     "allowed_steps": 169922,
+     "n_updates": 82,
+     "batch": 2048,
+     "steps": 167936,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0024
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0232,
+     "short_run_updates": 7
+    },
+    "rule": "bookmirror"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.9473,
+    "dev_per_seed": [
+     0.9473
+    ],
+    "train_exact": 0.9105,
+    "params": 61771,
+    "flops_ratio": 1.0,
+    "train_steps": 167936,
+    "wall_s": 127.8,
+    "sha": "7963280db0c0436f",
+    "readouts": null
+   }
+  }
+ ],
+ "rounds_done": 4,
+ "incumbent": "r4c3",
+ "analyses": {
+  "1": "There are no trials yet, and the starting architecture scored 0. Our past searches suggest that a world at 0 most likely has a mismatch between obs cells and action anchors, not too little capacity. So round 1 sweeps six layout hypotheses on one shared base. That base is the 1x1 stem, two 3x3 GroupNorm residual convs, a learned raw-obs skip, a global mean/max MLP and orthogonal init. Each hypothesis gets its own learnable head that starts near uniform. The heads are combined by a learned softmax with logits scaled \u00d75. The six hypotheses are dihedral frames, identity versus transposed square kernels, flattening orders, anchor corners, type permutation \u00d7 frames, and a factorised union of frames \u00d7 corners \u00d7 orders. All use the default recipe with r \u2248 1.1 to 1.3. Any candidate above 0 shows which layout this world uses, and later rounds will tune near it. If everything scores 0, round 2 will try products of hypotheses and new remaps.",
+  "2": "Round 1 found the layout. The three candidates with dihedral output frames all scored about 0.13 on dev (frames 0.127, type permutation \u00d7 frames 0.127, union 0.137), with training success of 0.07 to 0.10. The three without flips all scored 0: identity plus transpose, flattening order, and corners alone. So the hidden change is very likely a mirror or rotation of the action grid. That means optimisation is now the bottleneck, not layout. Training success is close to dev, so generalisation is not the problem.\n\nThe per-frame heads repeat work. Flipping the grid and pooling from the top-left corner gives the same result as pooling from some corner in the original grid and then flipping. Across frames, corners and orientations there are only 13 distinct (type, window shape, corner) heads, not 32. Sharing them gives exactly the same set of layout hypotheses at r of about 0.97 instead of 1.32, which means more samples. That opens up the 1- and 2-epoch recipes.\n\nRound 2 tries one change per candidate on the shared-head union and on the shared-head pure-frame net.",
+  "3": "The layout problem is solved. Every frame-based head scored and every other hypothesis scored 0. Pure frames scored 0.13 to 0.55, and the union, which includes frames, scored 0.14 to 0.63. Training success tracks dev success (0.53 against 0.63; 0.55 against 0.54), so the gap is optimisation, not generalisation. Cutting r to 1.0 helped: 0.18 to 0.63 at the same recipe family, against 0.13 to 0.14 at r 1.32. lr 1.5e-3 gave the best result (0.627). The 1-epoch long rollout helped pure frames (0.545 against 0.447) but not the union (0.35 against 0.18 default). Seed noise is \u00b130 points, so recipe rankings are weak. This round tests one recipe change at a time around the higher lr, on both heads: lr 3e-3, lr 1.5e-3 on pure frames, higher lr with 1 epoch and with 2 epochs, and 64 minibatches. Round 4 then stacks the winners. I prefer pure frames for the 4-seed retrain because it has one factor to commit to.",
+  "4": "The layout problem is solved. Every frame-mixture head scores above 0, while the corner-only, order-only and transposed-only candidates stayed at 0, so the hidden change in this world is a dihedral frame. Once the frame is matched, training success tracks dev success (0.95 against 0.97), so what remains is optimisation. The large gains came from the recipe. Pure frames went from 0.45 to 0.97 when lr rose to 2e-3 together with 1 or 2 PPO epochs. The union went from 0.18 to 0.89 the same way. Pure frames commits more cleanly than the union and is the better pick for the 4-seed retrain. In this last round, each candidate makes one recipe change to the best trial, r3c5 (pure frames, 2 epochs, lr 2e-3). The changes are a higher lr, more minibatches, 3 epochs and a longer discount horizon, plus two 1-epoch variants. The network stays at r = 1.0. Single-seed differences of a few points are noise."
+ }
+}

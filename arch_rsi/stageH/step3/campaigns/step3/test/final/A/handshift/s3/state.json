@@ -1,0 +1,839 @@
+{
+ "trials": [
+  {
+   "label": "r1c1",
+   "round": 1,
+   "name": "Dihedral pooled frames x5 mix",
+   "hypothesis": "There are 8 dihedral frames. Each frame gets per-type footprint max/min/mean pooling and a small MLP, and each frame's logits are flattened in its own frame. A softmax at scale 5, starting uniform, learns which frame matches the hidden action layout. This design won 6 of 7 earlier worlds. Refuted if both seeds score 0 on training and dev, which would mean the layout is still unmatched.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {\"ppo_epochs\": 2, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 32, \"gamma\": 0.97, \"gae_lambda\": 0.95, \"ent_coef\": 0.005, \"lr\": 0.0015}\n\nSTEM = 64\nCOL = 48\nWIDTH = 32\nSKIP = 16\nGLOB = 64\nPROJ = 16\nHID = 12\nSCALE = 5.0\nPER_TYPE = False\nR2 = 1.4142135623730951\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    if m.bias is not None:\n        nn.init.zeros_(m.bias)\n    return m\n\n\ndef apply_frame(t, g):\n    if g >= 4:\n        t = t.transpose(-1, -2)\n    k = g % 4\n    if k == 1:\n        t = t.flip(-1)\n    elif k == 2:\n        t = t.flip(-2)\n    elif k == 3:\n        t = t.flip(-2).flip(-1)\n    return t\n\n\nclass Trunk(nn.Module):\n    def __init__(self, spec, width, skip):\n        super().__init__()\n        c = spec.in_channels\n        self.stem1 = ortho(nn.Conv2d(c, STEM, 1), R2)\n        self.stem2 = ortho(nn.Conv2d(STEM, COL, 1), R2)\n        self.c1 = ortho(nn.Conv2d(COL, width, 3, padding=1), R2)\n        self.n1 = nn.GroupNorm(4, width)\n        self.c2 = ortho(nn.Conv2d(width, width, 3, padding=1), R2)\n        self.n2 = nn.GroupNorm(4, width)\n        self.skip = ortho(nn.Conv2d(c, skip, 1), 1.0)\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * width, GLOB), R2), nn.ReLU())\n        self.out_ch = width + skip\n\n    def forward(self, obs):\n        s = F.relu(self.stem1(obs))\n        s = F.relu(self.stem2(s))\n        x = F.relu(self.n1(self.c1(s)))\n        f = F.relu(x + self.n2(self.c2(x)))\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], dim=1))\n        h = torch.cat([f, self.skip(obs)], dim=1)\n        return h, g\n\n\nclass FramePoolHead(nn.Module):\n    def __init__(self, cin, spec):\n        super().__init__()\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        self.T = len(self.fps)\n        self.nf = 8 if self.Y == self.X else 4\n        self.proj = ortho(nn.Conv2d(cin, PROJ, 1), R2)\n        G = self.nf * self.T\n        w1 = torch.empty(G, HID, 3 * PROJ)\n        w2 = torch.empty(G, 1, HID)\n        for i in range(G):\n            nn.init.orthogonal_(w1[i], R2)\n            nn.init.orthogonal_(w2[i], 0.01)\n        self.w1 = nn.Parameter(w1)\n        self.b1 = nn.Parameter(torch.zeros(G, HID, 1))\n        self.w2 = nn.Parameter(w2)\n        self.b2 = nn.Parameter(torch.zeros(G, 1, 1))\n        if PER_TYPE:\n            self.alpha = nn.Parameter(torch.zeros(self.T, self.nf))\n        else:\n            self.alpha = nn.Parameter(torch.zeros(self.nf))\n\n    def forward(self, h):\n        B = h.shape[0]\n        nf, T, Y, X = self.nf, self.T, self.Y, self.X\n        YX = Y * X\n        p = self.proj(h)\n        frames = torch.stack([apply_frame(p, g) for g in range(nf)], 0)\n        q = frames.reshape(nf * B, PROJ, frames.shape[-2], frames.shape[-1])\n        feats = []\n        for dy, dx in self.fps:\n            if dy * dx == 1:\n                feats.append(torch.cat([q, q, q], dim=1))\n            else:\n                qq = F.pad(q, (0, dx - 1, 0, dy - 1))\n                mx = F.max_pool2d(qq, (dy, dx), stride=1)\n                mn = -F.max_pool2d(-qq, (dy, dx), stride=1)\n                av = F.avg_pool2d(qq, (dy, dx), stride=1)\n                feats.append(torch.cat([mx, mn, av], dim=1))\n        z = torch.stack(feats, 1)\n        z = z.reshape(nf, B, T, 3 * PROJ, YX).permute(0, 2, 3, 1, 4).reshape(nf * T, 3 * PROJ, B * YX)\n        hd = F.relu(torch.bmm(self.w1, z) + self.b1)\n        out = torch.bmm(self.w2, hd) + self.b2\n        out = out.reshape(nf, T, B, YX).permute(2, 0, 1, 3)\n        if PER_TYPE:\n            w = torch.softmax(SCALE * self.alpha, dim=1).t()\n            res = (out * w.reshape(1, nf, T, 1)).sum(1)\n        else:\n            w = torch.softmax(SCALE * self.alpha, dim=0)\n            res = (out * w.reshape(1, nf, 1, 1)).sum(1)\n        return res\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.trunk = Trunk(spec, WIDTH, SKIP)\n        self.head = FramePoolHead(self.trunk.out_ch, spec)\n        self.T = len(spec.footprints)\n        self.type_bias = ortho(nn.Linear(GLOB, self.T), 0.01)\n        self.done_head = ortho(nn.Linear(GLOB, 1), 0.01)\n        self.value_head = ortho(nn.Linear(GLOB, 1), 1.0)\n\n    def forward(self, obs, mask):\n        h, g = self.trunk(obs)\n        place = self.head(h)\n        place = place + self.type_bias(g).unsqueeze(2)\n        logits = torch.cat([place.flatten(1), self.done_head(g)], dim=1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 53166,
+    "fb_ms": 109.23,
+    "flops_per_sample": 18127104,
+    "flops_ratio": 0.99,
+    "sha": "01b547ff3f571266",
+    "recipe": {
+     "lr": 0.0015,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "ppo_epochs": 2,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "ent_coef": 0.005,
+     "lr": 0.0015
+    },
+    "budget": {
+     "allowed_steps": 243419,
+     "n_updates": 118,
+     "batch": 2048,
+     "steps": 241664,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0171
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 8
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0,
+     0.0
+    ],
+    "train_exact": 0.0004,
+    "params": 53166,
+    "flops_ratio": 0.99,
+    "train_steps": 241664,
+    "wall_s": 166.4,
+    "sha": "01b547ff3f571266",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r1c2",
+   "round": 1,
+   "name": "Frames x centred window x orders",
+   "hypothesis": "One shared centred (2K-1) window conv gives per-frame type maps. Each map is re-indexed into its frame and flattened both type-major and anchor-major, and a softmax at scale 5 picks among them. A dense term from the global vector is added. This covers mismatches in frame, anchor offset and flattening order. Refuted if both seeds score 0 on training and dev.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {\"ppo_epochs\": 2, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 32, \"gamma\": 0.97, \"gae_lambda\": 0.95, \"ent_coef\": 0.005, \"lr\": 0.0015}\n\nSTEM = 64\nCOL = 48\nWIDTH = 40\nSKIP = 16\nGLOB = 64\nHID = 32\nSCALE = 5.0\nR2 = 1.4142135623730951\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    if m.bias is not None:\n        nn.init.zeros_(m.bias)\n    return m\n\n\ndef apply_frame(t, g):\n    if g >= 4:\n        t = t.transpose(-1, -2)\n    k = g % 4\n    if k == 1:\n        t = t.flip(-1)\n    elif k == 2:\n        t = t.flip(-2)\n    elif k == 3:\n        t = t.flip(-2).flip(-1)\n    return t\n\n\nclass Trunk(nn.Module):\n    def __init__(self, spec, width, skip):\n        super().__init__()\n        c = spec.in_channels\n        self.stem1 = ortho(nn.Conv2d(c, STEM, 1), R2)\n        self.stem2 = ortho(nn.Conv2d(STEM, COL, 1), R2)\n        self.c1 = ortho(nn.Conv2d(COL, width, 3, padding=1), R2)\n        self.n1 = nn.GroupNorm(4, width)\n        self.c2 = ortho(nn.Conv2d(width, width, 3, padding=1), R2)\n        self.n2 = nn.GroupNorm(4, width)\n        self.skip = ortho(nn.Conv2d(c, skip, 1), 1.0)\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * width, GLOB), R2), nn.ReLU())\n        self.out_ch = width + skip\n\n    def forward(self, obs):\n        s = F.relu(self.stem1(obs))\n        s = F.relu(self.stem2(s))\n        x = F.relu(self.n1(self.c1(s)))\n        f = F.relu(x + self.n2(self.c2(x)))\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], dim=1))\n        h = torch.cat([f, self.skip(obs)], dim=1)\n        return h, g\n\n\nclass WindowHead(nn.Module):\n    def __init__(self, cin, spec):\n        super().__init__()\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        fps = [(int(a), int(b)) for a, b in spec.footprints]\n        self.T = len(fps)\n        K = max(max(a, b) for a, b in fps)\n        self.nf = 8 if self.Y == self.X else 4\n        self.hid = ortho(nn.Conv2d(cin, HID, 1), R2)\n        self.win = ortho(nn.Conv2d(HID, self.nf * self.T, 2 * K - 1, padding=K - 1), 0.01)\n        self.alpha = nn.Parameter(torch.zeros(2 * self.nf))\n        self.dense = ortho(nn.Linear(GLOB, self.T * self.Y * self.X), 0.01)\n\n    def forward(self, h, g):\n        B = h.shape[0]\n        m = self.win(F.relu(self.hid(h)))\n        m = m.reshape(B, self.nf, self.T, self.Y, self.X)\n        outs = []\n        for gi in range(self.nf):\n            mg = apply_frame(m[:, gi], gi)\n            outs.append(mg.reshape(B, -1))\n            outs.append(mg.permute(0, 2, 3, 1).reshape(B, -1))\n        L = torch.stack(outs, 1)\n        w = torch.softmax(SCALE * self.alpha, dim=0)\n        place = (L * w.reshape(1, -1, 1)).sum(1)\n        return place + self.dense(g)\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.trunk = Trunk(spec, WIDTH, SKIP)\n        self.head = WindowHead(self.trunk.out_ch, spec)\n        self.done_head = ortho(nn.Linear(GLOB, 1), 0.01)\n        self.value_head = ortho(nn.Linear(GLOB, 1), 1.0)\n\n    def forward(self, obs, mask):\n        h, g = self.trunk(obs)\n        place = self.head(h, g)\n        logits = torch.cat([place, self.done_head(g)], dim=1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 70322,
+    "fb_ms": 37.4,
+    "flops_per_sample": 18254592,
+    "flops_ratio": 1.0,
+    "sha": "2f0a5da093d9046f",
+    "recipe": {
+     "lr": 0.0015,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "ppo_epochs": 2,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "ent_coef": 0.005,
+     "lr": 0.0015
+    },
+    "budget": {
+     "allowed_steps": 243419,
+     "n_updates": 118,
+     "batch": 2048,
+     "steps": 241664,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0055
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 8
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0,
+     0.0
+    ],
+    "train_exact": 0.0002,
+    "params": 70322,
+    "flops_ratio": 1.0,
+    "train_steps": 241664,
+    "wall_s": 68.5,
+    "sha": "2f0a5da093d9046f",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r1c3",
+   "round": 1,
+   "name": "Identity+transpose square heads",
+   "hypothesis": "There are two square-kernel heads, one on the identity grid and one on the transposed grid. Each has per-type outputs, a zero-initialised type-mixing residual and a dense term, and a softmax at scale 5 mixes the two heads. This design won the transpose world. Refuted if both seeds score 0 here while the dihedral heads score above 0, which would mean the mismatch is not a pure transpose.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {\"ppo_epochs\": 2, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 32, \"gamma\": 0.97, \"gae_lambda\": 0.95, \"ent_coef\": 0.005, \"lr\": 0.0015}\n\nSTEM = 64\nCOL = 48\nWIDTH = 36\nSKIP = 16\nGLOB = 64\nHID = 32\nSCALE = 5.0\nR2 = 1.4142135623730951\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    if m.bias is not None:\n        nn.init.zeros_(m.bias)\n    return m\n\n\nclass Trunk(nn.Module):\n    def __init__(self, spec, width, skip):\n        super().__init__()\n        c = spec.in_channels\n        self.stem1 = ortho(nn.Conv2d(c, STEM, 1), R2)\n        self.stem2 = ortho(nn.Conv2d(STEM, COL, 1), R2)\n        self.c1 = ortho(nn.Conv2d(COL, width, 3, padding=1), R2)\n        self.n1 = nn.GroupNorm(4, width)\n        self.c2 = ortho(nn.Conv2d(width, width, 3, padding=1), R2)\n        self.n2 = nn.GroupNorm(4, width)\n        self.skip = ortho(nn.Conv2d(c, skip, 1), 1.0)\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * width, GLOB), R2), nn.ReLU())\n        self.out_ch = width + skip\n\n    def forward(self, obs):\n        s = F.relu(self.stem1(obs))\n        s = F.relu(self.stem2(s))\n        x = F.relu(self.n1(self.c1(s)))\n        f = F.relu(x + self.n2(self.c2(x)))\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], dim=1))\n        h = torch.cat([f, self.skip(obs)], dim=1)\n        return h, g\n\n\nclass SquareHeads(nn.Module):\n    def __init__(self, cin, spec):\n        super().__init__()\n        fps = [(int(a), int(b)) for a, b in spec.footprints]\n        self.T = len(fps)\n        self.K = max(max(a, b) for a, b in fps)\n        self.sq = nn.ModuleList([ortho(nn.Conv2d(cin, HID, self.K), R2) for _ in range(2)])\n        self.outs = nn.ModuleList([ortho(nn.Conv2d(HID, self.T, 1), 0.01) for _ in range(2)])\n        self.tmix = nn.Parameter(torch.zeros(self.T, self.T))\n        self.alpha = nn.Parameter(torch.zeros(2))\n        self.dense = ortho(nn.Linear(GLOB, self.T * int(spec.Y) * int(spec.X)), 0.01)\n\n    def forward(self, h, g):\n        B = h.shape[0]\n        K = self.K\n        L = []\n        for i in range(2):\n            hf = h if i == 0 else h.transpose(-1, -2)\n            hf = F.pad(hf, (0, K - 1, 0, K - 1))\n            m = self.outs[i](F.relu(self.sq[i](hf)))\n            m = m + torch.einsum('st,btyx->bsyx', self.tmix, m)\n            L.append(m.reshape(B, -1))\n        L = torch.stack(L, 1)\n        w = torch.softmax(SCALE * self.alpha, dim=0)\n        place = (L * w.reshape(1, 2, 1)).sum(1)\n        return place + self.dense(g)\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.trunk = Trunk(spec, WIDTH, SKIP)\n        self.head = SquareHeads(self.trunk.out_ch, spec)\n        self.done_head = ortho(nn.Linear(GLOB, 1), 0.01)\n        self.value_head = ortho(nn.Linear(GLOB, 1), 1.0)\n\n    def forward(self, obs, mask):\n        h, g = self.trunk(obs)\n        place = self.head(h, g)\n        logits = torch.cat([place, self.done_head(g)], dim=1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 67892,
+    "fb_ms": 42.5,
+    "flops_per_sample": 17532672,
+    "flops_ratio": 0.96,
+    "sha": "3c571fc9a4d65d7c",
+    "recipe": {
+     "lr": 0.0015,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "ppo_epochs": 2,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "ent_coef": 0.005,
+     "lr": 0.0015
+    },
+    "budget": {
+     "allowed_steps": 243419,
+     "n_updates": 118,
+     "batch": 2048,
+     "steps": 241664,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0129
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 8
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0,
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 67892,
+    "flops_ratio": 0.96,
+    "train_steps": 241664,
+    "wall_s": 113.2,
+    "sha": "3c571fc9a4d65d7c",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r1c4",
+   "round": 1,
+   "name": "Per-type frame mixture scale 2",
+   "hypothesis": "This is the dihedral pooled-frame head, but each brick type gets its own frame softmax at scale 2. That lets types use different frames and keeps the mixture from committing too early, which avoided collapses in one earlier world. Refuted if this scores lower than candidate 1, or if either seed collapses to about 0.078.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {\"ppo_epochs\": 2, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 32, \"gamma\": 0.97, \"gae_lambda\": 0.95, \"ent_coef\": 0.005, \"lr\": 0.0015}\n\nSTEM = 64\nCOL = 48\nWIDTH = 32\nSKIP = 16\nGLOB = 64\nPROJ = 16\nHID = 12\nSCALE = 2.0\nPER_TYPE = True\nR2 = 1.4142135623730951\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    if m.bias is not None:\n        nn.init.zeros_(m.bias)\n    return m\n\n\ndef apply_frame(t, g):\n    if g >= 4:\n        t = t.transpose(-1, -2)\n    k = g % 4\n    if k == 1:\n        t = t.flip(-1)\n    elif k == 2:\n        t = t.flip(-2)\n    elif k == 3:\n        t = t.flip(-2).flip(-1)\n    return t\n\n\nclass Trunk(nn.Module):\n    def __init__(self, spec, width, skip):\n        super().__init__()\n        c = spec.in_channels\n        self.stem1 = ortho(nn.Conv2d(c, STEM, 1), R2)\n        self.stem2 = ortho(nn.Conv2d(STEM, COL, 1), R2)\n        self.c1 = ortho(nn.Conv2d(COL, width, 3, padding=1), R2)\n        self.n1 = nn.GroupNorm(4, width)\n        self.c2 = ortho(nn.Conv2d(width, width, 3, padding=1), R2)\n        self.n2 = nn.GroupNorm(4, width)\n        self.skip = ortho(nn.Conv2d(c, skip, 1), 1.0)\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * width, GLOB), R2), nn.ReLU())\n        self.out_ch = width + skip\n\n    def forward(self, obs):\n        s = F.relu(self.stem1(obs))\n        s = F.relu(self.stem2(s))\n        x = F.relu(self.n1(self.c1(s)))\n        f = F.relu(x + self.n2(self.c2(x)))\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], dim=1))\n        h = torch.cat([f, self.skip(obs)], dim=1)\n        return h, g\n\n\nclass FramePoolHead(nn.Module):\n    def __init__(self, cin, spec):\n        super().__init__()\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        self.T = len(self.fps)\n        self.nf = 8 if self.Y == self.X else 4\n        self.proj = ortho(nn.Conv2d(cin, PROJ, 1), R2)\n        G = self.nf * self.T\n        w1 = torch.empty(G, HID, 3 * PROJ)\n        w2 = torch.empty(G, 1, HID)\n        for i in range(G):\n            nn.init.orthogonal_(w1[i], R2)\n            nn.init.orthogonal_(w2[i], 0.01)\n        self.w1 = nn.Parameter(w1)\n        self.b1 = nn.Parameter(torch.zeros(G, HID, 1))\n        self.w2 = nn.Parameter(w2)\n        self.b2 = nn.Parameter(torch.zeros(G, 1, 1))\n        if PER_TYPE:\n            self.alpha = nn.Parameter(torch.zeros(self.T, self.nf))\n        else:\n            self.alpha = nn.Parameter(torch.zeros(self.nf))\n\n    def forward(self, h):\n        B = h.shape[0]\n        nf, T, Y, X = self.nf, self.T, self.Y, self.X\n        YX = Y * X\n        p = self.proj(h)\n        frames = torch.stack([apply_frame(p, g) for g in range(nf)], 0)\n        q = frames.reshape(nf * B, PROJ, frames.shape[-2], frames.shape[-1])\n        feats = []\n        for dy, dx in self.fps:\n            if dy * dx == 1:\n                feats.append(torch.cat([q, q, q], dim=1))\n            else:\n                qq = F.pad(q, (0, dx - 1, 0, dy - 1))\n                mx = F.max_pool2d(qq, (dy, dx), stride=1)\n                mn = -F.max_pool2d(-qq, (dy, dx), stride=1)\n                av = F.avg_pool2d(qq, (dy, dx), stride=1)\n                feats.append(torch.cat([mx, mn, av], dim=1))\n        z = torch.stack(feats, 1)\n        z = z.reshape(nf, B, T, 3 * PROJ, YX).permute(0, 2, 3, 1, 4).reshape(nf * T, 3 * PROJ, B * YX)\n        hd = F.relu(torch.bmm(self.w1, z) + self.b1)\n        out = torch.bmm(self.w2, hd) + self.b2\n        out = out.reshape(nf, T, B, YX).permute(2, 0, 1, 3)\n        if PER_TYPE:\n            w = torch.softmax(SCALE * self.alpha, dim=1).t()\n            res = (out * w.reshape(1, nf, T, 1)).sum(1)\n        else:\n            w = torch.softmax(SCALE * self.alpha, dim=0)\n            res = (out * w.reshape(1, nf, 1, 1)).sum(1)\n        return res\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.trunk = Trunk(spec, WIDTH, SKIP)\n        self.head = FramePoolHead(self.trunk.out_ch, spec)\n        self.T = len(spec.footprints)\n        self.type_bias = ortho(nn.Linear(GLOB, self.T), 0.01)\n        self.done_head = ortho(nn.Linear(GLOB, 1), 0.01)\n        self.value_head = ortho(nn.Linear(GLOB, 1), 1.0)\n\n    def forward(self, obs, mask):\n        h, g = self.trunk(obs)\n        place = self.head(h)\n        place = place + self.type_bias(g).unsqueeze(2)\n        logits = torch.cat([place.flatten(1), self.done_head(g)], dim=1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 53190,
+    "fb_ms": 107.74,
+    "flops_per_sample": 18127104,
+    "flops_ratio": 0.99,
+    "sha": "478c934e28a37eb5",
+    "recipe": {
+     "lr": 0.0015,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "ppo_epochs": 2,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "ent_coef": 0.005,
+     "lr": 0.0015
+    },
+    "budget": {
+     "allowed_steps": 243419,
+     "n_updates": 118,
+     "batch": 2048,
+     "steps": 241664,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0171
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 8
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0,
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 53190,
+    "flops_ratio": 0.99,
+    "train_steps": 241664,
+    "wall_s": 166.8,
+    "sha": "478c934e28a37eb5",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r2c1",
+   "round": 2,
+   "name": "Frames x 3 type orders x DONE pos",
+   "hypothesis": "Shared centred (2K-1) window conv gives per-frame type maps. Each map is flattened with the type index first, middle or last (24 layouts, scale-5 softmax). A second softmax over 2 options puts DONE last or first, and a dense g->all-actions term is added. This covers the type-middle order and the DONE-first shift that round 1 missed, both combined with frames. Refuted if both seeds again score 0 on training and dev.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {\"ppo_epochs\": 2, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 32, \"gamma\": 0.97, \"gae_lambda\": 0.95, \"ent_coef\": 0.005, \"lr\": 0.0015}\n\nSTEM = 64\nCOL = 48\nWIDTH = 40\nSKIP = 16\nGLOB = 64\nHID = 32\nSCALE = 5.0\nR2 = 1.4142135623730951\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    if m.bias is not None:\n        nn.init.zeros_(m.bias)\n    return m\n\n\ndef apply_frame(t, g):\n    if g >= 4:\n        t = t.transpose(-1, -2)\n    k = g % 4\n    if k == 1:\n        t = t.flip(-1)\n    elif k == 2:\n        t = t.flip(-2)\n    elif k == 3:\n        t = t.flip(-2).flip(-1)\n    return t\n\n\nclass Trunk(nn.Module):\n    def __init__(self, spec, width, skip):\n        super().__init__()\n        c = spec.in_channels\n        self.stem1 = ortho(nn.Conv2d(c, STEM, 1), R2)\n        self.stem2 = ortho(nn.Conv2d(STEM, COL, 1), R2)\n        self.c1 = ortho(nn.Conv2d(COL, width, 3, padding=1), R2)\n        self.n1 = nn.GroupNorm(4, width)\n        self.c2 = ortho(nn.Conv2d(width, width, 3, padding=1), R2)\n        self.n2 = nn.GroupNorm(4, width)\n        self.skip = ortho(nn.Conv2d(c, skip, 1), 1.0)\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * width, GLOB), R2), nn.ReLU())\n        self.out_ch = width + skip\n\n    def forward(self, obs):\n        s = F.relu(self.stem1(obs))\n        s = F.relu(self.stem2(s))\n        x = F.relu(self.n1(self.c1(s)))\n        f = F.relu(x + self.n2(self.c2(x)))\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], dim=1))\n        h = torch.cat([f, self.skip(obs)], dim=1)\n        return h, g\n\n\nclass LayoutHead(nn.Module):\n    def __init__(self, cin, spec):\n        super().__init__()\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        fps = [(int(a), int(b)) for a, b in spec.footprints]\n        self.T = len(fps)\n        K = max(max(a, b) for a, b in fps)\n        self.nf = 8 if self.Y == self.X else 4\n        self.hid = ortho(nn.Conv2d(cin, HID, 1), R2)\n        self.win = ortho(nn.Conv2d(HID, self.nf * self.T, 2 * K - 1, padding=K - 1), 0.01)\n        self.alpha = nn.Parameter(torch.zeros(3 * self.nf))\n\n    def forward(self, h):\n        B = h.shape[0]\n        m = self.win(F.relu(self.hid(h)))\n        m = m.reshape(B, self.nf, self.T, self.Y, self.X)\n        outs = []\n        for gi in range(self.nf):\n            mg = apply_frame(m[:, gi], gi)\n            outs.append(mg.reshape(B, -1))\n            outs.append(mg.permute(0, 2, 1, 3).reshape(B, -1))\n            outs.append(mg.permute(0, 2, 3, 1).reshape(B, -1))\n        L = torch.stack(outs, 1)\n        w = torch.softmax(SCALE * self.alpha, dim=0)\n        return (L * w.reshape(1, -1, 1)).sum(1)\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.trunk = Trunk(spec, WIDTH, SKIP)\n        self.head = LayoutHead(self.trunk.out_ch, spec)\n        self.done_head = ortho(nn.Linear(GLOB, 1), 0.01)\n        self.dense = ortho(nn.Linear(GLOB, int(spec.n_actions)), 0.01)\n        self.beta = nn.Parameter(torch.zeros(2))\n        self.value_head = ortho(nn.Linear(GLOB, 1), 1.0)\n\n    def forward(self, obs, mask):\n        h, g = self.trunk(obs)\n        place = self.head(h)\n        done = self.done_head(g)\n        wd = torch.softmax(SCALE * self.beta, dim=0)\n        logits = wd[0] * torch.cat([place, done], dim=1) + wd[1] * torch.cat([done, place], dim=1)\n        logits = logits + self.dense(g)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 70397,
+    "fb_ms": 38.67,
+    "flops_per_sample": 18254976,
+    "flops_ratio": 1.0,
+    "sha": "3a244e10697ab3d3",
+    "recipe": {
+     "lr": 0.0015,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "ppo_epochs": 2,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "ent_coef": 0.005,
+     "lr": 0.0015
+    },
+    "budget": {
+     "allowed_steps": 243419,
+     "n_updates": 118,
+     "batch": 2048,
+     "steps": 241664,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0088
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 8
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0,
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 70397,
+    "flops_ratio": 1.0,
+    "train_steps": 241664,
+    "wall_s": 85.3,
+    "sha": "3a244e10697ab3d3",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r2c2",
+   "round": 2,
+   "name": "Dense learned action remap",
+   "hypothesis": "Every structured layout head has failed, so the action layout may be an arbitrary fixed permutation. Per-cell ReLU features (16 channels) are flattened, joined with the global vector, and mapped to every action, DONE included, by one learned linear layer (gain 0.01). That can fit any index permutation or DONE position. Refuted if both seeds score 0 on training. Training success above 0 would show the mismatch is non-structured.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {\"ppo_epochs\": 2, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 32, \"gamma\": 0.97, \"gae_lambda\": 0.95, \"ent_coef\": 0.005, \"lr\": 0.0015}\n\nSTEM = 64\nCOL = 48\nWIDTH = 40\nSKIP = 16\nGLOB = 64\nKF = 16\nR2 = 1.4142135623730951\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    if m.bias is not None:\n        nn.init.zeros_(m.bias)\n    return m\n\n\nclass Trunk(nn.Module):\n    def __init__(self, spec, width, skip):\n        super().__init__()\n        c = spec.in_channels\n        self.stem1 = ortho(nn.Conv2d(c, STEM, 1), R2)\n        self.stem2 = ortho(nn.Conv2d(STEM, COL, 1), R2)\n        self.c1 = ortho(nn.Conv2d(COL, width, 3, padding=1), R2)\n        self.n1 = nn.GroupNorm(4, width)\n        self.c2 = ortho(nn.Conv2d(width, width, 3, padding=1), R2)\n        self.n2 = nn.GroupNorm(4, width)\n        self.skip = ortho(nn.Conv2d(c, skip, 1), 1.0)\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * width, GLOB), R2), nn.ReLU())\n        self.out_ch = width + skip\n\n    def forward(self, obs):\n        s = F.relu(self.stem1(obs))\n        s = F.relu(self.stem2(s))\n        x = F.relu(self.n1(self.c1(s)))\n        f = F.relu(x + self.n2(self.c2(x)))\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], dim=1))\n        h = torch.cat([f, self.skip(obs)], dim=1)\n        return h, g\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.trunk = Trunk(spec, WIDTH, SKIP)\n        YX = int(spec.Y) * int(spec.X)\n        self.proj = ortho(nn.Conv2d(self.trunk.out_ch, KF, 1), R2)\n        self.out = ortho(nn.Linear(KF * YX + GLOB, int(spec.n_actions)), 0.01)\n        self.value_head = ortho(nn.Linear(GLOB, 1), 1.0)\n\n    def forward(self, obs, mask):\n        h, g = self.trunk(obs)\n        u = F.relu(self.proj(h)).flatten(1)\n        logits = self.out(torch.cat([u, g], dim=1))\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 323314,
+    "fb_ms": 28.57,
+    "flops_per_sample": 15950592,
+    "flops_ratio": 0.87,
+    "sha": "12aa161ff75877fa",
+    "recipe": {
+     "lr": 0.0015,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "ppo_epochs": 2,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "ent_coef": 0.005,
+     "lr": 0.0015
+    },
+    "budget": {
+     "allowed_steps": 243419,
+     "n_updates": 118,
+     "batch": 2048,
+     "steps": 241664,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0188
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0182,
+     "short_run_updates": 8
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0,
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 323314,
+    "flops_ratio": 0.87,
+    "train_steps": 241664,
+    "wall_s": 67.2,
+    "sha": "12aa161ff75877fa",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r2c3",
+   "round": 2,
+   "name": "Layout mixture + dense remap",
+   "hypothesis": "This is candidate 1's 24-layout x DONE-position mixture plus a gain-0.01 dense remap from 8-channel per-cell features to all actions. The trunk is slimmed to width 36 to keep r near 1. If the layout is one of the structured products, the mixture learns quickly; if not, the dense term is a general fallback. Refuted if both seeds score 0 on training. Scoring below whichever of candidates 1 and 2 wins would mean the two terms interfere.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {\"ppo_epochs\": 2, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 32, \"gamma\": 0.97, \"gae_lambda\": 0.95, \"ent_coef\": 0.005, \"lr\": 0.0015}\n\nSTEM = 64\nCOL = 48\nWIDTH = 36\nSKIP = 16\nGLOB = 64\nHID = 32\nKF = 8\nSCALE = 5.0\nR2 = 1.4142135623730951\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    if m.bias is not None:\n        nn.init.zeros_(m.bias)\n    return m\n\n\ndef apply_frame(t, g):\n    if g >= 4:\n        t = t.transpose(-1, -2)\n    k = g % 4\n    if k == 1:\n        t = t.flip(-1)\n    elif k == 2:\n        t = t.flip(-2)\n    elif k == 3:\n        t = t.flip(-2).flip(-1)\n    return t\n\n\nclass Trunk(nn.Module):\n    def __init__(self, spec, width, skip):\n        super().__init__()\n        c = spec.in_channels\n        self.stem1 = ortho(nn.Conv2d(c, STEM, 1), R2)\n        self.stem2 = ortho(nn.Conv2d(STEM, COL, 1), R2)\n        self.c1 = ortho(nn.Conv2d(COL, width, 3, padding=1), R2)\n        self.n1 = nn.GroupNorm(4, width)\n        self.c2 = ortho(nn.Conv2d(width, width, 3, padding=1), R2)\n        self.n2 = nn.GroupNorm(4, width)\n        self.skip = ortho(nn.Conv2d(c, skip, 1), 1.0)\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * width, GLOB), R2), nn.ReLU())\n        self.out_ch = width + skip\n\n    def forward(self, obs):\n        s = F.relu(self.stem1(obs))\n        s = F.relu(self.stem2(s))\n        x = F.relu(self.n1(self.c1(s)))\n        f = F.relu(x + self.n2(self.c2(x)))\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], dim=1))\n        h = torch.cat([f, self.skip(obs)], dim=1)\n        return h, g\n\n\nclass LayoutHead(nn.Module):\n    def __init__(self, cin, spec):\n        super().__init__()\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        fps = [(int(a), int(b)) for a, b in spec.footprints]\n        self.T = len(fps)\n        K = max(max(a, b) for a, b in fps)\n        self.nf = 8 if self.Y == self.X else 4\n        self.hid = ortho(nn.Conv2d(cin, HID, 1), R2)\n        self.win = ortho(nn.Conv2d(HID, self.nf * self.T, 2 * K - 1, padding=K - 1), 0.01)\n        self.alpha = nn.Parameter(torch.zeros(3 * self.nf))\n\n    def forward(self, h):\n        B = h.shape[0]\n        m = self.win(F.relu(self.hid(h)))\n        m = m.reshape(B, self.nf, self.T, self.Y, self.X)\n        outs = []\n        for gi in range(self.nf):\n            mg = apply_frame(m[:, gi], gi)\n            outs.append(mg.reshape(B, -1))\n            outs.append(mg.permute(0, 2, 1, 3).reshape(B, -1))\n            outs.append(mg.permute(0, 2, 3, 1).reshape(B, -1))\n        L = torch.stack(outs, 1)\n        w = torch.softmax(SCALE * self.alpha, dim=0)\n        return (L * w.reshape(1, -1, 1)).sum(1)\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.trunk = Trunk(spec, WIDTH, SKIP)\n        YX = int(spec.Y) * int(spec.X)\n        A = int(spec.n_actions)\n        self.head = LayoutHead(self.trunk.out_ch, spec)\n        self.done_head = ortho(nn.Linear(GLOB, 1), 0.01)\n        self.beta = nn.Parameter(torch.zeros(2))\n        self.fproj = ortho(nn.Conv2d(self.trunk.out_ch, KF, 1), R2)\n        self.remap = ortho(nn.Linear(KF * YX + GLOB, A), 0.01)\n        self.value_head = ortho(nn.Linear(GLOB, 1), 1.0)\n\n    def forward(self, obs, mask):\n        h, g = self.trunk(obs)\n        place = self.head(h)\n        done = self.done_head(g)\n        wd = torch.softmax(SCALE * self.beta, dim=0)\n        logits = wd[0] * torch.cat([place, done], dim=1) + wd[1] * torch.cat([done, place], dim=1)\n        u = F.relu(self.fproj(h)).flatten(1)\n        logits = logits + self.remap(torch.cat([u, g], dim=1))\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 197277,
+    "fb_ms": 37.24,
+    "flops_per_sample": 17437824,
+    "flops_ratio": 0.95,
+    "sha": "7a070d445a35749e",
+    "recipe": {
+     "lr": 0.0015,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "ppo_epochs": 2,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "ent_coef": 0.005,
+     "lr": 0.0015
+    },
+    "budget": {
+     "allowed_steps": 243419,
+     "n_updates": 118,
+     "batch": 2048,
+     "steps": 241664,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0113
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0177,
+     "short_run_updates": 8
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0,
+     0.0
+    ],
+    "train_exact": 0.0002,
+    "params": 197277,
+    "flops_ratio": 0.95,
+    "train_steps": 241664,
+    "wall_s": 87.7,
+    "sha": "7a070d445a35749e",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r2c4",
+   "round": 2,
+   "name": "Learned soft-address pointer head",
+   "hypothesis": "Each action index learns a soft cell address (a softmax over cells, starting uniform, scale 3) and a 16-dimensional embedding. Its logit is the embedding dotted with the address-weighted per-cell features, plus a dense global term. It can fit any permutation with far fewer parameters per action than a dense map (K+YX against K*YX), so it should learn from fewer samples. Refuted if both seeds score 0 on training while candidate 2 scores above 0.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {\"ppo_epochs\": 2, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 32, \"gamma\": 0.97, \"gae_lambda\": 0.95, \"ent_coef\": 0.005, \"lr\": 0.0015}\n\nSTEM = 64\nCOL = 48\nWIDTH = 40\nSKIP = 16\nGLOB = 64\nKF = 16\nADDR_SCALE = 3.0\nR2 = 1.4142135623730951\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    if m.bias is not None:\n        nn.init.zeros_(m.bias)\n    return m\n\n\nclass Trunk(nn.Module):\n    def __init__(self, spec, width, skip):\n        super().__init__()\n        c = spec.in_channels\n        self.stem1 = ortho(nn.Conv2d(c, STEM, 1), R2)\n        self.stem2 = ortho(nn.Conv2d(STEM, COL, 1), R2)\n        self.c1 = ortho(nn.Conv2d(COL, width, 3, padding=1), R2)\n        self.n1 = nn.GroupNorm(4, width)\n        self.c2 = ortho(nn.Conv2d(width, width, 3, padding=1), R2)\n        self.n2 = nn.GroupNorm(4, width)\n        self.skip = ortho(nn.Conv2d(c, skip, 1), 1.0)\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * width, GLOB), R2), nn.ReLU())\n        self.out_ch = width + skip\n\n    def forward(self, obs):\n        s = F.relu(self.stem1(obs))\n        s = F.relu(self.stem2(s))\n        x = F.relu(self.n1(self.c1(s)))\n        f = F.relu(x + self.n2(self.c2(x)))\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], dim=1))\n        h = torch.cat([f, self.skip(obs)], dim=1)\n        return h, g\n\n\nclass PointerHead(nn.Module):\n    def __init__(self, cin, spec):\n        super().__init__()\n        YX = int(spec.Y) * int(spec.X)\n        A = int(spec.n_actions)\n        self.proj = ortho(nn.Conv2d(cin, KF, 1), R2)\n        self.addr = nn.Parameter(torch.zeros(A, YX))\n        emb = torch.empty(A, KF)\n        nn.init.normal_(emb, 0.0, 0.05)\n        self.emb = nn.Parameter(emb)\n        self.bias = nn.Parameter(torch.zeros(A))\n        self.dense = ortho(nn.Linear(GLOB, A), 0.01)\n\n    def forward(self, h, g):\n        u = F.relu(self.proj(h)).flatten(2)\n        w = torch.softmax(ADDR_SCALE * self.addr, dim=-1)\n        v = torch.einsum('ap,bkp->bak', w, u)\n        logits = (v * self.emb.unsqueeze(0)).sum(-1)\n        return logits + self.bias + self.dense(g)\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.trunk = Trunk(spec, WIDTH, SKIP)\n        self.head = PointerHead(self.trunk.out_ch, spec)\n        self.value_head = ortho(nn.Linear(GLOB, 1), 1.0)\n\n    def forward(self, obs, mask):\n        h, g = self.trunk(obs)\n        logits = self.head(h, g)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 80963,
+    "fb_ms": 28.83,
+    "flops_per_sample": 15950592,
+    "flops_ratio": 0.87,
+    "sha": "6556f9e82aa4fddc",
+    "recipe": {
+     "lr": 0.0015,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "ppo_epochs": 2,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "ent_coef": 0.005,
+     "lr": 0.0015
+    },
+    "budget": {
+     "allowed_steps": 243419,
+     "n_updates": 118,
+     "batch": 2048,
+     "steps": 241664,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0107
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 8
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0,
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 80963,
+    "flops_ratio": 0.87,
+    "train_steps": 241664,
+    "wall_s": 73.6,
+    "sha": "6556f9e82aa4fddc",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r3c1",
+   "round": 3,
+   "name": "Obs axis reinterpretations + window head",
+   "hypothesis": "The obs memory may not be laid out as (C,Y,X). I re-read the flat obs in all 6 axis orders, using only reshape and permute, and concatenate the results as channels. A learned 1x1 stem picks the right one, and r1c2's frames \u00d7 centred-window \u00d7 2-orders head with a dense term sits on top. If the obs layout is scrambled, training success should rise above 0. Refuted if training and dev both stay at 0.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {\"ppo_epochs\": 2, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 32, \"gamma\": 0.97, \"gae_lambda\": 0.95, \"ent_coef\": 0.005, \"lr\": 0.0015}\n\nSTEM = 64\nCOL = 48\nWIDTH = 40\nSKIP = 16\nGLOB = 64\nHID = 32\nSCALE = 5.0\nREINTERP = True\nDIHEDRAL_IN = False\nMASK_IN = False\nR2 = 1.4142135623730951\nPERMS = ((0, 1, 2), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0))\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    if m.bias is not None:\n        nn.init.zeros_(m.bias)\n    return m\n\n\ndef apply_frame(t, g):\n    if g >= 4:\n        t = t.transpose(-1, -2)\n    k = g % 4\n    if k == 1:\n        t = t.flip(-1)\n    elif k == 2:\n        t = t.flip(-2)\n    elif k == 3:\n        t = t.flip(-2).flip(-1)\n    return t\n\n\nclass InputBuilder(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.C = int(spec.in_channels)\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        self.Z = int(spec.Z)\n        self.T = len(spec.footprints)\n        self.n_place = int(spec.n_place)\n        self.nf = 8 if self.Y == self.X else 4\n        n = self.C * (len(PERMS) if REINTERP else 1)\n        if DIHEDRAL_IN:\n            n += (3 * self.Z + 1) * (self.nf - 1)\n        if MASK_IN:\n            n += self.T\n        self.out_ch = n\n\n    def forward(self, obs, mask):\n        B = obs.shape[0]\n        C, Y, X, Z = self.C, self.Y, self.X, self.Z\n        parts = []\n        if REINTERP:\n            flat = obs.reshape(B, -1)\n            s = (C, Y, X)\n            for p in PERMS:\n                t = flat.reshape(B, s[p[0]], s[p[1]], s[p[2]])\n                parts.append(t.permute(0, p.index(0) + 1, p.index(1) + 1, p.index(2) + 1))\n        else:\n            parts.append(obs)\n        if DIHEDRAL_IN:\n            tg = torch.cat([obs[:, Z:4 * Z], obs[:, 4 * Z + 1:4 * Z + 2]], 1)\n            for g in range(1, self.nf):\n                parts.append(apply_frame(tg, g))\n        if MASK_IN:\n            m = mask[:, :self.n_place].to(obs.dtype).reshape(B, self.T, Y, X)\n            parts.append(m)\n        return torch.cat(parts, 1)\n\n\nclass Trunk(nn.Module):\n    def __init__(self, cin, width, skip):\n        super().__init__()\n        self.stem1 = ortho(nn.Conv2d(cin, STEM, 1), R2)\n        self.stem2 = ortho(nn.Conv2d(STEM, COL, 1), R2)\n        self.c1 = ortho(nn.Conv2d(COL, width, 3, padding=1), R2)\n        self.n1 = nn.GroupNorm(4, width)\n        self.c2 = ortho(nn.Conv2d(width, width, 3, padding=1), R2)\n        self.n2 = nn.GroupNorm(4, width)\n        self.skip = ortho(nn.Conv2d(cin, skip, 1), 1.0)\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * width, GLOB), R2), nn.ReLU())\n        self.out_ch = width + skip\n\n    def forward(self, xin):\n        s = F.relu(self.stem1(xin))\n        s = F.relu(self.stem2(s))\n        x = F.relu(self.n1(self.c1(s)))\n        f = F.relu(x + self.n2(self.c2(x)))\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], dim=1))\n        h = torch.cat([f, self.skip(xin)], dim=1)\n        return h, g\n\n\nclass WindowHead(nn.Module):\n    def __init__(self, cin, spec):\n        super().__init__()\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        fps = [(int(a), int(b)) for a, b in spec.footprints]\n        self.T = len(fps)\n        K = max(max(a, b) for a, b in fps)\n        self.nf = 8 if self.Y == self.X else 4\n        self.hid = ortho(nn.Conv2d(cin, HID, 1), R2)\n        self.win = ortho(nn.Conv2d(HID, self.nf * self.T, 2 * K - 1, padding=K - 1), 0.01)\n        self.alpha = nn.Parameter(torch.zeros(2 * self.nf))\n        self.dense = ortho(nn.Linear(GLOB, self.T * self.Y * self.X), 0.01)\n\n    def forward(self, h, g):\n        B = h.shape[0]\n        m = self.win(F.relu(self.hid(h)))\n        m = m.reshape(B, self.nf, self.T, self.Y, self.X)\n        outs = []\n        for gi in range(self.nf):\n            mg = apply_frame(m[:, gi], gi)\n            outs.append(mg.reshape(B, -1))\n            outs.append(mg.permute(0, 2, 3, 1).reshape(B, -1))\n        L = torch.stack(outs, 1)\n        w = torch.softmax(SCALE * self.alpha, dim=0)\n        place = (L * w.reshape(1, -1, 1)).sum(1)\n        return place + self.dense(g)\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.inp = InputBuilder(spec)\n        self.trunk = Trunk(self.inp.out_ch, WIDTH, SKIP)\n        self.head = WindowHead(self.trunk.out_ch, spec)\n        self.done_head = ortho(nn.Linear(GLOB, 1), 0.01)\n        self.value_head = ortho(nn.Linear(GLOB, 1), 1.0)\n\n    def forward(self, obs, mask):\n        xin = self.inp(obs, mask)\n        h, g = self.trunk(xin)\n        place = self.head(h, g)\n        logits = torch.cat([place, self.done_head(g)], dim=1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 81122,
+    "fb_ms": 49.38,
+    "flops_per_sample": 21019392,
+    "flops_ratio": 1.15,
+    "sha": "49f10609564208d7",
+    "recipe": {
+     "lr": 0.0015,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "ppo_epochs": 2,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "ent_coef": 0.005,
+     "lr": 0.0015
+    },
+    "budget": {
+     "allowed_steps": 211756,
+     "n_updates": 103,
+     "batch": 2048,
+     "steps": 210944,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0179
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0125,
+     "short_run_updates": 6
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0,
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 81122,
+    "flops_ratio": 1.15,
+    "train_steps": 210944,
+    "wall_s": 76.2,
+    "sha": "49f10609564208d7",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r3c2",
+   "round": 3,
+   "name": "Dihedral target-input copies + window head",
+   "hypothesis": "The target-side channels (target, missing, extra and target heights) may sit in a different spatial frame from the build. A local conv trunk cannot compare cells that sit far apart. I concatenate all 8 dihedral copies of those channels, using only flips and transposes, so the learned stem can pick the copy aligned with the build. The window frame head handles the action layout. Refuted if training and dev both stay at 0.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {\"ppo_epochs\": 2, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 32, \"gamma\": 0.97, \"gae_lambda\": 0.95, \"ent_coef\": 0.005, \"lr\": 0.0015}\n\nSTEM = 64\nCOL = 48\nWIDTH = 40\nSKIP = 16\nGLOB = 64\nHID = 32\nSCALE = 5.0\nREINTERP = False\nDIHEDRAL_IN = True\nMASK_IN = False\nR2 = 1.4142135623730951\nPERMS = ((0, 1, 2), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0))\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    if m.bias is not None:\n        nn.init.zeros_(m.bias)\n    return m\n\n\ndef apply_frame(t, g):\n    if g >= 4:\n        t = t.transpose(-1, -2)\n    k = g % 4\n    if k == 1:\n        t = t.flip(-1)\n    elif k == 2:\n        t = t.flip(-2)\n    elif k == 3:\n        t = t.flip(-2).flip(-1)\n    return t\n\n\nclass InputBuilder(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.C = int(spec.in_channels)\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        self.Z = int(spec.Z)\n        self.T = len(spec.footprints)\n        self.n_place = int(spec.n_place)\n        self.nf = 8 if self.Y == self.X else 4\n        n = self.C * (len(PERMS) if REINTERP else 1)\n        if DIHEDRAL_IN:\n            n += (3 * self.Z + 1) * (self.nf - 1)\n        if MASK_IN:\n            n += self.T\n        self.out_ch = n\n\n    def forward(self, obs, mask):\n        B = obs.shape[0]\n        C, Y, X, Z = self.C, self.Y, self.X, self.Z\n        parts = []\n        if REINTERP:\n            flat = obs.reshape(B, -1)\n            s = (C, Y, X)\n            for p in PERMS:\n                t = flat.reshape(B, s[p[0]], s[p[1]], s[p[2]])\n                parts.append(t.permute(0, p.index(0) + 1, p.index(1) + 1, p.index(2) + 1))\n        else:\n            parts.append(obs)\n        if DIHEDRAL_IN:\n            tg = torch.cat([obs[:, Z:4 * Z], obs[:, 4 * Z + 1:4 * Z + 2]], 1)\n            for g in range(1, self.nf):\n                parts.append(apply_frame(tg, g))\n        if MASK_IN:\n            m = mask[:, :self.n_place].to(obs.dtype).reshape(B, self.T, Y, X)\n            parts.append(m)\n        return torch.cat(parts, 1)\n\n\nclass Trunk(nn.Module):\n    def __init__(self, cin, width, skip):\n        super().__init__()\n        self.stem1 = ortho(nn.Conv2d(cin, STEM, 1), R2)\n        self.stem2 = ortho(nn.Conv2d(STEM, COL, 1), R2)\n        self.c1 = ortho(nn.Conv2d(COL, width, 3, padding=1), R2)\n        self.n1 = nn.GroupNorm(4, width)\n        self.c2 = ortho(nn.Conv2d(width, width, 3, padding=1), R2)\n        self.n2 = nn.GroupNorm(4, width)\n        self.skip = ortho(nn.Conv2d(cin, skip, 1), 1.0)\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * width, GLOB), R2), nn.ReLU())\n        self.out_ch = width + skip\n\n    def forward(self, xin):\n        s = F.relu(self.stem1(xin))\n        s = F.relu(self.stem2(s))\n        x = F.relu(self.n1(self.c1(s)))\n        f = F.relu(x + self.n2(self.c2(x)))\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], dim=1))\n        h = torch.cat([f, self.skip(xin)], dim=1)\n        return h, g\n\n\nclass WindowHead(nn.Module):\n    def __init__(self, cin, spec):\n        super().__init__()\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        fps = [(int(a), int(b)) for a, b in spec.footprints]\n        self.T = len(fps)\n        K = max(max(a, b) for a, b in fps)\n        self.nf = 8 if self.Y == self.X else 4\n        self.hid = ortho(nn.Conv2d(cin, HID, 1), R2)\n        self.win = ortho(nn.Conv2d(HID, self.nf * self.T, 2 * K - 1, padding=K - 1), 0.01)\n        self.alpha = nn.Parameter(torch.zeros(2 * self.nf))\n        self.dense = ortho(nn.Linear(GLOB, self.T * self.Y * self.X), 0.01)\n\n    def forward(self, h, g):\n        B = h.shape[0]\n        m = self.win(F.relu(self.hid(h)))\n        m = m.reshape(B, self.nf, self.T, self.Y, self.X)\n        outs = []\n        for gi in range(self.nf):\n            mg = apply_frame(m[:, gi], gi)\n            outs.append(mg.reshape(B, -1))\n            outs.append(mg.permute(0, 2, 3, 1).reshape(B, -1))\n        L = torch.stack(outs, 1)\n        w = torch.softmax(SCALE * self.alpha, dim=0)\n        place = (L * w.reshape(1, -1, 1)).sum(1)\n        return place + self.dense(g)\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.inp = InputBuilder(spec)\n        self.trunk = Trunk(self.inp.out_ch, WIDTH, SKIP)\n        self.head = WindowHead(self.trunk.out_ch, spec)\n        self.done_head = ortho(nn.Linear(GLOB, 1), 0.01)\n        self.value_head = ortho(nn.Linear(GLOB, 1), 1.0)\n\n    def forward(self, obs, mask):\n        xin = self.inp(obs, mask)\n        h, g = self.trunk(xin)\n        place = self.head(h, g)\n        logits = torch.cat([place, self.done_head(g)], dim=1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 80962,
+    "fb_ms": 51.01,
+    "flops_per_sample": 20978432,
+    "flops_ratio": 1.15,
+    "sha": "c68a95488db12298",
+    "recipe": {
+     "lr": 0.0015,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "ppo_epochs": 2,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "ent_coef": 0.005,
+     "lr": 0.0015
+    },
+    "budget": {
+     "allowed_steps": 212170,
+     "n_updates": 103,
+     "batch": 2048,
+     "steps": 210944,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.009
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0134,
+     "short_run_updates": 6
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0,
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 80962,
+    "flops_ratio": 1.15,
+    "train_steps": 210944,
+    "wall_s": 75.1,
+    "sha": "c68a95488db12298",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r3c3",
+   "round": 3,
+   "name": "Window head, 3 epochs lr 3e-3",
+   "hypothesis": "Every trial so far used one recipe: 2 epochs at lr 1.5e-3. Three epochs at lr 3e-3 won one earlier world. This keeps r1c2's network (frames \u00d7 centred window \u00d7 orders + dense, the fastest head) and changes only the recipe, to test whether this world needs faster policy updates before the layout mixture can commit. Refuted if training and dev both stay at 0. A 0.078 result would mean a collapse instead.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {\"ppo_epochs\": 3, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 32, \"gamma\": 0.97, \"gae_lambda\": 0.95, \"ent_coef\": 0.005, \"lr\": 0.003}\n\nSTEM = 64\nCOL = 48\nWIDTH = 40\nSKIP = 16\nGLOB = 64\nHID = 32\nSCALE = 5.0\nREINTERP = False\nDIHEDRAL_IN = False\nMASK_IN = False\nR2 = 1.4142135623730951\nPERMS = ((0, 1, 2), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0))\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    if m.bias is not None:\n        nn.init.zeros_(m.bias)\n    return m\n\n\ndef apply_frame(t, g):\n    if g >= 4:\n        t = t.transpose(-1, -2)\n    k = g % 4\n    if k == 1:\n        t = t.flip(-1)\n    elif k == 2:\n        t = t.flip(-2)\n    elif k == 3:\n        t = t.flip(-2).flip(-1)\n    return t\n\n\nclass InputBuilder(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.C = int(spec.in_channels)\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        self.Z = int(spec.Z)\n        self.T = len(spec.footprints)\n        self.n_place = int(spec.n_place)\n        self.nf = 8 if self.Y == self.X else 4\n        n = self.C * (len(PERMS) if REINTERP else 1)\n        if DIHEDRAL_IN:\n            n += (3 * self.Z + 1) * (self.nf - 1)\n        if MASK_IN:\n            n += self.T\n        self.out_ch = n\n\n    def forward(self, obs, mask):\n        B = obs.shape[0]\n        C, Y, X, Z = self.C, self.Y, self.X, self.Z\n        parts = []\n        if REINTERP:\n            flat = obs.reshape(B, -1)\n            s = (C, Y, X)\n            for p in PERMS:\n                t = flat.reshape(B, s[p[0]], s[p[1]], s[p[2]])\n                parts.append(t.permute(0, p.index(0) + 1, p.index(1) + 1, p.index(2) + 1))\n        else:\n            parts.append(obs)\n        if DIHEDRAL_IN:\n            tg = torch.cat([obs[:, Z:4 * Z], obs[:, 4 * Z + 1:4 * Z + 2]], 1)\n            for g in range(1, self.nf):\n                parts.append(apply_frame(tg, g))\n        if MASK_IN:\n            m = mask[:, :self.n_place].to(obs.dtype).reshape(B, self.T, Y, X)\n            parts.append(m)\n        return torch.cat(parts, 1)\n\n\nclass Trunk(nn.Module):\n    def __init__(self, cin, width, skip):\n        super().__init__()\n        self.stem1 = ortho(nn.Conv2d(cin, STEM, 1), R2)\n        self.stem2 = ortho(nn.Conv2d(STEM, COL, 1), R2)\n        self.c1 = ortho(nn.Conv2d(COL, width, 3, padding=1), R2)\n        self.n1 = nn.GroupNorm(4, width)\n        self.c2 = ortho(nn.Conv2d(width, width, 3, padding=1), R2)\n        self.n2 = nn.GroupNorm(4, width)\n        self.skip = ortho(nn.Conv2d(cin, skip, 1), 1.0)\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * width, GLOB), R2), nn.ReLU())\n        self.out_ch = width + skip\n\n    def forward(self, xin):\n        s = F.relu(self.stem1(xin))\n        s = F.relu(self.stem2(s))\n        x = F.relu(self.n1(self.c1(s)))\n        f = F.relu(x + self.n2(self.c2(x)))\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], dim=1))\n        h = torch.cat([f, self.skip(xin)], dim=1)\n        return h, g\n\n\nclass WindowHead(nn.Module):\n    def __init__(self, cin, spec):\n        super().__init__()\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        fps = [(int(a), int(b)) for a, b in spec.footprints]\n        self.T = len(fps)\n        K = max(max(a, b) for a, b in fps)\n        self.nf = 8 if self.Y == self.X else 4\n        self.hid = ortho(nn.Conv2d(cin, HID, 1), R2)\n        self.win = ortho(nn.Conv2d(HID, self.nf * self.T, 2 * K - 1, padding=K - 1), 0.01)\n        self.alpha = nn.Parameter(torch.zeros(2 * self.nf))\n        self.dense = ortho(nn.Linear(GLOB, self.T * self.Y * self.X), 0.01)\n\n    def forward(self, h, g):\n        B = h.shape[0]\n        m = self.win(F.relu(self.hid(h)))\n        m = m.reshape(B, self.nf, self.T, self.Y, self.X)\n        outs = []\n        for gi in range(self.nf):\n            mg = apply_frame(m[:, gi], gi)\n            outs.append(mg.reshape(B, -1))\n            outs.append(mg.permute(0, 2, 3, 1).reshape(B, -1))\n        L = torch.stack(outs, 1)\n        w = torch.softmax(SCALE * self.alpha, dim=0)\n        place = (L * w.reshape(1, -1, 1)).sum(1)\n        return place + self.dense(g)\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.inp = InputBuilder(spec)\n        self.trunk = Trunk(self.inp.out_ch, WIDTH, SKIP)\n        self.head = WindowHead(self.trunk.out_ch, spec)\n        self.done_head = ortho(nn.Linear(GLOB, 1), 0.01)\n        self.value_head = ortho(nn.Linear(GLOB, 1), 1.0)\n\n    def forward(self, obs, mask):\n        xin = self.inp(obs, mask)\n        h, g = self.trunk(xin)\n        place = self.head(h, g)\n        logits = torch.cat([place, self.done_head(g)], dim=1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 70322,
+    "fb_ms": 38.78,
+    "flops_per_sample": 18254592,
+    "flops_ratio": 1.0,
+    "sha": "70791827e5a205bf",
+    "recipe": {
+     "lr": 0.003,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "ppo_epochs": 3,
+     "ent_coef": 0.005,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "ppo_epochs": 3,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "ent_coef": 0.005,
+     "lr": 0.003
+    },
+    "budget": {
+     "allowed_steps": 170393,
+     "n_updates": 83,
+     "batch": 2048,
+     "steps": 169984,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0055
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 8
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0,
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 70322,
+    "flops_ratio": 1.0,
+    "train_steps": 169984,
+    "wall_s": 77.4,
+    "sha": "70791827e5a205bf",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r3c4",
+   "round": 3,
+   "name": "Kitchen-sink input: reinterp+dihedral+mask",
+   "hypothesis": "This stacks all the input-side fixes: the 6 obs axis reinterpretations, dihedral copies of the target-side channels, and the action mask reshaped to [T,Y,X] channels. The mask lies in the true action layout, so it ties action indices to grid cells. The stem is cut to 48 to keep r near 1.25, and the window frame head stays. Refuted if training and dev both stay at 0, which would point to a mismatch outside the obs and action layout.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {\"ppo_epochs\": 2, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 32, \"gamma\": 0.97, \"gae_lambda\": 0.95, \"ent_coef\": 0.005, \"lr\": 0.0015}\n\nSTEM = 48\nCOL = 48\nWIDTH = 40\nSKIP = 16\nGLOB = 64\nHID = 32\nSCALE = 5.0\nREINTERP = True\nDIHEDRAL_IN = True\nMASK_IN = True\nR2 = 1.4142135623730951\nPERMS = ((0, 1, 2), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0))\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    if m.bias is not None:\n        nn.init.zeros_(m.bias)\n    return m\n\n\ndef apply_frame(t, g):\n    if g >= 4:\n        t = t.transpose(-1, -2)\n    k = g % 4\n    if k == 1:\n        t = t.flip(-1)\n    elif k == 2:\n        t = t.flip(-2)\n    elif k == 3:\n        t = t.flip(-2).flip(-1)\n    return t\n\n\nclass InputBuilder(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.C = int(spec.in_channels)\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        self.Z = int(spec.Z)\n        self.T = len(spec.footprints)\n        self.n_place = int(spec.n_place)\n        self.nf = 8 if self.Y == self.X else 4\n        n = self.C * (len(PERMS) if REINTERP else 1)\n        if DIHEDRAL_IN:\n            n += (3 * self.Z + 1) * (self.nf - 1)\n        if MASK_IN:\n            n += self.T\n        self.out_ch = n\n\n    def forward(self, obs, mask):\n        B = obs.shape[0]\n        C, Y, X, Z = self.C, self.Y, self.X, self.Z\n        parts = []\n        if REINTERP:\n            flat = obs.reshape(B, -1)\n            s = (C, Y, X)\n            for p in PERMS:\n                t = flat.reshape(B, s[p[0]], s[p[1]], s[p[2]])\n                parts.append(t.permute(0, p.index(0) + 1, p.index(1) + 1, p.index(2) + 1))\n        else:\n            parts.append(obs)\n        if DIHEDRAL_IN:\n            tg = torch.cat([obs[:, Z:4 * Z], obs[:, 4 * Z + 1:4 * Z + 2]], 1)\n            for g in range(1, self.nf):\n                parts.append(apply_frame(tg, g))\n        if MASK_IN:\n            m = mask[:, :self.n_place].to(obs.dtype).reshape(B, self.T, Y, X)\n            parts.append(m)\n        return torch.cat(parts, 1)\n\n\nclass Trunk(nn.Module):\n    def __init__(self, cin, width, skip):\n        super().__init__()\n        self.stem1 = ortho(nn.Conv2d(cin, STEM, 1), R2)\n        self.stem2 = ortho(nn.Conv2d(STEM, COL, 1), R2)\n        self.c1 = ortho(nn.Conv2d(COL, width, 3, padding=1), R2)\n        self.n1 = nn.GroupNorm(4, width)\n        self.c2 = ortho(nn.Conv2d(width, width, 3, padding=1), R2)\n        self.n2 = nn.GroupNorm(4, width)\n        self.skip = ortho(nn.Conv2d(cin, skip, 1), 1.0)\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * width, GLOB), R2), nn.ReLU())\n        self.out_ch = width + skip\n\n    def forward(self, xin):\n        s = F.relu(self.stem1(xin))\n        s = F.relu(self.stem2(s))\n        x = F.relu(self.n1(self.c1(s)))\n        f = F.relu(x + self.n2(self.c2(x)))\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], dim=1))\n        h = torch.cat([f, self.skip(xin)], dim=1)\n        return h, g\n\n\nclass WindowHead(nn.Module):\n    def __init__(self, cin, spec):\n        super().__init__()\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        fps = [(int(a), int(b)) for a, b in spec.footprints]\n        self.T = len(fps)\n        K = max(max(a, b) for a, b in fps)\n        self.nf = 8 if self.Y == self.X else 4\n        self.hid = ortho(nn.Conv2d(cin, HID, 1), R2)\n        self.win = ortho(nn.Conv2d(HID, self.nf * self.T, 2 * K - 1, padding=K - 1), 0.01)\n        self.alpha = nn.Parameter(torch.zeros(2 * self.nf))\n        self.dense = ortho(nn.Linear(GLOB, self.T * self.Y * self.X), 0.01)\n\n    def forward(self, h, g):\n        B = h.shape[0]\n        m = self.win(F.relu(self.hid(h)))\n        m = m.reshape(B, self.nf, self.T, self.Y, self.X)\n        outs = []\n        for gi in range(self.nf):\n            mg = apply_frame(m[:, gi], gi)\n            outs.append(mg.reshape(B, -1))\n            outs.append(mg.permute(0, 2, 3, 1).reshape(B, -1))\n        L = torch.stack(outs, 1)\n        w = torch.softmax(SCALE * self.alpha, dim=0)\n        place = (L * w.reshape(1, -1, 1)).sum(1)\n        return place + self.dense(g)\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.inp = InputBuilder(spec)\n        self.trunk = Trunk(self.inp.out_ch, WIDTH, SKIP)\n        self.head = WindowHead(self.trunk.out_ch, spec)\n        self.done_head = ortho(nn.Linear(GLOB, 1), 0.01)\n        self.value_head = ortho(nn.Linear(GLOB, 1), 1.0)\n\n    def forward(self, obs, mask):\n        xin = self.inp(obs, mask)\n        h, g = self.trunk(xin)\n        place = self.head(h, g)\n        logits = torch.cat([place, self.done_head(g)], dim=1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 86514,
+    "fb_ms": 56.47,
+    "flops_per_sample": 22305536,
+    "flops_ratio": 1.22,
+    "sha": "3b422868d3c3ebc9",
+    "recipe": {
+     "lr": 0.0015,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "ppo_epochs": 2,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "gamma": 0.97,
+     "gae_lambda": 0.95,
+     "ent_coef": 0.005,
+     "lr": 0.0015
+    },
+    "budget": {
+     "allowed_steps": 199546,
+     "n_updates": 97,
+     "batch": 2048,
+     "steps": 198656,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0095
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0004,
+     "short_run_updates": 6
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0,
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 86514,
+    "flops_ratio": 1.22,
+    "train_steps": 198656,
+    "wall_s": 71.1,
+    "sha": "3b422868d3c3ebc9",
+    "readouts": null
+   }
+  }
+ ],
+ "rounds_done": 3,
+ "incumbent": null,
+ "analyses": {
+  "1": "No trials have run in this search yet. The starting architecture scored 0.000 on both seeds. In earlier generations, a score of 0 meant the action layout did not match, and a learnable frame head fixed that in all 7 worlds. An 8-frame dihedral mixture won 6 of them. Identity plus transposed square heads won the transpose world. Some worlds also needed a centred window or anchor-major flattening. So round 1 runs the planned frame-head sweep on the default 2-epoch recipe (lr 1.5e-3, 32 minibatches). Each candidate covers a different family of layout mismatches: 1) pooled dihedral frames with one mixture; 2) frames \u00d7 a centred window \u00d7 type-major or anchor-major order, plus a dense term; 3) identity and transposed square heads with type mixing; 4) a per-type frame mixture at scale 2, which helps against collapse. My FLOP estimates put every candidate at r \u2264 1, so each keeps the full sample budget. For each candidate I will read the mean and the minimum over the 2 seeds. A seed at exactly 0.078 marks a collapse rather than partial progress.",
+  "2": "All four round-1 heads scored 0 on both seeds, for training as well as dev. Training success was at most 0.0004 and no run sat at the 0.078 collapse value. So the action layout is still unmatched; this is not a collapse or a recipe problem. Between them the round-1 heads covered 8 frames, anchor offsets (centred window), learnable type identity (the window conv learns per-type maps), and type-major and type-minor index orders. Two kinds of mismatch remain:\n- **Uncovered structured products:** a type-middle order (y,t,x), DONE placed first instead of last (which shifts every index by one), or both combined with frames.\n- **A non-structured permutation**, which only a fully learned index remap can fit.\n\nThis round keeps breadth:\n1. A factorised window mixture over 8 frames \u00d7 3 type positions \u00d7 2 DONE positions.\n2. A dense learned remap from per-cell features to all actions.\n3. Candidates 1 and 2 combined.\n4. A low-parameter learned pointer head: each action index gets a soft cell address and an embedding.\n\nAll use the default recipe.",
+  "3": "All 8 trials scored 0 on dev. Training success was also about 0 (at most 0.0004), and no run collapsed to 0.078. The policy therefore never matched the world at all. The tested heads together covered dihedral frames, anchor offset, type permutation, three flattening orders and DONE first or last. Dense and pointer heads that could learn any remap also stayed at 0. Two explanations remain. The mismatch may sit on the observation side, for example a scrambled obs memory layout or target channels in a different frame from the build. Neither can be repaired by a head with a local receptive field. Or every trial used the same recipe, and this world needs a different one. In this last round I spend all 4 slots on breadth: re-read the raw obs in all 6 axis orders, add dihedral copies of the target-side channels, try a recipe change, and test a combined input with the mask as a feature. Any score above 0 beats the starting architecture."
+ }
+}

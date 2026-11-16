@@ -1,0 +1,137 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+RECIPE = {"lr": 2e-3, "n_envs": 128, "rollout_len": 16, "n_minibatches": 8, "ppo_epochs": 2, "ent_coef": 0.005, "gamma": 0.9, "gae_lambda": 0.85}
+
+LAYOUTS = [(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1)]
+OBS_SYM = True
+USE_LN = True
+STEM = 64
+WIDTH = 40
+HEAD = 32
+GLOB = 64
+
+
+def lay(g, t, fy, fx):
+    if t:
+        g = g.transpose(2, 3)
+    if fy:
+        g = g.flip(2)
+    if fx:
+        g = g.flip(3)
+    return g
+
+
+def unlay(g, t, fy, fx):
+    if fx:
+        g = g.flip(3)
+    if fy:
+        g = g.flip(2)
+    if t:
+        g = g.transpose(2, 3)
+    return g
+
+
+class ChanLN(nn.Module):
+    def __init__(self, c, on):
+        super().__init__()
+        self.on = on
+        self.ln = nn.LayerNorm(c) if on else nn.Identity()
+
+    def forward(self, x):
+        if not self.on:
+            return x
+        return self.ln(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+
+
+class Net(nn.Module):
+    def __init__(self, spec):
+        super().__init__()
+        self.ny = int(spec.Y)
+        self.nx = int(spec.X)
+        self.n_place = int(spec.n_place)
+        self.n_extra = int(spec.n_actions) - self.n_place
+        cells = self.ny * self.nx
+        sq = self.ny == self.nx
+        self.grid_mask = (self.n_place % cells) == 0
+        self.k = self.n_place // cells
+        lays = [l for l in LAYOUTS if sq or l[0] == 0]
+        if len(lays) == 0:
+            lays = [(0, 0, 0)]
+        self.layouts = lays
+        allsyms = [(0, 0, 0), (0, 1, 0), (0, 0, 1), (0, 1, 1)]
+        if sq:
+            allsyms = allsyms + [(1, 0, 0), (1, 1, 0), (1, 0, 1), (1, 1, 1)]
+        self.syms = allsyms if OBS_SYM else [(0, 0, 0)]
+        nl = len(self.layouts)
+        cin = int(spec.in_channels) * len(self.syms) + 2
+        if self.grid_mask:
+            mch = self.k * nl
+            nout = self.k * nl
+        else:
+            mch = 8
+            nout = 8
+            self.mask_embed = nn.Linear(self.n_place, 8 * cells)
+            self.place_out = nn.Linear(8 * cells, self.n_place)
+        self.mch = mch
+        self.obs_stem = nn.Conv2d(cin, STEM, 1)
+        self.mask_stem = nn.Conv2d(mch, STEM, 1)
+        self.ln_o = ChanLN(STEM, USE_LN)
+        self.ln_m = ChanLN(STEM, USE_LN)
+        self.col = nn.Conv2d(STEM, WIDTH, 1)
+        self.ln_c = ChanLN(WIDTH, USE_LN)
+        self.res = nn.ModuleList([nn.Conv2d(WIDTH, WIDTH, 3, padding=1) for _ in range(2)])
+        self.res_ln = nn.ModuleList([ChanLN(WIDTH, USE_LN) for _ in range(2)])
+        self.h3 = nn.Conv2d(WIDTH, HEAD, 3, padding=1)
+        self.h1 = nn.Conv2d(WIDTH, HEAD, 1)
+        self.hout = nn.Conv2d(HEAD, nout, 1)
+        self.glob = nn.Linear(2 * WIDTH, GLOB)
+        self.done_head = nn.Linear(GLOB, self.n_extra)
+        self.value_head = nn.Linear(GLOB, 1)
+        if USE_LN:
+            nn.init.orthogonal_(self.hout.weight, 0.01)
+            nn.init.zeros_(self.hout.bias)
+            nn.init.orthogonal_(self.done_head.weight, 0.01)
+            nn.init.zeros_(self.done_head.bias)
+
+    def forward(self, obs, mask):
+        b = obs.shape[0]
+        ny = self.ny
+        nx = self.nx
+        views = [lay(obs, t, fy, fx) for (t, fy, fx) in self.syms]
+        yy = torch.linspace(-1.0, 1.0, ny, device=obs.device, dtype=obs.dtype).view(1, 1, ny, 1).expand(b, 1, ny, nx)
+        xx = torch.linspace(-1.0, 1.0, nx, device=obs.device, dtype=obs.dtype).view(1, 1, 1, nx).expand(b, 1, ny, nx)
+        xo = torch.cat(views + [yy, xx], dim=1)
+        mp = mask[:, :self.n_place].to(obs.dtype)
+        if self.grid_mask:
+            mg = mp.reshape(b, self.k, ny, nx)
+            xm = torch.cat([lay(mg, t, fy, fx) for (t, fy, fx) in self.layouts], dim=1)
+        else:
+            xm = self.mask_embed(mp).reshape(b, self.mch, ny, nx)
+        so = self.obs_stem(xo)
+        sm = self.mask_stem(xm)
+        if USE_LN:
+            s = F.relu(self.ln_o(so)) + F.relu(self.ln_m(sm))
+        else:
+            s = F.relu(so + sm)
+        f = F.relu(self.ln_c(self.col(s)))
+        for conv, ln in zip(self.res, self.res_ln):
+            f = F.relu(ln(f + conv(f)))
+        h = F.relu(self.h3(f) + self.h1(f))
+        o = self.hout(h)
+        if self.grid_mask:
+            place = None
+            for i, (t, fy, fx) in enumerate(self.layouts):
+                oi = o[:, i * self.k:(i + 1) * self.k]
+                c = unlay(oi, t, fy, fx).reshape(b, -1)
+                place = c if place is None else place + c
+        else:
+            place = self.place_out(o.reshape(b, -1))
+        g = F.relu(self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3))], dim=1)))
+        logits = torch.cat([place, self.done_head(g)], dim=1)
+        return logits, self.value_head(g).squeeze(1)
+
+
+def build_policy(spec):
+    return Net(spec)

@@ -1,0 +1,1668 @@
+{
+ "trials": [
+  {
+   "label": "r1c1",
+   "round": 1,
+   "name": "everything stack, 2 epochs",
+   "hypothesis": "Stacks all the untried fixes: orthogonal init with 0.01 logit gain (policy starts near uniform), a GroupNorm residual trunk, a raw-obs 1x1 skip into the footprint min/max/avg head, factorised type and anchor terms, a dense 3x3 head, a flattened dense head and global context. Recipe: lr 2e-3, 2 epochs, gamma 0.99, lambda 0.95. If even this stack scores 0 on training and dev, the bottleneck is not init, normalisation or head blur.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {'lr': 0.002, 'n_envs': 256, 'rollout_len': 16, 'n_minibatches': 16, 'ppo_epochs': 2, 'ent_coef': 0.01, 'gamma': 0.99, 'gae_lambda': 0.95, 'clip_eps': 0.2}\n\nCOLW = 48\nSKIP = 24\nSKIP_DEEP = False\nWIDTH = 48\nNBLOCKS = 1\nUSE_TRUNK = True\nPROJ = 24\nHID = 32\nMIX2 = False\nDENSE3 = True\nFLATD = 8\nGLOB = 64\nGROUPS = 8\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    nn.init.zeros_(m.bias)\n    return m\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        nt = len(self.fps)\n        self.nt = nt\n        cin = int(spec.in_channels)\n        g = math.sqrt(2.0)\n        self.col1 = ortho(nn.Conv2d(cin, COLW, 1), g)\n        self.col2 = ortho(nn.Conv2d(COLW, COLW, 1), g)\n        if SKIP_DEEP:\n            self.skip = nn.Sequential(ortho(nn.Conv2d(cin, COLW, 1), g), nn.ReLU(), ortho(nn.Conv2d(COLW, SKIP, 1), g), nn.ReLU())\n        else:\n            self.skip = nn.Sequential(ortho(nn.Conv2d(cin, SKIP, 1), g), nn.ReLU())\n        if USE_TRUNK:\n            self.c0 = ortho(nn.Conv2d(COLW, WIDTH, 3, padding=1), g)\n            self.n0 = nn.GroupNorm(GROUPS, WIDTH)\n            self.blocks = nn.ModuleList([ortho(nn.Conv2d(WIDTH, WIDTH, 3, padding=1), g) for _ in range(NBLOCKS)])\n            self.norms = nn.ModuleList([nn.GroupNorm(GROUPS, WIDTH) for _ in range(NBLOCKS)])\n            fw = WIDTH\n        else:\n            fw = COLW\n        self.proj = ortho(nn.Conv2d(fw, PROJ, 1), g)\n        P = PROJ + SKIP\n        self.mix = nn.ModuleList([ortho(nn.Conv2d(3 * P, HID, 1), g) for _ in self.fps])\n        if MIX2:\n            self.mix2 = nn.ModuleList([ortho(nn.Conv2d(HID, HID, 1), g) for _ in self.fps])\n        self.outs = nn.ModuleList([ortho(nn.Conv2d(HID, 1, 1), 0.01) for _ in self.fps])\n        self.anchor = ortho(nn.Conv2d(P, 1, 1), 0.01)\n        self.type_bias = nn.Parameter(torch.zeros(1, nt, 1, 1))\n        if DENSE3:\n            self.dense3 = ortho(nn.Conv2d(P, nt, 3, padding=1), 0.01)\n        if FLATD > 0:\n            self.flat_in = ortho(nn.Conv2d(P, FLATD, 1), g)\n            self.flat_out = ortho(nn.Linear(FLATD * self.Y * self.X, nt * self.Y * self.X), 0.01)\n        gin = 2 * fw + 2 * P\n        self.glob = nn.Sequential(ortho(nn.Linear(gin, GLOB), g), nn.ReLU())\n        self.ctx = ortho(nn.Linear(GLOB, nt * HID), 1.0)\n        self.done_head = ortho(nn.Linear(GLOB, 1), 0.01)\n        self.value_head = ortho(nn.Linear(GLOB, 1), 1.0)\n\n    def forward(self, obs, mask):\n        B = obs.shape[0]\n        h = F.relu(self.col1(obs))\n        h = F.relu(self.col2(h))\n        s = self.skip(obs)\n        if USE_TRUNK:\n            x = F.relu(self.n0(self.c0(h)))\n            for conv, nrm in zip(self.blocks, self.norms):\n                x = F.relu(x + nrm(conv(x)))\n        else:\n            x = h\n        p = torch.cat([F.relu(self.proj(x)), s], dim=1)\n        gfeat = torch.cat([x.mean((2, 3)), x.amax((2, 3)), p.mean((2, 3)), p.amax((2, 3))], dim=1)\n        g = self.glob(gfeat)\n        ctx = self.ctx(g).view(B, self.nt, HID, 1, 1)\n        res = []\n        for i, (dy, dx) in enumerate(self.fps):\n            if dy * dx == 1:\n                mx, mn, av = p, p, p\n            else:\n                q = F.pad(p, (0, dx - 1, 0, dy - 1))\n                mx = F.max_pool2d(q, (dy, dx), stride=1)\n                mn = -F.max_pool2d(-q, (dy, dx), stride=1)\n                av = F.avg_pool2d(q, (dy, dx), stride=1)\n            hh = F.relu(self.mix[i](torch.cat([mx, mn, av], 1)) + ctx[:, i])\n            if MIX2:\n                hh = F.relu(self.mix2[i](hh))\n            res.append(self.outs[i](hh))\n        place = torch.cat(res, 1) + self.anchor(p) + self.type_bias\n        if DENSE3:\n            place = place + self.dense3(p)\n        place = place.flatten(1)\n        if FLATD > 0:\n            fl = F.relu(self.flat_in(p)).flatten(1)\n            place = place + self.flat_out(fl)\n        logits = torch.cat([place, self.done_head(g)], 1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 220303,
+    "fb_ms": 97.34,
+    "flops_per_sample": 26616576,
+    "flops_ratio": 1.46,
+    "sha": "3ec45ffb3625e5e3",
+    "recipe": {
+     "lr": 0.002,
+     "n_envs": 256,
+     "rollout_len": 16,
+     "n_minibatches": 16,
+     "ppo_epochs": 2,
+     "ent_coef": 0.01,
+     "gamma": 0.99,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "lr": 0.002,
+     "n_envs": 256,
+     "rollout_len": 16,
+     "n_minibatches": 16,
+     "ppo_epochs": 2,
+     "ent_coef": 0.01,
+     "gamma": 0.99,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.2
+    },
+    "budget": {
+     "allowed_steps": 167226,
+     "n_updates": 40,
+     "batch": 4096,
+     "steps": 163840,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0109
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 5
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 220303,
+    "flops_ratio": 1.46,
+    "train_steps": 163840,
+    "wall_s": 50.7,
+    "sha": "3ec45ffb3625e5e3",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r1c2",
+   "round": 1,
+   "name": "local column MLP, 1 epoch",
+   "hypothesis": "Correctness is local: a footprint's columns decide the landing layer and whether a placement seals a cell. A wide per-column MLP plus a raw skip, pooled over the footprint with min/max/avg and given a global context, can express that rule with no blurring 3x3 trunk. Adds init hygiene, about 330k samples (1 epoch) and gamma 0.99. Refuted if it stays at 0 while the 3x3-trunk candidates score.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {'lr': 0.0015, 'n_envs': 128, 'rollout_len': 32, 'n_minibatches': 32, 'ppo_epochs': 1, 'ent_coef': 0.01, 'gamma': 0.99, 'gae_lambda': 0.95, 'clip_eps': 0.2}\n\nCOLW = 96\nSKIP = 32\nSKIP_DEEP = False\nWIDTH = 48\nNBLOCKS = 0\nUSE_TRUNK = False\nPROJ = 32\nHID = 64\nMIX2 = False\nDENSE3 = False\nFLATD = 0\nGLOB = 64\nGROUPS = 8\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    nn.init.zeros_(m.bias)\n    return m\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        nt = len(self.fps)\n        self.nt = nt\n        cin = int(spec.in_channels)\n        g = math.sqrt(2.0)\n        self.col1 = ortho(nn.Conv2d(cin, COLW, 1), g)\n        self.col2 = ortho(nn.Conv2d(COLW, COLW, 1), g)\n        if SKIP_DEEP:\n            self.skip = nn.Sequential(ortho(nn.Conv2d(cin, COLW, 1), g), nn.ReLU(), ortho(nn.Conv2d(COLW, SKIP, 1), g), nn.ReLU())\n        else:\n            self.skip = nn.Sequential(ortho(nn.Conv2d(cin, SKIP, 1), g), nn.ReLU())\n        if USE_TRUNK:\n            self.c0 = ortho(nn.Conv2d(COLW, WIDTH, 3, padding=1), g)\n            self.n0 = nn.GroupNorm(GROUPS, WIDTH)\n            self.blocks = nn.ModuleList([ortho(nn.Conv2d(WIDTH, WIDTH, 3, padding=1), g) for _ in range(NBLOCKS)])\n            self.norms = nn.ModuleList([nn.GroupNorm(GROUPS, WIDTH) for _ in range(NBLOCKS)])\n            fw = WIDTH\n        else:\n            fw = COLW\n        self.proj = ortho(nn.Conv2d(fw, PROJ, 1), g)\n        P = PROJ + SKIP\n        self.mix = nn.ModuleList([ortho(nn.Conv2d(3 * P, HID, 1), g) for _ in self.fps])\n        if MIX2:\n            self.mix2 = nn.ModuleList([ortho(nn.Conv2d(HID, HID, 1), g) for _ in self.fps])\n        self.outs = nn.ModuleList([ortho(nn.Conv2d(HID, 1, 1), 0.01) for _ in self.fps])\n        self.anchor = ortho(nn.Conv2d(P, 1, 1), 0.01)\n        self.type_bias = nn.Parameter(torch.zeros(1, nt, 1, 1))\n        if DENSE3:\n            self.dense3 = ortho(nn.Conv2d(P, nt, 3, padding=1), 0.01)\n        if FLATD > 0:\n            self.flat_in = ortho(nn.Conv2d(P, FLATD, 1), g)\n            self.flat_out = ortho(nn.Linear(FLATD * self.Y * self.X, nt * self.Y * self.X), 0.01)\n        gin = 2 * fw + 2 * P\n        self.glob = nn.Sequential(ortho(nn.Linear(gin, GLOB), g), nn.ReLU())\n        self.ctx = ortho(nn.Linear(GLOB, nt * HID), 1.0)\n        self.done_head = ortho(nn.Linear(GLOB, 1), 0.01)\n        self.value_head = ortho(nn.Linear(GLOB, 1), 1.0)\n\n    def forward(self, obs, mask):\n        B = obs.shape[0]\n        h = F.relu(self.col1(obs))\n        h = F.relu(self.col2(h))\n        s = self.skip(obs)\n        if USE_TRUNK:\n            x = F.relu(self.n0(self.c0(h)))\n            for conv, nrm in zip(self.blocks, self.norms):\n                x = F.relu(x + nrm(conv(x)))\n        else:\n            x = h\n        p = torch.cat([F.relu(self.proj(x)), s], dim=1)\n        gfeat = torch.cat([x.mean((2, 3)), x.amax((2, 3)), p.mean((2, 3)), p.amax((2, 3))], dim=1)\n        g = self.glob(gfeat)\n        ctx = self.ctx(g).view(B, self.nt, HID, 1, 1)\n        res = []\n        for i, (dy, dx) in enumerate(self.fps):\n            if dy * dx == 1:\n                mx, mn, av = p, p, p\n            else:\n                q = F.pad(p, (0, dx - 1, 0, dy - 1))\n                mx = F.max_pool2d(q, (dy, dx), stride=1)\n                mn = -F.max_pool2d(-q, (dy, dx), stride=1)\n                av = F.avg_pool2d(q, (dy, dx), stride=1)\n            hh = F.relu(self.mix[i](torch.cat([mx, mn, av], 1)) + ctx[:, i])\n            if MIX2:\n                hh = F.relu(self.mix2[i](hh))\n            res.append(self.outs[i](hh))\n        place = torch.cat(res, 1) + self.anchor(p) + self.type_bias\n        if DENSE3:\n            place = place + self.dense3(p)\n        place = place.flatten(1)\n        if FLATD > 0:\n            fl = F.relu(self.flat_in(p)).flatten(1)\n            place = place + self.flat_out(fl)\n        logits = torch.cat([place, self.done_head(g)], 1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 103051,
+    "fb_ms": 113.26,
+    "flops_per_sample": 24822528,
+    "flops_ratio": 1.36,
+    "sha": "91267acc0bb31842",
+    "recipe": {
+     "lr": 0.0015,
+     "n_envs": 128,
+     "rollout_len": 32,
+     "n_minibatches": 32,
+     "ppo_epochs": 1,
+     "ent_coef": 0.01,
+     "gamma": 0.99,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "lr": 0.0015,
+     "n_envs": 128,
+     "rollout_len": 32,
+     "n_minibatches": 32,
+     "ppo_epochs": 1,
+     "ent_coef": 0.01,
+     "gamma": 0.99,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.2
+    },
+    "budget": {
+     "allowed_steps": 313797,
+     "n_updates": 76,
+     "batch": 4096,
+     "steps": 311296,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0082
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 5
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 103051,
+    "flops_ratio": 1.36,
+    "train_steps": 311296,
+    "wall_s": 75.2,
+    "sha": "91267acc0bb31842",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r1c3",
+   "round": 1,
+   "name": "small net, extreme recipe",
+   "hypothesis": "A net no costlier than the starting one (r about 1) gets the most samples (about 426k), with the untried extreme recipe: lr 3e-3, 1 epoch, 64 envs x 64-step rollouts (longer than an episode), gamma 0.995, lambda 0.99, clip 0.3 and 3,300 small-batch gradient steps. Also gets init hygiene, GroupNorm, the skip and a dense 3x3 head. It tests whether many fresh, high-lr updates break the zero plateau. Refuted if it scores 0 while the slower recipes score.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {'lr': 0.003, 'n_envs': 64, 'rollout_len': 64, 'n_minibatches': 32, 'ppo_epochs': 1, 'ent_coef': 0.005, 'gamma': 0.995, 'gae_lambda': 0.99, 'clip_eps': 0.3}\n\nCOLW = 48\nSKIP = 16\nSKIP_DEEP = False\nWIDTH = 32\nNBLOCKS = 1\nUSE_TRUNK = True\nPROJ = 16\nHID = 24\nMIX2 = False\nDENSE3 = True\nFLATD = 0\nGLOB = 64\nGROUPS = 8\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    nn.init.zeros_(m.bias)\n    return m\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        nt = len(self.fps)\n        self.nt = nt\n        cin = int(spec.in_channels)\n        g = math.sqrt(2.0)\n        self.col1 = ortho(nn.Conv2d(cin, COLW, 1), g)\n        self.col2 = ortho(nn.Conv2d(COLW, COLW, 1), g)\n        if SKIP_DEEP:\n            self.skip = nn.Sequential(ortho(nn.Conv2d(cin, COLW, 1), g), nn.ReLU(), ortho(nn.Conv2d(COLW, SKIP, 1), g), nn.ReLU())\n        else:\n            self.skip = nn.Sequential(ortho(nn.Conv2d(cin, SKIP, 1), g), nn.ReLU())\n        if USE_TRUNK:\n            self.c0 = ortho(nn.Conv2d(COLW, WIDTH, 3, padding=1), g)\n            self.n0 = nn.GroupNorm(GROUPS, WIDTH)\n            self.blocks = nn.ModuleList([ortho(nn.Conv2d(WIDTH, WIDTH, 3, padding=1), g) for _ in range(NBLOCKS)])\n            self.norms = nn.ModuleList([nn.GroupNorm(GROUPS, WIDTH) for _ in range(NBLOCKS)])\n            fw = WIDTH\n        else:\n            fw = COLW\n        self.proj = ortho(nn.Conv2d(fw, PROJ, 1), g)\n        P = PROJ + SKIP\n        self.mix = nn.ModuleList([ortho(nn.Conv2d(3 * P, HID, 1), g) for _ in self.fps])\n        if MIX2:\n            self.mix2 = nn.ModuleList([ortho(nn.Conv2d(HID, HID, 1), g) for _ in self.fps])\n        self.outs = nn.ModuleList([ortho(nn.Conv2d(HID, 1, 1), 0.01) for _ in self.fps])\n        self.anchor = ortho(nn.Conv2d(P, 1, 1), 0.01)\n        self.type_bias = nn.Parameter(torch.zeros(1, nt, 1, 1))\n        if DENSE3:\n            self.dense3 = ortho(nn.Conv2d(P, nt, 3, padding=1), 0.01)\n        if FLATD > 0:\n            self.flat_in = ortho(nn.Conv2d(P, FLATD, 1), g)\n            self.flat_out = ortho(nn.Linear(FLATD * self.Y * self.X, nt * self.Y * self.X), 0.01)\n        gin = 2 * fw + 2 * P\n        self.glob = nn.Sequential(ortho(nn.Linear(gin, GLOB), g), nn.ReLU())\n        self.ctx = ortho(nn.Linear(GLOB, nt * HID), 1.0)\n        self.done_head = ortho(nn.Linear(GLOB, 1), 0.01)\n        self.value_head = ortho(nn.Linear(GLOB, 1), 1.0)\n\n    def forward(self, obs, mask):\n        B = obs.shape[0]\n        h = F.relu(self.col1(obs))\n        h = F.relu(self.col2(h))\n        s = self.skip(obs)\n        if USE_TRUNK:\n            x = F.relu(self.n0(self.c0(h)))\n            for conv, nrm in zip(self.blocks, self.norms):\n                x = F.relu(x + nrm(conv(x)))\n        else:\n            x = h\n        p = torch.cat([F.relu(self.proj(x)), s], dim=1)\n        gfeat = torch.cat([x.mean((2, 3)), x.amax((2, 3)), p.mean((2, 3)), p.amax((2, 3))], dim=1)\n        g = self.glob(gfeat)\n        ctx = self.ctx(g).view(B, self.nt, HID, 1, 1)\n        res = []\n        for i, (dy, dx) in enumerate(self.fps):\n            if dy * dx == 1:\n                mx, mn, av = p, p, p\n            else:\n                q = F.pad(p, (0, dx - 1, 0, dy - 1))\n                mx = F.max_pool2d(q, (dy, dx), stride=1)\n                mn = -F.max_pool2d(-q, (dy, dx), stride=1)\n                av = F.avg_pool2d(q, (dy, dx), stride=1)\n            hh = F.relu(self.mix[i](torch.cat([mx, mn, av], 1)) + ctx[:, i])\n            if MIX2:\n                hh = F.relu(self.mix2[i](hh))\n            res.append(self.outs[i](hh))\n        place = torch.cat(res, 1) + self.anchor(p) + self.type_bias\n        if DENSE3:\n            place = place + self.dense3(p)\n        place = place.flatten(1)\n        if FLATD > 0:\n            fl = F.relu(self.flat_in(p)).flatten(1)\n            place = place + self.flat_out(fl)\n        logits = torch.cat([place, self.done_head(g)], 1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 53135,
+    "fb_ms": 64.91,
+    "flops_per_sample": 14488320,
+    "flops_ratio": 0.79,
+    "sha": "cb102ee70a20596c",
+    "recipe": {
+     "lr": 0.003,
+     "n_envs": 64,
+     "rollout_len": 64,
+     "n_minibatches": 32,
+     "ppo_epochs": 1,
+     "ent_coef": 0.005,
+     "gamma": 0.995,
+     "gae_lambda": 0.99,
+     "clip_eps": 0.3
+    },
+    "recipe_from_file": {
+     "lr": 0.003,
+     "n_envs": 64,
+     "rollout_len": 64,
+     "n_minibatches": 32,
+     "ppo_epochs": 1,
+     "ent_coef": 0.005,
+     "gamma": 0.995,
+     "gae_lambda": 0.99,
+     "clip_eps": 0.3
+    },
+    "budget": {
+     "allowed_steps": 425984,
+     "n_updates": 104,
+     "batch": 4096,
+     "steps": 425984,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0114
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0028,
+     "short_run_updates": 8
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 53135,
+    "flops_ratio": 0.79,
+    "train_steps": 425984,
+    "wall_s": 128.9,
+    "sha": "cb102ee70a20596c",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r1c4",
+   "round": 1,
+   "name": "dense-heavy hybrid head",
+   "hypothesis": "The world may change the action layout or anchor convention, which would break purely aligned footprint heads. This candidate sums the footprint head with a 3x3 conv head and a wide flattened linear head (16 ch x cells to all placements), so whichever alignment is right can win. Adds a wide single 3x3 trunk, init hygiene, 1 epoch, gamma 0.99 and clip 0.25. Refuted if it scores no better than the aligned-only candidates.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {'lr': 0.002, 'n_envs': 128, 'rollout_len': 32, 'n_minibatches': 16, 'ppo_epochs': 1, 'ent_coef': 0.01, 'gamma': 0.99, 'gae_lambda': 0.95, 'clip_eps': 0.25}\n\nCOLW = 64\nSKIP = 32\nSKIP_DEEP = False\nWIDTH = 64\nNBLOCKS = 0\nUSE_TRUNK = True\nPROJ = 32\nHID = 32\nMIX2 = False\nDENSE3 = True\nFLATD = 16\nGLOB = 64\nGROUPS = 8\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    nn.init.zeros_(m.bias)\n    return m\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        nt = len(self.fps)\n        self.nt = nt\n        cin = int(spec.in_channels)\n        g = math.sqrt(2.0)\n        self.col1 = ortho(nn.Conv2d(cin, COLW, 1), g)\n        self.col2 = ortho(nn.Conv2d(COLW, COLW, 1), g)\n        if SKIP_DEEP:\n            self.skip = nn.Sequential(ortho(nn.Conv2d(cin, COLW, 1), g), nn.ReLU(), ortho(nn.Conv2d(COLW, SKIP, 1), g), nn.ReLU())\n        else:\n            self.skip = nn.Sequential(ortho(nn.Conv2d(cin, SKIP, 1), g), nn.ReLU())\n        if USE_TRUNK:\n            self.c0 = ortho(nn.Conv2d(COLW, WIDTH, 3, padding=1), g)\n            self.n0 = nn.GroupNorm(GROUPS, WIDTH)\n            self.blocks = nn.ModuleList([ortho(nn.Conv2d(WIDTH, WIDTH, 3, padding=1), g) for _ in range(NBLOCKS)])\n            self.norms = nn.ModuleList([nn.GroupNorm(GROUPS, WIDTH) for _ in range(NBLOCKS)])\n            fw = WIDTH\n        else:\n            fw = COLW\n        self.proj = ortho(nn.Conv2d(fw, PROJ, 1), g)\n        P = PROJ + SKIP\n        self.mix = nn.ModuleList([ortho(nn.Conv2d(3 * P, HID, 1), g) for _ in self.fps])\n        if MIX2:\n            self.mix2 = nn.ModuleList([ortho(nn.Conv2d(HID, HID, 1), g) for _ in self.fps])\n        self.outs = nn.ModuleList([ortho(nn.Conv2d(HID, 1, 1), 0.01) for _ in self.fps])\n        self.anchor = ortho(nn.Conv2d(P, 1, 1), 0.01)\n        self.type_bias = nn.Parameter(torch.zeros(1, nt, 1, 1))\n        if DENSE3:\n            self.dense3 = ortho(nn.Conv2d(P, nt, 3, padding=1), 0.01)\n        if FLATD > 0:\n            self.flat_in = ortho(nn.Conv2d(P, FLATD, 1), g)\n            self.flat_out = ortho(nn.Linear(FLATD * self.Y * self.X, nt * self.Y * self.X), 0.01)\n        gin = 2 * fw + 2 * P\n        self.glob = nn.Sequential(ortho(nn.Linear(gin, GLOB), g), nn.ReLU())\n        self.ctx = ortho(nn.Linear(GLOB, nt * HID), 1.0)\n        self.done_head = ortho(nn.Linear(GLOB, 1), 0.01)\n        self.value_head = ortho(nn.Linear(GLOB, 1), 1.0)\n\n    def forward(self, obs, mask):\n        B = obs.shape[0]\n        h = F.relu(self.col1(obs))\n        h = F.relu(self.col2(h))\n        s = self.skip(obs)\n        if USE_TRUNK:\n            x = F.relu(self.n0(self.c0(h)))\n            for conv, nrm in zip(self.blocks, self.norms):\n                x = F.relu(x + nrm(conv(x)))\n        else:\n            x = h\n        p = torch.cat([F.relu(self.proj(x)), s], dim=1)\n        gfeat = torch.cat([x.mean((2, 3)), x.amax((2, 3)), p.mean((2, 3)), p.amax((2, 3))], dim=1)\n        g = self.glob(gfeat)\n        ctx = self.ctx(g).view(B, self.nt, HID, 1, 1)\n        res = []\n        for i, (dy, dx) in enumerate(self.fps):\n            if dy * dx == 1:\n                mx, mn, av = p, p, p\n            else:\n                q = F.pad(p, (0, dx - 1, 0, dy - 1))\n                mx = F.max_pool2d(q, (dy, dx), stride=1)\n                mn = -F.max_pool2d(-q, (dy, dx), stride=1)\n                av = F.avg_pool2d(q, (dy, dx), stride=1)\n            hh = F.relu(self.mix[i](torch.cat([mx, mn, av], 1)) + ctx[:, i])\n            if MIX2:\n                hh = F.relu(self.mix2[i](hh))\n            res.append(self.outs[i](hh))\n        place = torch.cat(res, 1) + self.anchor(p) + self.type_bias\n        if DENSE3:\n            place = place + self.dense3(p)\n        place = place.flatten(1)\n        if FLATD > 0:\n            fl = F.relu(self.flat_in(p)).flatten(1)\n            place = place + self.flat_out(fl)\n        logits = torch.cat([place, self.done_head(g)], 1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 361535,
+    "fb_ms": 114.5,
+    "flops_per_sample": 29688576,
+    "flops_ratio": 1.62,
+    "sha": "67d5f2ac5c0c2bbf",
+    "recipe": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 32,
+     "n_minibatches": 16,
+     "ppo_epochs": 1,
+     "ent_coef": 0.01,
+     "gamma": 0.99,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.25
+    },
+    "recipe_from_file": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 32,
+     "n_minibatches": 16,
+     "ppo_epochs": 1,
+     "ent_coef": 0.01,
+     "gamma": 0.99,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.25
+    },
+    "budget": {
+     "allowed_steps": 262365,
+     "n_updates": 64,
+     "batch": 4096,
+     "steps": 262144,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0109
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 4
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 361535,
+    "flops_ratio": 1.62,
+    "train_steps": 262144,
+    "wall_s": 61.0,
+    "sha": "67d5f2ac5c0c2bbf",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r1c5",
+   "round": 1,
+   "name": "deeper GroupNorm residual trunk",
+   "hypothesis": "Change: a GroupNorm residual trunk with orthogonal init, a near-uniform starting policy (output gain 0.01), a learned skip of raw obs into the footprint head, global context added to the head, and a dense 3x3 head. Recipe: 1 epoch, 1,024-step updates, gamma 0.99. Why: normalisation and init hygiene should steady early learning, and the skip keeps exact cell detail. Refuted if dev and training success both stay at 0.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {'lr': 0.001, 'n_envs': 64, 'rollout_len': 16, 'n_minibatches': 4, 'ppo_epochs': 1, 'ent_coef': 0.01, 'gamma': 0.99, 'gae_lambda': 0.95, 'clip_eps': 0.2}\n\nCOLW = 48\nSKIP = 24\nWIDTH = 48\nNBLOCKS = 2\nPROJ = 24\nHID = 32\nGLOB = 64\nGROUPS = 8\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    nn.init.zeros_(m.bias)\n    return m\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        nt = len(self.fps)\n        self.nt = nt\n        cin = int(spec.in_channels)\n        g = math.sqrt(2.0)\n        self.col1 = ortho(nn.Conv2d(cin, COLW, 1), g)\n        self.col2 = ortho(nn.Conv2d(COLW, COLW, 1), g)\n        self.skip = nn.Sequential(ortho(nn.Conv2d(cin, SKIP, 1), g), nn.ReLU())\n        self.c0 = ortho(nn.Conv2d(COLW, WIDTH, 3, padding=1), g)\n        self.n0 = nn.GroupNorm(GROUPS, WIDTH)\n        self.blocks = nn.ModuleList([ortho(nn.Conv2d(WIDTH, WIDTH, 3, padding=1), g) for _ in range(NBLOCKS)])\n        self.norms = nn.ModuleList([nn.GroupNorm(GROUPS, WIDTH) for _ in range(NBLOCKS)])\n        fw = WIDTH\n        self.proj = ortho(nn.Conv2d(fw, PROJ, 1), g)\n        P = PROJ + SKIP\n        self.mix = nn.ModuleList([ortho(nn.Conv2d(3 * P, HID, 1), g) for _ in self.fps])\n        self.outs = nn.ModuleList([ortho(nn.Conv2d(HID, 1, 1), 0.01) for _ in self.fps])\n        self.anchor = ortho(nn.Conv2d(P, 1, 1), 0.01)\n        self.type_bias = nn.Parameter(torch.zeros(1, nt, 1, 1))\n        self.dense3 = ortho(nn.Conv2d(P, nt, 3, padding=1), 0.01)\n        gin = 2 * fw + 2 * P\n        self.glob = nn.Sequential(ortho(nn.Linear(gin, GLOB), g), nn.ReLU())\n        self.ctx = ortho(nn.Linear(GLOB, nt * HID), 1.0)\n        self.done_head = ortho(nn.Linear(GLOB, 1), 0.01)\n        self.value_head = ortho(nn.Linear(GLOB, 1), 1.0)\n\n    def forward(self, obs, mask):\n        B = obs.shape[0]\n        h = F.relu(self.col1(obs))\n        h = F.relu(self.col2(h))\n        s = self.skip(obs)\n        x = F.relu(self.n0(self.c0(h)))\n        for conv, nrm in zip(self.blocks, self.norms):\n            x = F.relu(x + nrm(conv(x)))\n        p = torch.cat([F.relu(self.proj(x)), s], dim=1)\n        gfeat = torch.cat([x.mean((2, 3)), x.amax((2, 3)), p.mean((2, 3)), p.amax((2, 3))], dim=1)\n        g = self.glob(gfeat)\n        ctx = self.ctx(g).view(B, self.nt, HID, 1, 1)\n        res = []\n        for i, (dy, dx) in enumerate(self.fps):\n            if dy * dx == 1:\n                mx, mn, av = p, p, p\n            else:\n                q = F.pad(p, (0, dx - 1, 0, dy - 1))\n                mx = F.max_pool2d(q, (dy, dx), stride=1)\n                mn = -F.max_pool2d(-q, (dy, dx), stride=1)\n                av = F.avg_pool2d(q, (dy, dx), stride=1)\n            hh = F.relu(self.mix[i](torch.cat([mx, mn, av], 1)) + ctx[:, i])\n            res.append(self.outs[i](hh))\n        place = torch.cat(res, 1) + self.anchor(p) + self.type_bias + self.dense3(p)\n        place = place.flatten(1)\n        logits = torch.cat([place, self.done_head(g)], 1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 109463,
+    "fb_ms": 102.73,
+    "flops_per_sample": 33645312,
+    "flops_ratio": 1.84,
+    "sha": "c2e6f2972fc0c663",
+    "recipe": {
+     "lr": 0.001,
+     "n_envs": 64,
+     "rollout_len": 16,
+     "n_minibatches": 4,
+     "ppo_epochs": 1,
+     "ent_coef": 0.01,
+     "gamma": 0.99,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "lr": 0.001,
+     "n_envs": 64,
+     "rollout_len": 16,
+     "n_minibatches": 4,
+     "ppo_epochs": 1,
+     "ent_coef": 0.01,
+     "gamma": 0.99,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.2
+    },
+    "budget": {
+     "allowed_steps": 231510,
+     "n_updates": 226,
+     "batch": 1024,
+     "steps": 231424,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.011
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 4
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 109463,
+    "flops_ratio": 1.84,
+    "train_steps": 231424,
+    "wall_s": 71.3,
+    "sha": "c2e6f2972fc0c663",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r1c6",
+   "round": 1,
+   "name": "deep skip + 2-layer head, 3 epochs",
+   "hypothesis": "The landing-layer and sealing rule needs AND/OR logic over a footprint's columns. A deeper raw-obs skip MLP and a 2-layer per-type head (hidden 48) give more capacity to learn it exactly. Also has a GroupNorm trunk, dense and factorised heads, orthogonal init and small logits. Recipe: 3 epochs, lr 1e-3, low entropy 0.005, gamma 0.99. Refuted if extra head depth gives 0 while shallow heads score.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {'lr': 0.001, 'n_envs': 256, 'rollout_len': 16, 'n_minibatches': 32, 'ppo_epochs': 3, 'ent_coef': 0.005, 'gamma': 0.99, 'gae_lambda': 0.95, 'clip_eps': 0.2}\n\nCOLW = 48\nSKIP = 32\nSKIP_DEEP = True\nWIDTH = 40\nNBLOCKS = 1\nUSE_TRUNK = True\nPROJ = 24\nHID = 48\nMIX2 = True\nDENSE3 = True\nFLATD = 0\nGLOB = 64\nGROUPS = 8\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    nn.init.zeros_(m.bias)\n    return m\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        nt = len(self.fps)\n        self.nt = nt\n        cin = int(spec.in_channels)\n        g = math.sqrt(2.0)\n        self.col1 = ortho(nn.Conv2d(cin, COLW, 1), g)\n        self.col2 = ortho(nn.Conv2d(COLW, COLW, 1), g)\n        if SKIP_DEEP:\n            self.skip = nn.Sequential(ortho(nn.Conv2d(cin, COLW, 1), g), nn.ReLU(), ortho(nn.Conv2d(COLW, SKIP, 1), g), nn.ReLU())\n        else:\n            self.skip = nn.Sequential(ortho(nn.Conv2d(cin, SKIP, 1), g), nn.ReLU())\n        if USE_TRUNK:\n            self.c0 = ortho(nn.Conv2d(COLW, WIDTH, 3, padding=1), g)\n            self.n0 = nn.GroupNorm(GROUPS, WIDTH)\n            self.blocks = nn.ModuleList([ortho(nn.Conv2d(WIDTH, WIDTH, 3, padding=1), g) for _ in range(NBLOCKS)])\n            self.norms = nn.ModuleList([nn.GroupNorm(GROUPS, WIDTH) for _ in range(NBLOCKS)])\n            fw = WIDTH\n        else:\n            fw = COLW\n        self.proj = ortho(nn.Conv2d(fw, PROJ, 1), g)\n        P = PROJ + SKIP\n        self.mix = nn.ModuleList([ortho(nn.Conv2d(3 * P, HID, 1), g) for _ in self.fps])\n        if MIX2:\n            self.mix2 = nn.ModuleList([ortho(nn.Conv2d(HID, HID, 1), g) for _ in self.fps])\n        self.outs = nn.ModuleList([ortho(nn.Conv2d(HID, 1, 1), 0.01) for _ in self.fps])\n        self.anchor = ortho(nn.Conv2d(P, 1, 1), 0.01)\n        self.type_bias = nn.Parameter(torch.zeros(1, nt, 1, 1))\n        if DENSE3:\n            self.dense3 = ortho(nn.Conv2d(P, nt, 3, padding=1), 0.01)\n        if FLATD > 0:\n            self.flat_in = ortho(nn.Conv2d(P, FLATD, 1), g)\n            self.flat_out = ortho(nn.Linear(FLATD * self.Y * self.X, nt * self.Y * self.X), 0.01)\n        gin = 2 * fw + 2 * P\n        self.glob = nn.Sequential(ortho(nn.Linear(gin, GLOB), g), nn.ReLU())\n        self.ctx = ortho(nn.Linear(GLOB, nt * HID), 1.0)\n        self.done_head = ortho(nn.Linear(GLOB, 1), 0.01)\n        self.value_head = ortho(nn.Linear(GLOB, 1), 1.0)\n\n    def forward(self, obs, mask):\n        B = obs.shape[0]\n        h = F.relu(self.col1(obs))\n        h = F.relu(self.col2(h))\n        s = self.skip(obs)\n        if USE_TRUNK:\n            x = F.relu(self.n0(self.c0(h)))\n            for conv, nrm in zip(self.blocks, self.norms):\n                x = F.relu(x + nrm(conv(x)))\n        else:\n            x = h\n        p = torch.cat([F.relu(self.proj(x)), s], dim=1)\n        gfeat = torch.cat([x.mean((2, 3)), x.amax((2, 3)), p.mean((2, 3)), p.amax((2, 3))], dim=1)\n        g = self.glob(gfeat)\n        ctx = self.ctx(g).view(B, self.nt, HID, 1, 1)\n        res = []\n        for i, (dy, dx) in enumerate(self.fps):\n            if dy * dx == 1:\n                mx, mn, av = p, p, p\n            else:\n                q = F.pad(p, (0, dx - 1, 0, dy - 1))\n                mx = F.max_pool2d(q, (dy, dx), stride=1)\n                mn = -F.max_pool2d(-q, (dy, dx), stride=1)\n                av = F.avg_pool2d(q, (dy, dx), stride=1)\n            hh = F.relu(self.mix[i](torch.cat([mx, mn, av], 1)) + ctx[:, i])\n            if MIX2:\n                hh = F.relu(self.mix2[i](hh))\n            res.append(self.outs[i](hh))\n        place = torch.cat(res, 1) + self.anchor(p) + self.type_bias\n        if DENSE3:\n            place = place + self.dense3(p)\n        place = place.flatten(1)\n        if FLATD > 0:\n            fl = F.relu(self.flat_in(p)).flatten(1)\n            place = place + self.flat_out(fl)\n        logits = torch.cat([place, self.done_head(g)], 1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 108607,
+    "fb_ms": 120.48,
+    "flops_per_sample": 31614720,
+    "flops_ratio": 1.73,
+    "sha": "1bc3d986d4a7824d",
+    "recipe": {
+     "lr": 0.001,
+     "n_envs": 256,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "ppo_epochs": 3,
+     "ent_coef": 0.005,
+     "gamma": 0.99,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "lr": 0.001,
+     "n_envs": 256,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "ppo_epochs": 3,
+     "ent_coef": 0.005,
+     "gamma": 0.99,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.2
+    },
+    "budget": {
+     "allowed_steps": 98552,
+     "n_updates": 24,
+     "batch": 4096,
+     "steps": 98304,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0133,
+     "short_run_updates": 4
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 108607,
+    "flops_ratio": 1.73,
+    "train_steps": 98304,
+    "wall_s": 55.1,
+    "sha": "1bc3d986d4a7824d",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r2c1",
+   "round": 2,
+   "name": "mixer + remap, aligned and flat heads",
+   "hypothesis": "Adds a learned per-input-channel spatial remap (a cell-to-cell linear map per channel), 2 MLP-Mixer blocks (token mixing over cells) and both an aligned footprint head and a per-type cell-to-action head. If the world misaligns the target, build or actions, the remap and mixing can learn the correspondence, and the aligned head still covers the nominal case. 1 epoch, about 370k samples, gamma 0.99. Refuted if training success stays 0.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {'lr': 0.001, 'n_envs': 256, 'rollout_len': 32, 'n_minibatches': 32, 'ppo_epochs': 1, 'ent_coef': 0.01, 'gamma': 0.99, 'gae_lambda': 0.95, 'clip_eps': 0.2}\n\nD = 48\nNMIX = 2\nTOK = 64\nTOKG = 1\nCHMULT = 2\nCHREMAP = True\nGLU = False\nCONV = 0\nGROUPS = 8\nPROJ = 24\nSKIP = 24\nFOOT = True\nHID = 24\nDENSE3 = True\nFLATK = 4\nGLOB = 64\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    nn.init.zeros_(m.bias)\n    return m\n\n\ndef unif(shape, fan_in):\n    b = 1.0 / math.sqrt(fan_in)\n    return nn.Parameter(torch.empty(*shape).uniform_(-b, b))\n\n\nclass TokenMix(nn.Module):\n    def __init__(self, d, n, t, g):\n        super().__init__()\n        self.g = g\n        self.w1 = unif((g, n, t), n)\n        self.b1 = nn.Parameter(torch.zeros(g, 1, t))\n        self.w2 = unif((g, t, n), t)\n        self.b2 = nn.Parameter(torch.zeros(g, 1, n))\n\n    def forward(self, y):\n        B, d, n = y.shape\n        y = y.reshape(B, self.g, d // self.g, n)\n        h = F.gelu(torch.einsum('bgdn,gnt->bgdt', y, self.w1) + self.b1)\n        o = torch.einsum('bgdt,gtn->bgdn', h, self.w2) + self.b2\n        return o.reshape(B, d, n)\n\n\nclass MixBlock(nn.Module):\n    def __init__(self, d, n):\n        super().__init__()\n        self.ln1 = nn.LayerNorm(d)\n        self.tok = TokenMix(d, n, TOK, TOKG)\n        self.ln2 = nn.LayerNorm(d)\n        self.ch1 = nn.Linear(d, CHMULT * d)\n        self.ch2 = nn.Linear(CHMULT * d, d)\n\n    def forward(self, x):\n        y = self.ln1(x).transpose(1, 2)\n        x = x + self.tok(y).transpose(1, 2)\n        x = x + self.ch2(F.gelu(self.ch1(self.ln2(x))))\n        return x\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        N = self.Y * self.X\n        self.N = N\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        nt = len(self.fps)\n        self.nt = nt\n        cin = int(spec.in_channels)\n        g2 = math.sqrt(2.0)\n        sin = cin\n        if CHREMAP:\n            self.remap_w = unif((cin, N, N), N)\n            self.remap_b = nn.Parameter(torch.zeros(cin, N))\n            sin = 2 * cin\n        self.s1 = nn.Linear(sin, 2 * D if GLU else D)\n        self.pos = nn.Parameter(torch.randn(N, D) * 0.02)\n        self.s2 = nn.Linear(D, D)\n        self.blocks = nn.ModuleList([MixBlock(D, N) for _ in range(NMIX)])\n        self.lnf = nn.LayerNorm(D)\n        self.convs = nn.ModuleList([ortho(nn.Conv2d(D, D, 3, padding=1), g2) for _ in range(CONV)])\n        self.norms = nn.ModuleList([nn.GroupNorm(GROUPS, D) for _ in range(CONV)])\n        self.skip = ortho(nn.Conv2d(cin, SKIP, 1), g2)\n        self.proj = ortho(nn.Conv2d(D, PROJ, 1), g2)\n        P = PROJ + SKIP\n        if FOOT:\n            self.mix = nn.ModuleList([ortho(nn.Conv2d(3 * P, HID, 1), g2) for _ in self.fps])\n            self.outs = nn.ModuleList([ortho(nn.Conv2d(HID, 1, 1), 0.01) for _ in self.fps])\n            self.anchor = ortho(nn.Conv2d(P, 1, 1), 0.01)\n            self.ctx = ortho(nn.Linear(GLOB, nt * HID), 1.0)\n        if DENSE3:\n            self.dense3 = ortho(nn.Conv2d(P, nt, 3, padding=1), 0.01)\n        if FLATK > 0:\n            self.flat_in = ortho(nn.Conv2d(P, nt * FLATK, 1), 1.0)\n            self.flat_w = nn.Parameter(torch.randn(nt, FLATK, N, N) * (0.01 / math.sqrt(FLATK * N)))\n        self.type_bias = nn.Parameter(torch.zeros(1, nt, 1, 1))\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * D + 2 * P, GLOB), g2), nn.ReLU())\n        self.done_head = ortho(nn.Linear(GLOB, 1), 0.01)\n        self.value_head = ortho(nn.Linear(GLOB, 1), 1.0)\n\n    def forward(self, obs, mask):\n        B = obs.shape[0]\n        o = obs.flatten(2)\n        if CHREMAP:\n            r = torch.einsum('bcn,cnm->bcm', o, self.remap_w) + self.remap_b\n            z = torch.cat([o, r], 1)\n        else:\n            z = o\n        h = self.s1(z.transpose(1, 2))\n        if GLU:\n            a, b = h.chunk(2, -1)\n            h = a * torch.sigmoid(b)\n        else:\n            h = F.relu(h)\n        h = F.relu(self.s2(h + self.pos))\n        for blk in self.blocks:\n            h = blk(h)\n        h = self.lnf(h)\n        f = h.transpose(1, 2).reshape(B, D, self.Y, self.X)\n        for conv, nrm in zip(self.convs, self.norms):\n            f = F.relu(f + nrm(conv(f)))\n        s = F.relu(self.skip(obs))\n        p = torch.cat([F.relu(self.proj(f)), s], 1)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3)), p.mean((2, 3)), p.amax((2, 3))], 1))\n        place = self.type_bias.expand(B, self.nt, self.Y, self.X)\n        if FOOT:\n            ctx = self.ctx(g).view(B, self.nt, HID, 1, 1)\n            res = []\n            for i, (dy, dx) in enumerate(self.fps):\n                if dy * dx == 1:\n                    mx, mn, av = p, p, p\n                else:\n                    q = F.pad(p, (0, dx - 1, 0, dy - 1))\n                    mx = F.max_pool2d(q, (dy, dx), stride=1)\n                    mn = -F.max_pool2d(-q, (dy, dx), stride=1)\n                    av = F.avg_pool2d(q, (dy, dx), stride=1)\n                hh = F.relu(self.mix[i](torch.cat([mx, mn, av], 1)) + ctx[:, i])\n                res.append(self.outs[i](hh))\n            place = place + torch.cat(res, 1) + self.anchor(p)\n        if DENSE3:\n            place = place + self.dense3(p)\n        place = place.reshape(B, -1)\n        if FLATK > 0:\n            q = self.flat_in(p).reshape(B, self.nt, FLATK, self.N)\n            place = place + torch.einsum('btkn,tknm->btm', q, self.flat_w).reshape(B, -1)\n        logits = torch.cat([place, self.done_head(g)], 1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 258919,
+    "fb_ms": 80.36,
+    "flops_per_sample": 21553920,
+    "flops_ratio": 1.18,
+    "sha": "d485d6f964855863",
+    "recipe": {
+     "lr": 0.001,
+     "n_envs": 256,
+     "rollout_len": 32,
+     "n_minibatches": 32,
+     "ppo_epochs": 1,
+     "ent_coef": 0.01,
+     "gamma": 0.99,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "lr": 0.001,
+     "n_envs": 256,
+     "rollout_len": 32,
+     "n_minibatches": 32,
+     "ppo_epochs": 1,
+     "ent_coef": 0.01,
+     "gamma": 0.99,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.2
+    },
+    "budget": {
+     "allowed_steps": 361384,
+     "n_updates": 44,
+     "batch": 8192,
+     "steps": 360448,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0168
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0008,
+     "short_run_updates": 6
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 258919,
+    "flops_ratio": 1.18,
+    "train_steps": 360448,
+    "wall_s": 97.7,
+    "sha": "d485d6f964855863",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r2c2",
+   "round": 2,
+   "name": "pure layout-free mixer, 2 epochs",
+   "hypothesis": "Bets fully on misalignment: there are no aligned conv or footprint heads. A per-channel spatial remap, 3 Mixer blocks and a per-type learned cell-to-action map (8 channels) produce every placement logit, so any fixed permutation between the obs and the actions can be learned with shared weights. 2 epochs, lr 7e-4. If it scores while the aligned candidates score 0, the world breaks alignment. Refuted if it scores 0 and an aligned candidate scores.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {'lr': 0.0007, 'n_envs': 256, 'rollout_len': 16, 'n_minibatches': 16, 'ppo_epochs': 2, 'ent_coef': 0.01, 'gamma': 0.99, 'gae_lambda': 0.95, 'clip_eps': 0.2}\n\nD = 48\nNMIX = 3\nTOK = 64\nTOKG = 1\nCHMULT = 2\nCHREMAP = True\nGLU = False\nCONV = 0\nGROUPS = 8\nPROJ = 24\nSKIP = 24\nFOOT = False\nHID = 24\nDENSE3 = False\nFLATK = 8\nGLOB = 64\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    nn.init.zeros_(m.bias)\n    return m\n\n\ndef unif(shape, fan_in):\n    b = 1.0 / math.sqrt(fan_in)\n    return nn.Parameter(torch.empty(*shape).uniform_(-b, b))\n\n\nclass TokenMix(nn.Module):\n    def __init__(self, d, n, t, g):\n        super().__init__()\n        self.g = g\n        self.w1 = unif((g, n, t), n)\n        self.b1 = nn.Parameter(torch.zeros(g, 1, t))\n        self.w2 = unif((g, t, n), t)\n        self.b2 = nn.Parameter(torch.zeros(g, 1, n))\n\n    def forward(self, y):\n        B, d, n = y.shape\n        y = y.reshape(B, self.g, d // self.g, n)\n        h = F.gelu(torch.einsum('bgdn,gnt->bgdt', y, self.w1) + self.b1)\n        o = torch.einsum('bgdt,gtn->bgdn', h, self.w2) + self.b2\n        return o.reshape(B, d, n)\n\n\nclass MixBlock(nn.Module):\n    def __init__(self, d, n):\n        super().__init__()\n        self.ln1 = nn.LayerNorm(d)\n        self.tok = TokenMix(d, n, TOK, TOKG)\n        self.ln2 = nn.LayerNorm(d)\n        self.ch1 = nn.Linear(d, CHMULT * d)\n        self.ch2 = nn.Linear(CHMULT * d, d)\n\n    def forward(self, x):\n        y = self.ln1(x).transpose(1, 2)\n        x = x + self.tok(y).transpose(1, 2)\n        x = x + self.ch2(F.gelu(self.ch1(self.ln2(x))))\n        return x\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        N = self.Y * self.X\n        self.N = N\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        nt = len(self.fps)\n        self.nt = nt\n        cin = int(spec.in_channels)\n        g2 = math.sqrt(2.0)\n        sin = cin\n        if CHREMAP:\n            self.remap_w = unif((cin, N, N), N)\n            self.remap_b = nn.Parameter(torch.zeros(cin, N))\n            sin = 2 * cin\n        self.s1 = nn.Linear(sin, 2 * D if GLU else D)\n        self.pos = nn.Parameter(torch.randn(N, D) * 0.02)\n        self.s2 = nn.Linear(D, D)\n        self.blocks = nn.ModuleList([MixBlock(D, N) for _ in range(NMIX)])\n        self.lnf = nn.LayerNorm(D)\n        self.convs = nn.ModuleList([ortho(nn.Conv2d(D, D, 3, padding=1), g2) for _ in range(CONV)])\n        self.norms = nn.ModuleList([nn.GroupNorm(GROUPS, D) for _ in range(CONV)])\n        self.skip = ortho(nn.Conv2d(cin, SKIP, 1), g2)\n        self.proj = ortho(nn.Conv2d(D, PROJ, 1), g2)\n        P = PROJ + SKIP\n        if FOOT:\n            self.mix = nn.ModuleList([ortho(nn.Conv2d(3 * P, HID, 1), g2) for _ in self.fps])\n            self.outs = nn.ModuleList([ortho(nn.Conv2d(HID, 1, 1), 0.01) for _ in self.fps])\n            self.anchor = ortho(nn.Conv2d(P, 1, 1), 0.01)\n            self.ctx = ortho(nn.Linear(GLOB, nt * HID), 1.0)\n        if DENSE3:\n            self.dense3 = ortho(nn.Conv2d(P, nt, 3, padding=1), 0.01)\n        if FLATK > 0:\n            self.flat_in = ortho(nn.Conv2d(P, nt * FLATK, 1), 1.0)\n            self.flat_w = nn.Parameter(torch.randn(nt, FLATK, N, N) * (0.01 / math.sqrt(FLATK * N)))\n        self.type_bias = nn.Parameter(torch.zeros(1, nt, 1, 1))\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * D + 2 * P, GLOB), g2), nn.ReLU())\n        self.done_head = ortho(nn.Linear(GLOB, 1), 0.01)\n        self.value_head = ortho(nn.Linear(GLOB, 1), 1.0)\n\n    def forward(self, obs, mask):\n        B = obs.shape[0]\n        o = obs.flatten(2)\n        if CHREMAP:\n            r = torch.einsum('bcn,cnm->bcm', o, self.remap_w) + self.remap_b\n            z = torch.cat([o, r], 1)\n        else:\n            z = o\n        h = self.s1(z.transpose(1, 2))\n        if GLU:\n            a, b = h.chunk(2, -1)\n            h = a * torch.sigmoid(b)\n        else:\n            h = F.relu(h)\n        h = F.relu(self.s2(h + self.pos))\n        for blk in self.blocks:\n            h = blk(h)\n        h = self.lnf(h)\n        f = h.transpose(1, 2).reshape(B, D, self.Y, self.X)\n        for conv, nrm in zip(self.convs, self.norms):\n            f = F.relu(f + nrm(conv(f)))\n        s = F.relu(self.skip(obs))\n        p = torch.cat([F.relu(self.proj(f)), s], 1)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3)), p.mean((2, 3)), p.amax((2, 3))], 1))\n        place = self.type_bias.expand(B, self.nt, self.Y, self.X)\n        if FOOT:\n            ctx = self.ctx(g).view(B, self.nt, HID, 1, 1)\n            res = []\n            for i, (dy, dx) in enumerate(self.fps):\n                if dy * dx == 1:\n                    mx, mn, av = p, p, p\n                else:\n                    q = F.pad(p, (0, dx - 1, 0, dy - 1))\n                    mx = F.max_pool2d(q, (dy, dx), stride=1)\n                    mn = -F.max_pool2d(-q, (dy, dx), stride=1)\n                    av = F.avg_pool2d(q, (dy, dx), stride=1)\n                hh = F.relu(self.mix[i](torch.cat([mx, mn, av], 1)) + ctx[:, i])\n                res.append(self.outs[i](hh))\n            place = place + torch.cat(res, 1) + self.anchor(p)\n        if DENSE3:\n            place = place + self.dense3(p)\n        place = place.reshape(B, -1)\n        if FLATK > 0:\n            q = self.flat_in(p).reshape(B, self.nt, FLATK, self.N)\n            place = place + torch.einsum('btkn,tknm->btm', q, self.flat_w).reshape(B, -1)\n        logits = torch.cat([place, self.done_head(g)], 1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 321070,
+    "fb_ms": 28.79,
+    "flops_per_sample": 22076160,
+    "flops_ratio": 1.21,
+    "sha": "8ccbcd044a6730a1",
+    "recipe": {
+     "lr": 0.0007,
+     "n_envs": 256,
+     "rollout_len": 16,
+     "n_minibatches": 16,
+     "ppo_epochs": 2,
+     "ent_coef": 0.01,
+     "gamma": 0.99,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "lr": 0.0007,
+     "n_envs": 256,
+     "rollout_len": 16,
+     "n_minibatches": 16,
+     "ppo_epochs": 2,
+     "ent_coef": 0.01,
+     "gamma": 0.99,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.2
+    },
+    "budget": {
+     "allowed_steps": 201620,
+     "n_updates": 49,
+     "batch": 4096,
+     "steps": 200704,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0077
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0128,
+     "short_run_updates": 6
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 321070,
+    "flops_ratio": 1.21,
+    "train_steps": 200704,
+    "wall_s": 60.5,
+    "sha": "8ccbcd044a6730a1",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r2c3",
+   "round": 2,
+   "name": "everything: GLU, remap, mixer, conv",
+   "hypothesis": "The 'everything plausible' stack. A gated (GLU) column stem for multiplicative AND-like logic, a per-channel spatial remap, 1 Mixer block for global alignment, a GroupNorm 3x3 residual block for local detail, plus aligned footprint, dense 3x3 and per-type flat heads, all with init hygiene. 1 epoch, lr 1.5e-3, gamma 0.99. Refuted if training success stays 0 while a simpler candidate scores.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {'lr': 0.0015, 'n_envs': 256, 'rollout_len': 32, 'n_minibatches': 32, 'ppo_epochs': 1, 'ent_coef': 0.01, 'gamma': 0.99, 'gae_lambda': 0.95, 'clip_eps': 0.2}\n\nD = 48\nNMIX = 1\nTOK = 64\nTOKG = 1\nCHMULT = 2\nCHREMAP = True\nGLU = True\nCONV = 1\nGROUPS = 8\nPROJ = 24\nSKIP = 24\nFOOT = True\nHID = 24\nDENSE3 = True\nFLATK = 4\nGLOB = 64\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    nn.init.zeros_(m.bias)\n    return m\n\n\ndef unif(shape, fan_in):\n    b = 1.0 / math.sqrt(fan_in)\n    return nn.Parameter(torch.empty(*shape).uniform_(-b, b))\n\n\nclass TokenMix(nn.Module):\n    def __init__(self, d, n, t, g):\n        super().__init__()\n        self.g = g\n        self.w1 = unif((g, n, t), n)\n        self.b1 = nn.Parameter(torch.zeros(g, 1, t))\n        self.w2 = unif((g, t, n), t)\n        self.b2 = nn.Parameter(torch.zeros(g, 1, n))\n\n    def forward(self, y):\n        B, d, n = y.shape\n        y = y.reshape(B, self.g, d // self.g, n)\n        h = F.gelu(torch.einsum('bgdn,gnt->bgdt', y, self.w1) + self.b1)\n        o = torch.einsum('bgdt,gtn->bgdn', h, self.w2) + self.b2\n        return o.reshape(B, d, n)\n\n\nclass MixBlock(nn.Module):\n    def __init__(self, d, n):\n        super().__init__()\n        self.ln1 = nn.LayerNorm(d)\n        self.tok = TokenMix(d, n, TOK, TOKG)\n        self.ln2 = nn.LayerNorm(d)\n        self.ch1 = nn.Linear(d, CHMULT * d)\n        self.ch2 = nn.Linear(CHMULT * d, d)\n\n    def forward(self, x):\n        y = self.ln1(x).transpose(1, 2)\n        x = x + self.tok(y).transpose(1, 2)\n        x = x + self.ch2(F.gelu(self.ch1(self.ln2(x))))\n        return x\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        N = self.Y * self.X\n        self.N = N\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        nt = len(self.fps)\n        self.nt = nt\n        cin = int(spec.in_channels)\n        g2 = math.sqrt(2.0)\n        sin = cin\n        if CHREMAP:\n            self.remap_w = unif((cin, N, N), N)\n            self.remap_b = nn.Parameter(torch.zeros(cin, N))\n            sin = 2 * cin\n        self.s1 = nn.Linear(sin, 2 * D if GLU else D)\n        self.pos = nn.Parameter(torch.randn(N, D) * 0.02)\n        self.s2 = nn.Linear(D, D)\n        self.blocks = nn.ModuleList([MixBlock(D, N) for _ in range(NMIX)])\n        self.lnf = nn.LayerNorm(D)\n        self.convs = nn.ModuleList([ortho(nn.Conv2d(D, D, 3, padding=1), g2) for _ in range(CONV)])\n        self.norms = nn.ModuleList([nn.GroupNorm(GROUPS, D) for _ in range(CONV)])\n        self.skip = ortho(nn.Conv2d(cin, SKIP, 1), g2)\n        self.proj = ortho(nn.Conv2d(D, PROJ, 1), g2)\n        P = PROJ + SKIP\n        if FOOT:\n            self.mix = nn.ModuleList([ortho(nn.Conv2d(3 * P, HID, 1), g2) for _ in self.fps])\n            self.outs = nn.ModuleList([ortho(nn.Conv2d(HID, 1, 1), 0.01) for _ in self.fps])\n            self.anchor = ortho(nn.Conv2d(P, 1, 1), 0.01)\n            self.ctx = ortho(nn.Linear(GLOB, nt * HID), 1.0)\n        if DENSE3:\n            self.dense3 = ortho(nn.Conv2d(P, nt, 3, padding=1), 0.01)\n        if FLATK > 0:\n            self.flat_in = ortho(nn.Conv2d(P, nt * FLATK, 1), 1.0)\n            self.flat_w = nn.Parameter(torch.randn(nt, FLATK, N, N) * (0.01 / math.sqrt(FLATK * N)))\n        self.type_bias = nn.Parameter(torch.zeros(1, nt, 1, 1))\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * D + 2 * P, GLOB), g2), nn.ReLU())\n        self.done_head = ortho(nn.Linear(GLOB, 1), 0.01)\n        self.value_head = ortho(nn.Linear(GLOB, 1), 1.0)\n\n    def forward(self, obs, mask):\n        B = obs.shape[0]\n        o = obs.flatten(2)\n        if CHREMAP:\n            r = torch.einsum('bcn,cnm->bcm', o, self.remap_w) + self.remap_b\n            z = torch.cat([o, r], 1)\n        else:\n            z = o\n        h = self.s1(z.transpose(1, 2))\n        if GLU:\n            a, b = h.chunk(2, -1)\n            h = a * torch.sigmoid(b)\n        else:\n            h = F.relu(h)\n        h = F.relu(self.s2(h + self.pos))\n        for blk in self.blocks:\n            h = blk(h)\n        h = self.lnf(h)\n        f = h.transpose(1, 2).reshape(B, D, self.Y, self.X)\n        for conv, nrm in zip(self.convs, self.norms):\n            f = F.relu(f + nrm(conv(f)))\n        s = F.relu(self.skip(obs))\n        p = torch.cat([F.relu(self.proj(f)), s], 1)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3)), p.mean((2, 3)), p.amax((2, 3))], 1))\n        place = self.type_bias.expand(B, self.nt, self.Y, self.X)\n        if FOOT:\n            ctx = self.ctx(g).view(B, self.nt, HID, 1, 1)\n            res = []\n            for i, (dy, dx) in enumerate(self.fps):\n                if dy * dx == 1:\n                    mx, mn, av = p, p, p\n                else:\n                    q = F.pad(p, (0, dx - 1, 0, dy - 1))\n                    mx = F.max_pool2d(q, (dy, dx), stride=1)\n                    mn = -F.max_pool2d(-q, (dy, dx), stride=1)\n                    av = F.avg_pool2d(q, (dy, dx), stride=1)\n                hh = F.relu(self.mix[i](torch.cat([mx, mn, av], 1)) + ctx[:, i])\n                res.append(self.outs[i](hh))\n            place = place + torch.cat(res, 1) + self.anchor(p)\n        if DENSE3:\n            place = place + self.dense3(p)\n        place = place.reshape(B, -1)\n        if FLATK > 0:\n            q = self.flat_in(p).reshape(B, self.nt, FLATK, self.N)\n            place = place + torch.einsum('btkn,tknm->btm', q, self.flat_w).reshape(B, -1)\n        logits = torch.cat([place, self.done_head(g)], 1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 264567,
+    "fb_ms": 82.53,
+    "flops_per_sample": 24613632,
+    "flops_ratio": 1.35,
+    "sha": "c5caacebaa44c7e2",
+    "recipe": {
+     "lr": 0.0015,
+     "n_envs": 256,
+     "rollout_len": 32,
+     "n_minibatches": 32,
+     "ppo_epochs": 1,
+     "ent_coef": 0.01,
+     "gamma": 0.99,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "lr": 0.0015,
+     "n_envs": 256,
+     "rollout_len": 32,
+     "n_minibatches": 32,
+     "ppo_epochs": 1,
+     "ent_coef": 0.01,
+     "gamma": 0.99,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.2
+    },
+    "budget": {
+     "allowed_steps": 316460,
+     "n_updates": 38,
+     "batch": 8192,
+     "steps": 311296,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0097
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 5
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 264567,
+    "flops_ratio": 1.35,
+    "train_steps": 311296,
+    "wall_s": 96.8,
+    "sha": "c5caacebaa44c7e2",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r2c4",
+   "round": 2,
+   "name": "GLU column net, long horizon",
+   "hypothesis": "Tests multiplicative inductive bias, which has not been tried. A wide gated (GLU) per-column stem lets products of target and build features form the 'this layer is missing and the cells below are settled' conjunctions directly. The column features are then pooled over each footprint. No spatial mixing, r below 1, so about 426k samples. Recipe: 512 envs, lr 2e-3, gamma 0.995, clip 0.3, low entropy. Refuted if it stays at 0 like the earlier ReLU column MLP.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {'lr': 0.002, 'n_envs': 512, 'rollout_len': 32, 'n_minibatches': 64, 'ppo_epochs': 1, 'ent_coef': 0.005, 'gamma': 0.995, 'gae_lambda': 0.95, 'clip_eps': 0.3}\n\nD = 96\nNMIX = 0\nTOK = 64\nTOKG = 1\nCHMULT = 2\nCHREMAP = False\nGLU = True\nCONV = 0\nGROUPS = 8\nPROJ = 32\nSKIP = 32\nFOOT = True\nHID = 32\nDENSE3 = True\nFLATK = 0\nGLOB = 64\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    nn.init.zeros_(m.bias)\n    return m\n\n\ndef unif(shape, fan_in):\n    b = 1.0 / math.sqrt(fan_in)\n    return nn.Parameter(torch.empty(*shape).uniform_(-b, b))\n\n\nclass TokenMix(nn.Module):\n    def __init__(self, d, n, t, g):\n        super().__init__()\n        self.g = g\n        self.w1 = unif((g, n, t), n)\n        self.b1 = nn.Parameter(torch.zeros(g, 1, t))\n        self.w2 = unif((g, t, n), t)\n        self.b2 = nn.Parameter(torch.zeros(g, 1, n))\n\n    def forward(self, y):\n        B, d, n = y.shape\n        y = y.reshape(B, self.g, d // self.g, n)\n        h = F.gelu(torch.einsum('bgdn,gnt->bgdt', y, self.w1) + self.b1)\n        o = torch.einsum('bgdt,gtn->bgdn', h, self.w2) + self.b2\n        return o.reshape(B, d, n)\n\n\nclass MixBlock(nn.Module):\n    def __init__(self, d, n):\n        super().__init__()\n        self.ln1 = nn.LayerNorm(d)\n        self.tok = TokenMix(d, n, TOK, TOKG)\n        self.ln2 = nn.LayerNorm(d)\n        self.ch1 = nn.Linear(d, CHMULT * d)\n        self.ch2 = nn.Linear(CHMULT * d, d)\n\n    def forward(self, x):\n        y = self.ln1(x).transpose(1, 2)\n        x = x + self.tok(y).transpose(1, 2)\n        x = x + self.ch2(F.gelu(self.ch1(self.ln2(x))))\n        return x\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        N = self.Y * self.X\n        self.N = N\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        nt = len(self.fps)\n        self.nt = nt\n        cin = int(spec.in_channels)\n        g2 = math.sqrt(2.0)\n        sin = cin\n        if CHREMAP:\n            self.remap_w = unif((cin, N, N), N)\n            self.remap_b = nn.Parameter(torch.zeros(cin, N))\n            sin = 2 * cin\n        self.s1 = nn.Linear(sin, 2 * D if GLU else D)\n        self.pos = nn.Parameter(torch.randn(N, D) * 0.02)\n        self.s2 = nn.Linear(D, D)\n        self.blocks = nn.ModuleList([MixBlock(D, N) for _ in range(NMIX)])\n        self.lnf = nn.LayerNorm(D)\n        self.convs = nn.ModuleList([ortho(nn.Conv2d(D, D, 3, padding=1), g2) for _ in range(CONV)])\n        self.norms = nn.ModuleList([nn.GroupNorm(GROUPS, D) for _ in range(CONV)])\n        self.skip = ortho(nn.Conv2d(cin, SKIP, 1), g2)\n        self.proj = ortho(nn.Conv2d(D, PROJ, 1), g2)\n        P = PROJ + SKIP\n        if FOOT:\n            self.mix = nn.ModuleList([ortho(nn.Conv2d(3 * P, HID, 1), g2) for _ in self.fps])\n            self.outs = nn.ModuleList([ortho(nn.Conv2d(HID, 1, 1), 0.01) for _ in self.fps])\n            self.anchor = ortho(nn.Conv2d(P, 1, 1), 0.01)\n            self.ctx = ortho(nn.Linear(GLOB, nt * HID), 1.0)\n        if DENSE3:\n            self.dense3 = ortho(nn.Conv2d(P, nt, 3, padding=1), 0.01)\n        if FLATK > 0:\n            self.flat_in = ortho(nn.Conv2d(P, nt * FLATK, 1), 1.0)\n            self.flat_w = nn.Parameter(torch.randn(nt, FLATK, N, N) * (0.01 / math.sqrt(FLATK * N)))\n        self.type_bias = nn.Parameter(torch.zeros(1, nt, 1, 1))\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * D + 2 * P, GLOB), g2), nn.ReLU())\n        self.done_head = ortho(nn.Linear(GLOB, 1), 0.01)\n        self.value_head = ortho(nn.Linear(GLOB, 1), 1.0)\n\n    def forward(self, obs, mask):\n        B = obs.shape[0]\n        o = obs.flatten(2)\n        if CHREMAP:\n            r = torch.einsum('bcn,cnm->bcm', o, self.remap_w) + self.remap_b\n            z = torch.cat([o, r], 1)\n        else:\n            z = o\n        h = self.s1(z.transpose(1, 2))\n        if GLU:\n            a, b = h.chunk(2, -1)\n            h = a * torch.sigmoid(b)\n        else:\n            h = F.relu(h)\n        h = F.relu(self.s2(h + self.pos))\n        for blk in self.blocks:\n            h = blk(h)\n        h = self.lnf(h)\n        f = h.transpose(1, 2).reshape(B, D, self.Y, self.X)\n        for conv, nrm in zip(self.convs, self.norms):\n            f = F.relu(f + nrm(conv(f)))\n        s = F.relu(self.skip(obs))\n        p = torch.cat([F.relu(self.proj(f)), s], 1)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3)), p.mean((2, 3)), p.amax((2, 3))], 1))\n        place = self.type_bias.expand(B, self.nt, self.Y, self.X)\n        if FOOT:\n            ctx = self.ctx(g).view(B, self.nt, HID, 1, 1)\n            res = []\n            for i, (dy, dx) in enumerate(self.fps):\n                if dy * dx == 1:\n                    mx, mn, av = p, p, p\n                else:\n                    q = F.pad(p, (0, dx - 1, 0, dy - 1))\n                    mx = F.max_pool2d(q, (dy, dx), stride=1)\n                    mn = -F.max_pool2d(-q, (dy, dx), stride=1)\n                    av = F.avg_pool2d(q, (dy, dx), stride=1)\n                hh = F.relu(self.mix[i](torch.cat([mx, mn, av], 1)) + ctx[:, i])\n                res.append(self.outs[i](hh))\n            place = place + torch.cat(res, 1) + self.anchor(p)\n        if DENSE3:\n            place = place + self.dense3(p)\n        place = place.reshape(B, -1)\n        if FLATK > 0:\n            q = self.flat_in(p).reshape(B, self.nt, FLATK, self.N)\n            place = place + torch.einsum('btkn,tknm->btm', q, self.flat_w).reshape(B, -1)\n        logits = torch.cat([place, self.done_head(g)], 1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 81231,
+    "fb_ms": 90.14,
+    "flops_per_sample": 16835328,
+    "flops_ratio": 0.92,
+    "sha": "704051b2c641b372",
+    "recipe": {
+     "lr": 0.002,
+     "n_envs": 512,
+     "rollout_len": 32,
+     "n_minibatches": 64,
+     "ppo_epochs": 1,
+     "ent_coef": 0.005,
+     "gamma": 0.995,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.3
+    },
+    "recipe_from_file": {
+     "lr": 0.002,
+     "n_envs": 512,
+     "rollout_len": 32,
+     "n_minibatches": 64,
+     "ppo_epochs": 1,
+     "ent_coef": 0.005,
+     "gamma": 0.995,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.3
+    },
+    "budget": {
+     "allowed_steps": 425984,
+     "n_updates": 26,
+     "batch": 16384,
+     "steps": 425984,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0074
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0134,
+     "short_run_updates": 8
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 81231,
+    "flops_ratio": 0.92,
+    "train_steps": 425984,
+    "wall_s": 102.3,
+    "sha": "704051b2c641b372",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r2c5",
+   "round": 2,
+   "name": "small mixer, huge batches, lr 3e-3",
+   "hypothesis": "A small mixer (width 32, r below 1) with the remap and all heads gets the maximum of about 426k samples, collected as 16k-sample updates from 1,024 parallel worlds. This lowers gradient noise for the rare exact-build bonus. lr 3e-3, clip 0.3, entropy 0.02 to keep exploring. Tests whether the mixer family is held back by sample count rather than capacity. Refuted if it is 0 while the wider mixers score.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {'lr': 0.003, 'n_envs': 1024, 'rollout_len': 16, 'n_minibatches': 32, 'ppo_epochs': 1, 'ent_coef': 0.02, 'gamma': 0.99, 'gae_lambda': 0.95, 'clip_eps': 0.3}\n\nD = 32\nNMIX = 2\nTOK = 32\nTOKG = 1\nCHMULT = 2\nCHREMAP = True\nGLU = False\nCONV = 0\nGROUPS = 8\nPROJ = 16\nSKIP = 16\nFOOT = True\nHID = 16\nDENSE3 = True\nFLATK = 2\nGLOB = 64\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    nn.init.zeros_(m.bias)\n    return m\n\n\ndef unif(shape, fan_in):\n    b = 1.0 / math.sqrt(fan_in)\n    return nn.Parameter(torch.empty(*shape).uniform_(-b, b))\n\n\nclass TokenMix(nn.Module):\n    def __init__(self, d, n, t, g):\n        super().__init__()\n        self.g = g\n        self.w1 = unif((g, n, t), n)\n        self.b1 = nn.Parameter(torch.zeros(g, 1, t))\n        self.w2 = unif((g, t, n), t)\n        self.b2 = nn.Parameter(torch.zeros(g, 1, n))\n\n    def forward(self, y):\n        B, d, n = y.shape\n        y = y.reshape(B, self.g, d // self.g, n)\n        h = F.gelu(torch.einsum('bgdn,gnt->bgdt', y, self.w1) + self.b1)\n        o = torch.einsum('bgdt,gtn->bgdn', h, self.w2) + self.b2\n        return o.reshape(B, d, n)\n\n\nclass MixBlock(nn.Module):\n    def __init__(self, d, n):\n        super().__init__()\n        self.ln1 = nn.LayerNorm(d)\n        self.tok = TokenMix(d, n, TOK, TOKG)\n        self.ln2 = nn.LayerNorm(d)\n        self.ch1 = nn.Linear(d, CHMULT * d)\n        self.ch2 = nn.Linear(CHMULT * d, d)\n\n    def forward(self, x):\n        y = self.ln1(x).transpose(1, 2)\n        x = x + self.tok(y).transpose(1, 2)\n        x = x + self.ch2(F.gelu(self.ch1(self.ln2(x))))\n        return x\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        N = self.Y * self.X\n        self.N = N\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        nt = len(self.fps)\n        self.nt = nt\n        cin = int(spec.in_channels)\n        g2 = math.sqrt(2.0)\n        sin = cin\n        if CHREMAP:\n            self.remap_w = unif((cin, N, N), N)\n            self.remap_b = nn.Parameter(torch.zeros(cin, N))\n            sin = 2 * cin\n        self.s1 = nn.Linear(sin, 2 * D if GLU else D)\n        self.pos = nn.Parameter(torch.randn(N, D) * 0.02)\n        self.s2 = nn.Linear(D, D)\n        self.blocks = nn.ModuleList([MixBlock(D, N) for _ in range(NMIX)])\n        self.lnf = nn.LayerNorm(D)\n        self.convs = nn.ModuleList([ortho(nn.Conv2d(D, D, 3, padding=1), g2) for _ in range(CONV)])\n        self.norms = nn.ModuleList([nn.GroupNorm(GROUPS, D) for _ in range(CONV)])\n        self.skip = ortho(nn.Conv2d(cin, SKIP, 1), g2)\n        self.proj = ortho(nn.Conv2d(D, PROJ, 1), g2)\n        P = PROJ + SKIP\n        if FOOT:\n            self.mix = nn.ModuleList([ortho(nn.Conv2d(3 * P, HID, 1), g2) for _ in self.fps])\n            self.outs = nn.ModuleList([ortho(nn.Conv2d(HID, 1, 1), 0.01) for _ in self.fps])\n            self.anchor = ortho(nn.Conv2d(P, 1, 1), 0.01)\n            self.ctx = ortho(nn.Linear(GLOB, nt * HID), 1.0)\n        if DENSE3:\n            self.dense3 = ortho(nn.Conv2d(P, nt, 3, padding=1), 0.01)\n        if FLATK > 0:\n            self.flat_in = ortho(nn.Conv2d(P, nt * FLATK, 1), 1.0)\n            self.flat_w = nn.Parameter(torch.randn(nt, FLATK, N, N) * (0.01 / math.sqrt(FLATK * N)))\n        self.type_bias = nn.Parameter(torch.zeros(1, nt, 1, 1))\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * D + 2 * P, GLOB), g2), nn.ReLU())\n        self.done_head = ortho(nn.Linear(GLOB, 1), 0.01)\n        self.value_head = ortho(nn.Linear(GLOB, 1), 1.0)\n\n    def forward(self, obs, mask):\n        B = obs.shape[0]\n        o = obs.flatten(2)\n        if CHREMAP:\n            r = torch.einsum('bcn,cnm->bcm', o, self.remap_w) + self.remap_b\n            z = torch.cat([o, r], 1)\n        else:\n            z = o\n        h = self.s1(z.transpose(1, 2))\n        if GLU:\n            a, b = h.chunk(2, -1)\n            h = a * torch.sigmoid(b)\n        else:\n            h = F.relu(h)\n        h = F.relu(self.s2(h + self.pos))\n        for blk in self.blocks:\n            h = blk(h)\n        h = self.lnf(h)\n        f = h.transpose(1, 2).reshape(B, D, self.Y, self.X)\n        for conv, nrm in zip(self.convs, self.norms):\n            f = F.relu(f + nrm(conv(f)))\n        s = F.relu(self.skip(obs))\n        p = torch.cat([F.relu(self.proj(f)), s], 1)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3)), p.mean((2, 3)), p.amax((2, 3))], 1))\n        place = self.type_bias.expand(B, self.nt, self.Y, self.X)\n        if FOOT:\n            ctx = self.ctx(g).view(B, self.nt, HID, 1, 1)\n            res = []\n            for i, (dy, dx) in enumerate(self.fps):\n                if dy * dx == 1:\n                    mx, mn, av = p, p, p\n                else:\n                    q = F.pad(p, (0, dx - 1, 0, dy - 1))\n                    mx = F.max_pool2d(q, (dy, dx), stride=1)\n                    mn = -F.max_pool2d(-q, (dy, dx), stride=1)\n                    av = F.avg_pool2d(q, (dy, dx), stride=1)\n                hh = F.relu(self.mix[i](torch.cat([mx, mn, av], 1)) + ctx[:, i])\n                res.append(self.outs[i](hh))\n            place = place + torch.cat(res, 1) + self.anchor(p)\n        if DENSE3:\n            place = place + self.dense3(p)\n        place = place.reshape(B, -1)\n        if FLATK > 0:\n            q = self.flat_in(p).reshape(B, self.nt, FLATK, self.N)\n            place = place + torch.einsum('btkn,tknm->btm', q, self.flat_w).reshape(B, -1)\n        logits = torch.cat([place, self.done_head(g)], 1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 188295,
+    "fb_ms": 51.88,
+    "flops_per_sample": 9732864,
+    "flops_ratio": 0.53,
+    "sha": "8e0cb8b787b847b9",
+    "recipe": {
+     "lr": 0.003,
+     "n_envs": 1024,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "ppo_epochs": 1,
+     "ent_coef": 0.02,
+     "gamma": 0.99,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.3
+    },
+    "recipe_from_file": {
+     "lr": 0.003,
+     "n_envs": 1024,
+     "rollout_len": 16,
+     "n_minibatches": 32,
+     "ppo_epochs": 1,
+     "ent_coef": 0.02,
+     "gamma": 0.99,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.3
+    },
+    "budget": {
+     "allowed_steps": 425984,
+     "n_updates": 26,
+     "batch": 16384,
+     "steps": 425984,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0081
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0005,
+     "short_run_updates": 8
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 188295,
+    "flops_ratio": 0.53,
+    "train_steps": 425984,
+    "wall_s": 83.0,
+    "sha": "8e0cb8b787b847b9",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r2c6",
+   "round": 2,
+   "name": "grouped token mixer, 2 epochs",
+   "hypothesis": "A wider mixer (width 64) whose token mixing is split into 4 channel groups, each with its own spatial map. Different feature groups (for example, target-derived and build-derived) can then be realigned separately when the world misaligns them differently. Has the remap and all heads. Recipe: 2 epochs, lr 1e-3, default gamma 0.95 and lambda 0.9 for low-variance credit assignment. Refuted if it is 0 while the shared-mixing candidates score.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {'lr': 0.001, 'n_envs': 256, 'rollout_len': 16, 'n_minibatches': 16, 'ppo_epochs': 2, 'ent_coef': 0.01, 'gamma': 0.95, 'gae_lambda': 0.9, 'clip_eps': 0.2}\n\nD = 64\nNMIX = 2\nTOK = 64\nTOKG = 4\nCHMULT = 1\nCHREMAP = True\nGLU = False\nCONV = 0\nGROUPS = 8\nPROJ = 24\nSKIP = 24\nFOOT = True\nHID = 24\nDENSE3 = True\nFLATK = 4\nGLOB = 64\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    nn.init.zeros_(m.bias)\n    return m\n\n\ndef unif(shape, fan_in):\n    b = 1.0 / math.sqrt(fan_in)\n    return nn.Parameter(torch.empty(*shape).uniform_(-b, b))\n\n\nclass TokenMix(nn.Module):\n    def __init__(self, d, n, t, g):\n        super().__init__()\n        self.g = g\n        self.w1 = unif((g, n, t), n)\n        self.b1 = nn.Parameter(torch.zeros(g, 1, t))\n        self.w2 = unif((g, t, n), t)\n        self.b2 = nn.Parameter(torch.zeros(g, 1, n))\n\n    def forward(self, y):\n        B, d, n = y.shape\n        y = y.reshape(B, self.g, d // self.g, n)\n        h = F.gelu(torch.einsum('bgdn,gnt->bgdt', y, self.w1) + self.b1)\n        o = torch.einsum('bgdt,gtn->bgdn', h, self.w2) + self.b2\n        return o.reshape(B, d, n)\n\n\nclass MixBlock(nn.Module):\n    def __init__(self, d, n):\n        super().__init__()\n        self.ln1 = nn.LayerNorm(d)\n        self.tok = TokenMix(d, n, TOK, TOKG)\n        self.ln2 = nn.LayerNorm(d)\n        self.ch1 = nn.Linear(d, CHMULT * d)\n        self.ch2 = nn.Linear(CHMULT * d, d)\n\n    def forward(self, x):\n        y = self.ln1(x).transpose(1, 2)\n        x = x + self.tok(y).transpose(1, 2)\n        x = x + self.ch2(F.gelu(self.ch1(self.ln2(x))))\n        return x\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        N = self.Y * self.X\n        self.N = N\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        nt = len(self.fps)\n        self.nt = nt\n        cin = int(spec.in_channels)\n        g2 = math.sqrt(2.0)\n        sin = cin\n        if CHREMAP:\n            self.remap_w = unif((cin, N, N), N)\n            self.remap_b = nn.Parameter(torch.zeros(cin, N))\n            sin = 2 * cin\n        self.s1 = nn.Linear(sin, 2 * D if GLU else D)\n        self.pos = nn.Parameter(torch.randn(N, D) * 0.02)\n        self.s2 = nn.Linear(D, D)\n        self.blocks = nn.ModuleList([MixBlock(D, N) for _ in range(NMIX)])\n        self.lnf = nn.LayerNorm(D)\n        self.convs = nn.ModuleList([ortho(nn.Conv2d(D, D, 3, padding=1), g2) for _ in range(CONV)])\n        self.norms = nn.ModuleList([nn.GroupNorm(GROUPS, D) for _ in range(CONV)])\n        self.skip = ortho(nn.Conv2d(cin, SKIP, 1), g2)\n        self.proj = ortho(nn.Conv2d(D, PROJ, 1), g2)\n        P = PROJ + SKIP\n        if FOOT:\n            self.mix = nn.ModuleList([ortho(nn.Conv2d(3 * P, HID, 1), g2) for _ in self.fps])\n            self.outs = nn.ModuleList([ortho(nn.Conv2d(HID, 1, 1), 0.01) for _ in self.fps])\n            self.anchor = ortho(nn.Conv2d(P, 1, 1), 0.01)\n            self.ctx = ortho(nn.Linear(GLOB, nt * HID), 1.0)\n        if DENSE3:\n            self.dense3 = ortho(nn.Conv2d(P, nt, 3, padding=1), 0.01)\n        if FLATK > 0:\n            self.flat_in = ortho(nn.Conv2d(P, nt * FLATK, 1), 1.0)\n            self.flat_w = nn.Parameter(torch.randn(nt, FLATK, N, N) * (0.01 / math.sqrt(FLATK * N)))\n        self.type_bias = nn.Parameter(torch.zeros(1, nt, 1, 1))\n        self.glob = nn.Sequential(ortho(nn.Linear(2 * D + 2 * P, GLOB), g2), nn.ReLU())\n        self.done_head = ortho(nn.Linear(GLOB, 1), 0.01)\n        self.value_head = ortho(nn.Linear(GLOB, 1), 1.0)\n\n    def forward(self, obs, mask):\n        B = obs.shape[0]\n        o = obs.flatten(2)\n        if CHREMAP:\n            r = torch.einsum('bcn,cnm->bcm', o, self.remap_w) + self.remap_b\n            z = torch.cat([o, r], 1)\n        else:\n            z = o\n        h = self.s1(z.transpose(1, 2))\n        if GLU:\n            a, b = h.chunk(2, -1)\n            h = a * torch.sigmoid(b)\n        else:\n            h = F.relu(h)\n        h = F.relu(self.s2(h + self.pos))\n        for blk in self.blocks:\n            h = blk(h)\n        h = self.lnf(h)\n        f = h.transpose(1, 2).reshape(B, D, self.Y, self.X)\n        for conv, nrm in zip(self.convs, self.norms):\n            f = F.relu(f + nrm(conv(f)))\n        s = F.relu(self.skip(obs))\n        p = torch.cat([F.relu(self.proj(f)), s], 1)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3)), p.mean((2, 3)), p.amax((2, 3))], 1))\n        place = self.type_bias.expand(B, self.nt, self.Y, self.X)\n        if FOOT:\n            ctx = self.ctx(g).view(B, self.nt, HID, 1, 1)\n            res = []\n            for i, (dy, dx) in enumerate(self.fps):\n                if dy * dx == 1:\n                    mx, mn, av = p, p, p\n                else:\n                    q = F.pad(p, (0, dx - 1, 0, dy - 1))\n                    mx = F.max_pool2d(q, (dy, dx), stride=1)\n                    mn = -F.max_pool2d(-q, (dy, dx), stride=1)\n                    av = F.avg_pool2d(q, (dy, dx), stride=1)\n                hh = F.relu(self.mix[i](torch.cat([mx, mn, av], 1)) + ctx[:, i])\n                res.append(self.outs[i](hh))\n            place = place + torch.cat(res, 1) + self.anchor(p)\n        if DENSE3:\n            place = place + self.dense3(p)\n        place = place.reshape(B, -1)\n        if FLATK > 0:\n            q = self.flat_in(p).reshape(B, self.nt, FLATK, self.N)\n            place = place + torch.einsum('btkn,tknm->btm', q, self.flat_w).reshape(B, -1)\n        logits = torch.cat([place, self.done_head(g)], 1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 313063,
+    "fb_ms": 83.52,
+    "flops_per_sample": 23520000,
+    "flops_ratio": 1.29,
+    "sha": "d4a59f36def76993",
+    "recipe": {
+     "lr": 0.001,
+     "n_envs": 256,
+     "rollout_len": 16,
+     "n_minibatches": 16,
+     "ppo_epochs": 2,
+     "ent_coef": 0.01,
+     "gamma": 0.95,
+     "gae_lambda": 0.9,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "lr": 0.001,
+     "n_envs": 256,
+     "rollout_len": 16,
+     "n_minibatches": 16,
+     "ppo_epochs": 2,
+     "ent_coef": 0.01,
+     "gamma": 0.95,
+     "gae_lambda": 0.9,
+     "clip_eps": 0.2
+    },
+    "budget": {
+     "allowed_steps": 189243,
+     "n_updates": 46,
+     "batch": 4096,
+     "steps": 188416,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0111
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 6
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 313063,
+    "flops_ratio": 1.29,
+    "train_steps": 188416,
+    "wall_s": 78.3,
+    "sha": "d4a59f36def76993",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r3c1",
+   "round": 3,
+   "name": "landing attention, everything",
+   "hypothesis": "Adds the main new idea, a learned per-layer encoder plus a soft landing-layer attention for each footprint. It is stacked with a LayerNorm after the first layer, coordinate channels, a 3x3 trunk, a 3x3 local head per type, a skip into the footprint head and small output gains. Recipe: 1 epoch, gamma 0.995, entropy 0.02. These should make 'lands exactly on missing cells and seals nothing' learnable. Refuted if training success stays 0.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {'lr': 0.0015, 'n_envs': 256, 'rollout_len': 32, 'n_minibatches': 32, 'ppo_epochs': 1, 'ent_coef': 0.02, 'gamma': 0.995, 'gae_lambda': 0.95, 'clip_eps': 0.25}\n\nW = 48\nCOORD = True\nINLN = True\nUSE_C0 = True\nNB = 0\nP = 24\nK = 16\nHID = 16\nLOCAL3 = 16\nFLATD = 0\nGLOB = 64\nGROUPS = 8\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    nn.init.zeros_(m.bias)\n    return m\n\n\nclass CellLN(nn.Module):\n    def __init__(self, c):\n        super().__init__()\n        self.ln = nn.LayerNorm(c)\n\n    def forward(self, x):\n        return self.ln(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)\n\n\ndef fpool(q, dy, dx):\n    if dy * dx == 1:\n        return q, q, q\n    r = F.pad(q, (0, dx - 1, 0, dy - 1))\n    mx = F.max_pool2d(r, (dy, dx), stride=1)\n    mn = -F.max_pool2d(-r, (dy, dx), stride=1)\n    av = F.avg_pool2d(r, (dy, dx), stride=1)\n    return mx, mn, av\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.X = int(spec.X)\n        self.Y = int(spec.Y)\n        self.Z = int(spec.Z)\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        nt = len(self.fps)\n        self.nt = nt\n        cin = int(spec.in_channels) + (2 if COORD else 0)\n        g = math.sqrt(2.0)\n        self.s1 = ortho(nn.Conv2d(cin, W, 1), g)\n        self.ln1 = CellLN(W) if INLN else nn.Identity()\n        self.s2 = ortho(nn.Conv2d(W, W, 1), g)\n        if USE_C0:\n            self.c0 = ortho(nn.Conv2d(W, W, 3, padding=1), g)\n            self.n0 = nn.GroupNorm(GROUPS, W)\n        self.blocks = nn.ModuleList([ortho(nn.Conv2d(W, W, 3, padding=1), g) for _ in range(NB)])\n        self.norms = nn.ModuleList([nn.GroupNorm(GROUPS, W) for _ in range(NB)])\n        self.proj = ortho(nn.Conv2d(W, P, 1), g)\n        self.skip = ortho(nn.Conv2d(cin, P, 1), g)\n        PP = 2 * P\n        hin = 3 * PP\n        gin = 2 * W + 2 * PP\n        self.KK = 2 * K\n        if K > 0:\n            self.l1 = ortho(nn.Conv2d(8, K, 1), g)\n            self.l2 = ortho(nn.Conv2d(K, K, 1), g)\n            self.land = nn.ModuleList([ortho(nn.Linear(3 * self.KK, 1), 1.0) for _ in self.fps])\n            hin += 3 * self.KK\n            gin += 2 * K\n        self.mix = nn.ModuleList([ortho(nn.Conv2d(hin, HID, 1), g) for _ in self.fps])\n        self.outs = nn.ModuleList([ortho(nn.Conv2d(HID, 1, 1), 0.01) for _ in self.fps])\n        self.type_bias = nn.Parameter(torch.zeros(1, nt, 1, 1))\n        if LOCAL3 > 0:\n            self.loc1 = ortho(nn.Conv2d(PP, LOCAL3, 3, padding=1), g)\n            self.loc2 = ortho(nn.Conv2d(LOCAL3, nt, 1), 0.01)\n        if FLATD > 0:\n            N = self.Y * self.X\n            self.flat_in = ortho(nn.Conv2d(PP, FLATD, 1), g)\n            self.flat_out = ortho(nn.Linear(FLATD * N, nt * N), 0.01)\n        self.glob = nn.Sequential(ortho(nn.Linear(gin, GLOB), g), nn.ReLU())\n        self.ctx = ortho(nn.Linear(GLOB, nt * HID), 1.0)\n        self.done_head = ortho(nn.Linear(GLOB, 1), 0.01)\n        self.value_head = ortho(nn.Linear(GLOB, 1), 1.0)\n\n    def forward(self, obs, mask):\n        B = obs.shape[0]\n        Y, X, Z = self.Y, self.X, self.Z\n        KK = self.KK\n        if COORD:\n            yy = torch.linspace(-1.0, 1.0, Y, device=obs.device, dtype=obs.dtype).view(1, 1, Y, 1).expand(B, 1, Y, X)\n            xx = torch.linspace(-1.0, 1.0, X, device=obs.device, dtype=obs.dtype).view(1, 1, 1, X).expand(B, 1, Y, X)\n            x0 = torch.cat([obs, yy, xx], 1)\n        else:\n            x0 = obs\n        h = F.relu(self.ln1(self.s1(x0)))\n        h = F.relu(self.s2(h))\n        f = h\n        if USE_C0:\n            f = F.relu(self.n0(self.c0(f)))\n        for conv, nrm in zip(self.blocks, self.norms):\n            f = F.relu(f + nrm(conv(f)))\n        p = torch.cat([F.relu(self.proj(f)), F.relu(self.skip(x0))], 1)\n        gparts = [f.mean((2, 3)), f.amax((2, 3)), p.mean((2, 3)), p.amax((2, 3))]\n        v = None\n        if K > 0:\n            lay = obs[:, :4 * Z].reshape(B, 4, Z, Y, X)\n            below = torch.cat([torch.zeros_like(obs[:, :1]), obs[:, :Z - 1]], 1).unsqueeze(1)\n            hts = obs[:, 4 * Z:4 * Z + 2].unsqueeze(2).expand(B, 2, Z, Y, X)\n            zc = torch.linspace(0.0, 1.0, Z, device=obs.device, dtype=obs.dtype).view(1, 1, Z, 1, 1).expand(B, 1, Z, Y, X)\n            per = torch.cat([lay, below, hts, zc], 1)\n            per = per.permute(0, 2, 1, 3, 4).reshape(B * Z, 8, Y, X)\n            u = F.relu(self.l2(F.relu(self.l1(per)))).reshape(B, Z, K, Y, X)\n            cm = torch.cummax(u, dim=1).values\n            cb = torch.cat([torch.zeros_like(cm[:, :1]), cm[:, :-1]], 1)\n            feats = torch.cat([u, cb], 2)\n            v = feats.reshape(B, Z * KK, Y, X)\n            gparts += [u.mean((1, 3, 4)), u.amax((1, 3, 4))]\n        g = self.glob(torch.cat(gparts, 1))\n        ctx = self.ctx(g).view(B, self.nt, HID, 1, 1)\n        res = []\n        for i, (dy, dx) in enumerate(self.fps):\n            mx, mn, av = fpool(p, dy, dx)\n            parts = [mx, mn, av]\n            if K > 0:\n                a1, a2, a3 = fpool(v, dy, dx)\n                up = torch.cat([a1.reshape(B, Z, KK, Y, X), a2.reshape(B, Z, KK, Y, X), a3.reshape(B, Z, KK, Y, X)], 2)\n                sc = self.land[i](up.permute(0, 1, 3, 4, 2)).squeeze(-1)\n                att = torch.softmax(sc, dim=1).unsqueeze(2)\n                parts.append((att * up).sum(1))\n            hh = F.relu(self.mix[i](torch.cat(parts, 1)) + ctx[:, i])\n            res.append(self.outs[i](hh))\n        place = torch.cat(res, 1) + self.type_bias\n        if LOCAL3 > 0:\n            place = place + self.loc2(F.relu(self.loc1(p)))\n        place = place.flatten(1)\n        if FLATD > 0:\n            place = place + self.flat_out(F.relu(self.flat_in(p)).flatten(1))\n        logits = torch.cat([place, self.done_head(g)], 1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 68650,
+    "fb_ms": 244.49,
+    "flops_per_sample": 20208384,
+    "flops_ratio": 1.11,
+    "sha": "52374d35ddaac831",
+    "recipe": {
+     "lr": 0.0015,
+     "n_envs": 256,
+     "rollout_len": 32,
+     "n_minibatches": 32,
+     "ppo_epochs": 1,
+     "ent_coef": 0.02,
+     "gamma": 0.995,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.25
+    },
+    "recipe_from_file": {
+     "lr": 0.0015,
+     "n_envs": 256,
+     "rollout_len": 32,
+     "n_minibatches": 32,
+     "ppo_epochs": 1,
+     "ent_coef": 0.02,
+     "gamma": 0.995,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.25
+    },
+    "budget": {
+     "allowed_steps": 385446,
+     "n_updates": 47,
+     "batch": 8192,
+     "steps": 385024,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0105
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 7
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 68650,
+    "flops_ratio": 1.11,
+    "train_steps": 385024,
+    "wall_s": 497.0,
+    "sha": "52374d35ddaac831",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r3c2",
+   "round": 3,
+   "name": "lean landing net, max samples",
+   "hypothesis": "Keeps only the column stem with LayerNorm, the per-layer encoder and a wider landing attention (K 24). There is no 3x3 trunk and no local head, so r stays under 1 and the trial gets about 426k samples, collected as 16k-sample updates from 512 parallel worlds (lr 2e-3, gamma 0.99). It tests whether layer-wise attention alone is the missing inductive bias, without the blur of spatial convolutions. Refuted if it scores 0 while the trunk versions score.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {'lr': 0.002, 'n_envs': 512, 'rollout_len': 32, 'n_minibatches': 64, 'ppo_epochs': 1, 'ent_coef': 0.01, 'gamma': 0.99, 'gae_lambda': 0.95, 'clip_eps': 0.2}\n\nW = 48\nCOORD = True\nINLN = True\nUSE_C0 = False\nNB = 0\nP = 24\nK = 24\nHID = 24\nLOCAL3 = 0\nFLATD = 0\nGLOB = 64\nGROUPS = 8\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    nn.init.zeros_(m.bias)\n    return m\n\n\nclass CellLN(nn.Module):\n    def __init__(self, c):\n        super().__init__()\n        self.ln = nn.LayerNorm(c)\n\n    def forward(self, x):\n        return self.ln(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)\n\n\ndef fpool(q, dy, dx):\n    if dy * dx == 1:\n        return q, q, q\n    r = F.pad(q, (0, dx - 1, 0, dy - 1))\n    mx = F.max_pool2d(r, (dy, dx), stride=1)\n    mn = -F.max_pool2d(-r, (dy, dx), stride=1)\n    av = F.avg_pool2d(r, (dy, dx), stride=1)\n    return mx, mn, av\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.X = int(spec.X)\n        self.Y = int(spec.Y)\n        self.Z = int(spec.Z)\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        nt = len(self.fps)\n        self.nt = nt\n        cin = int(spec.in_channels) + (2 if COORD else 0)\n        g = math.sqrt(2.0)\n        self.s1 = ortho(nn.Conv2d(cin, W, 1), g)\n        self.ln1 = CellLN(W) if INLN else nn.Identity()\n        self.s2 = ortho(nn.Conv2d(W, W, 1), g)\n        if USE_C0:\n            self.c0 = ortho(nn.Conv2d(W, W, 3, padding=1), g)\n            self.n0 = nn.GroupNorm(GROUPS, W)\n        self.blocks = nn.ModuleList([ortho(nn.Conv2d(W, W, 3, padding=1), g) for _ in range(NB)])\n        self.norms = nn.ModuleList([nn.GroupNorm(GROUPS, W) for _ in range(NB)])\n        self.proj = ortho(nn.Conv2d(W, P, 1), g)\n        self.skip = ortho(nn.Conv2d(cin, P, 1), g)\n        PP = 2 * P\n        hin = 3 * PP\n        gin = 2 * W + 2 * PP\n        self.KK = 2 * K\n        if K > 0:\n            self.l1 = ortho(nn.Conv2d(8, K, 1), g)\n            self.l2 = ortho(nn.Conv2d(K, K, 1), g)\n            self.land = nn.ModuleList([ortho(nn.Linear(3 * self.KK, 1), 1.0) for _ in self.fps])\n            hin += 3 * self.KK\n            gin += 2 * K\n        self.mix = nn.ModuleList([ortho(nn.Conv2d(hin, HID, 1), g) for _ in self.fps])\n        self.outs = nn.ModuleList([ortho(nn.Conv2d(HID, 1, 1), 0.01) for _ in self.fps])\n        self.type_bias = nn.Parameter(torch.zeros(1, nt, 1, 1))\n        if LOCAL3 > 0:\n            self.loc1 = ortho(nn.Conv2d(PP, LOCAL3, 3, padding=1), g)\n            self.loc2 = ortho(nn.Conv2d(LOCAL3, nt, 1), 0.01)\n        if FLATD > 0:\n            N = self.Y * self.X\n            self.flat_in = ortho(nn.Conv2d(PP, FLATD, 1), g)\n            self.flat_out = ortho(nn.Linear(FLATD * N, nt * N), 0.01)\n        self.glob = nn.Sequential(ortho(nn.Linear(gin, GLOB), g), nn.ReLU())\n        self.ctx = ortho(nn.Linear(GLOB, nt * HID), 1.0)\n        self.done_head = ortho(nn.Linear(GLOB, 1), 0.01)\n        self.value_head = ortho(nn.Linear(GLOB, 1), 1.0)\n\n    def forward(self, obs, mask):\n        B = obs.shape[0]\n        Y, X, Z = self.Y, self.X, self.Z\n        KK = self.KK\n        if COORD:\n            yy = torch.linspace(-1.0, 1.0, Y, device=obs.device, dtype=obs.dtype).view(1, 1, Y, 1).expand(B, 1, Y, X)\n            xx = torch.linspace(-1.0, 1.0, X, device=obs.device, dtype=obs.dtype).view(1, 1, 1, X).expand(B, 1, Y, X)\n            x0 = torch.cat([obs, yy, xx], 1)\n        else:\n            x0 = obs\n        h = F.relu(self.ln1(self.s1(x0)))\n        h = F.relu(self.s2(h))\n        f = h\n        if USE_C0:\n            f = F.relu(self.n0(self.c0(f)))\n        for conv, nrm in zip(self.blocks, self.norms):\n            f = F.relu(f + nrm(conv(f)))\n        p = torch.cat([F.relu(self.proj(f)), F.relu(self.skip(x0))], 1)\n        gparts = [f.mean((2, 3)), f.amax((2, 3)), p.mean((2, 3)), p.amax((2, 3))]\n        v = None\n        if K > 0:\n            lay = obs[:, :4 * Z].reshape(B, 4, Z, Y, X)\n            below = torch.cat([torch.zeros_like(obs[:, :1]), obs[:, :Z - 1]], 1).unsqueeze(1)\n            hts = obs[:, 4 * Z:4 * Z + 2].unsqueeze(2).expand(B, 2, Z, Y, X)\n            zc = torch.linspace(0.0, 1.0, Z, device=obs.device, dtype=obs.dtype).view(1, 1, Z, 1, 1).expand(B, 1, Z, Y, X)\n            per = torch.cat([lay, below, hts, zc], 1)\n            per = per.permute(0, 2, 1, 3, 4).reshape(B * Z, 8, Y, X)\n            u = F.relu(self.l2(F.relu(self.l1(per)))).reshape(B, Z, K, Y, X)\n            cm = torch.cummax(u, dim=1).values\n            cb = torch.cat([torch.zeros_like(cm[:, :1]), cm[:, :-1]], 1)\n            feats = torch.cat([u, cb], 2)\n            v = feats.reshape(B, Z * KK, Y, X)\n            gparts += [u.mean((1, 3, 4)), u.amax((1, 3, 4))]\n        g = self.glob(torch.cat(gparts, 1))\n        ctx = self.ctx(g).view(B, self.nt, HID, 1, 1)\n        res = []\n        for i, (dy, dx) in enumerate(self.fps):\n            mx, mn, av = fpool(p, dy, dx)\n            parts = [mx, mn, av]\n            if K > 0:\n                a1, a2, a3 = fpool(v, dy, dx)\n                up = torch.cat([a1.reshape(B, Z, KK, Y, X), a2.reshape(B, Z, KK, Y, X), a3.reshape(B, Z, KK, Y, X)], 2)\n                sc = self.land[i](up.permute(0, 1, 3, 4, 2)).squeeze(-1)\n                att = torch.softmax(sc, dim=1).unsqueeze(2)\n                parts.append((att * up).sum(1))\n            hh = F.relu(self.mix[i](torch.cat(parts, 1)) + ctx[:, i])\n            res.append(self.outs[i](hh))\n        place = torch.cat(res, 1) + self.type_bias\n        if LOCAL3 > 0:\n            place = place + self.loc2(F.relu(self.loc1(p)))\n        place = place.flatten(1)\n        if FLATD > 0:\n            place = place + self.flat_out(F.relu(self.flat_in(p)).flatten(1))\n        logits = torch.cat([place, self.done_head(g)], 1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 56822,
+    "fb_ms": 311.79,
+    "flops_per_sample": 15594240,
+    "flops_ratio": 0.85,
+    "sha": "e58ee138d0d7a6fc",
+    "recipe": {
+     "lr": 0.002,
+     "n_envs": 512,
+     "rollout_len": 32,
+     "n_minibatches": 64,
+     "ppo_epochs": 1,
+     "ent_coef": 0.01,
+     "gamma": 0.99,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "lr": 0.002,
+     "n_envs": 512,
+     "rollout_len": 32,
+     "n_minibatches": 64,
+     "ppo_epochs": 1,
+     "ent_coef": 0.01,
+     "gamma": 0.99,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.2
+    },
+    "budget": {
+     "allowed_steps": 425984,
+     "n_updates": 26,
+     "batch": 16384,
+     "steps": 425984,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0094
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 8
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 56822,
+    "flops_ratio": 0.85,
+    "train_steps": 425984,
+    "wall_s": 608.4,
+    "sha": "e58ee138d0d7a6fc",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r3c3",
+   "round": 3,
+   "name": "entropy 0.05, GN trunk, local heads",
+   "hypothesis": "No per-layer branch. A LayerNorm stem with coordinates, a GroupNorm residual trunk, footprint heads and a 3x3 local head per type (which works for any anchor convention). Recipe: maximum entropy 0.05, gamma 0.995, lambda 0.99, clip 0.3, 1 epoch. If the policy collapses early (for example, to DONE or one placement habit) and never meets an exact build, stronger exploration should break that. Refuted if training success stays 0.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {'lr': 0.001, 'n_envs': 256, 'rollout_len': 32, 'n_minibatches': 32, 'ppo_epochs': 1, 'ent_coef': 0.05, 'gamma': 0.995, 'gae_lambda': 0.99, 'clip_eps': 0.3}\n\nW = 48\nCOORD = True\nINLN = True\nUSE_C0 = True\nNB = 1\nP = 24\nK = 0\nHID = 24\nLOCAL3 = 16\nFLATD = 0\nGLOB = 64\nGROUPS = 8\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    nn.init.zeros_(m.bias)\n    return m\n\n\nclass CellLN(nn.Module):\n    def __init__(self, c):\n        super().__init__()\n        self.ln = nn.LayerNorm(c)\n\n    def forward(self, x):\n        return self.ln(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)\n\n\ndef fpool(q, dy, dx):\n    if dy * dx == 1:\n        return q, q, q\n    r = F.pad(q, (0, dx - 1, 0, dy - 1))\n    mx = F.max_pool2d(r, (dy, dx), stride=1)\n    mn = -F.max_pool2d(-r, (dy, dx), stride=1)\n    av = F.avg_pool2d(r, (dy, dx), stride=1)\n    return mx, mn, av\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.X = int(spec.X)\n        self.Y = int(spec.Y)\n        self.Z = int(spec.Z)\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        nt = len(self.fps)\n        self.nt = nt\n        cin = int(spec.in_channels) + (2 if COORD else 0)\n        g = math.sqrt(2.0)\n        self.s1 = ortho(nn.Conv2d(cin, W, 1), g)\n        self.ln1 = CellLN(W) if INLN else nn.Identity()\n        self.s2 = ortho(nn.Conv2d(W, W, 1), g)\n        if USE_C0:\n            self.c0 = ortho(nn.Conv2d(W, W, 3, padding=1), g)\n            self.n0 = nn.GroupNorm(GROUPS, W)\n        self.blocks = nn.ModuleList([ortho(nn.Conv2d(W, W, 3, padding=1), g) for _ in range(NB)])\n        self.norms = nn.ModuleList([nn.GroupNorm(GROUPS, W) for _ in range(NB)])\n        self.proj = ortho(nn.Conv2d(W, P, 1), g)\n        self.skip = ortho(nn.Conv2d(cin, P, 1), g)\n        PP = 2 * P\n        hin = 3 * PP\n        gin = 2 * W + 2 * PP\n        self.KK = 2 * K\n        if K > 0:\n            self.l1 = ortho(nn.Conv2d(8, K, 1), g)\n            self.l2 = ortho(nn.Conv2d(K, K, 1), g)\n            self.land = nn.ModuleList([ortho(nn.Linear(3 * self.KK, 1), 1.0) for _ in self.fps])\n            hin += 3 * self.KK\n            gin += 2 * K\n        self.mix = nn.ModuleList([ortho(nn.Conv2d(hin, HID, 1), g) for _ in self.fps])\n        self.outs = nn.ModuleList([ortho(nn.Conv2d(HID, 1, 1), 0.01) for _ in self.fps])\n        self.type_bias = nn.Parameter(torch.zeros(1, nt, 1, 1))\n        if LOCAL3 > 0:\n            self.loc1 = ortho(nn.Conv2d(PP, LOCAL3, 3, padding=1), g)\n            self.loc2 = ortho(nn.Conv2d(LOCAL3, nt, 1), 0.01)\n        if FLATD > 0:\n            N = self.Y * self.X\n            self.flat_in = ortho(nn.Conv2d(PP, FLATD, 1), g)\n            self.flat_out = ortho(nn.Linear(FLATD * N, nt * N), 0.01)\n        self.glob = nn.Sequential(ortho(nn.Linear(gin, GLOB), g), nn.ReLU())\n        self.ctx = ortho(nn.Linear(GLOB, nt * HID), 1.0)\n        self.done_head = ortho(nn.Linear(GLOB, 1), 0.01)\n        self.value_head = ortho(nn.Linear(GLOB, 1), 1.0)\n\n    def forward(self, obs, mask):\n        B = obs.shape[0]\n        Y, X, Z = self.Y, self.X, self.Z\n        KK = self.KK\n        if COORD:\n            yy = torch.linspace(-1.0, 1.0, Y, device=obs.device, dtype=obs.dtype).view(1, 1, Y, 1).expand(B, 1, Y, X)\n            xx = torch.linspace(-1.0, 1.0, X, device=obs.device, dtype=obs.dtype).view(1, 1, 1, X).expand(B, 1, Y, X)\n            x0 = torch.cat([obs, yy, xx], 1)\n        else:\n            x0 = obs\n        h = F.relu(self.ln1(self.s1(x0)))\n        h = F.relu(self.s2(h))\n        f = h\n        if USE_C0:\n            f = F.relu(self.n0(self.c0(f)))\n        for conv, nrm in zip(self.blocks, self.norms):\n            f = F.relu(f + nrm(conv(f)))\n        p = torch.cat([F.relu(self.proj(f)), F.relu(self.skip(x0))], 1)\n        gparts = [f.mean((2, 3)), f.amax((2, 3)), p.mean((2, 3)), p.amax((2, 3))]\n        v = None\n        if K > 0:\n            lay = obs[:, :4 * Z].reshape(B, 4, Z, Y, X)\n            below = torch.cat([torch.zeros_like(obs[:, :1]), obs[:, :Z - 1]], 1).unsqueeze(1)\n            hts = obs[:, 4 * Z:4 * Z + 2].unsqueeze(2).expand(B, 2, Z, Y, X)\n            zc = torch.linspace(0.0, 1.0, Z, device=obs.device, dtype=obs.dtype).view(1, 1, Z, 1, 1).expand(B, 1, Z, Y, X)\n            per = torch.cat([lay, below, hts, zc], 1)\n            per = per.permute(0, 2, 1, 3, 4).reshape(B * Z, 8, Y, X)\n            u = F.relu(self.l2(F.relu(self.l1(per)))).reshape(B, Z, K, Y, X)\n            cm = torch.cummax(u, dim=1).values\n            cb = torch.cat([torch.zeros_like(cm[:, :1]), cm[:, :-1]], 1)\n            feats = torch.cat([u, cb], 2)\n            v = feats.reshape(B, Z * KK, Y, X)\n            gparts += [u.mean((1, 3, 4)), u.amax((1, 3, 4))]\n        g = self.glob(torch.cat(gparts, 1))\n        ctx = self.ctx(g).view(B, self.nt, HID, 1, 1)\n        res = []\n        for i, (dy, dx) in enumerate(self.fps):\n            mx, mn, av = fpool(p, dy, dx)\n            parts = [mx, mn, av]\n            if K > 0:\n                a1, a2, a3 = fpool(v, dy, dx)\n                up = torch.cat([a1.reshape(B, Z, KK, Y, X), a2.reshape(B, Z, KK, Y, X), a3.reshape(B, Z, KK, Y, X)], 2)\n                sc = self.land[i](up.permute(0, 1, 3, 4, 2)).squeeze(-1)\n                att = torch.softmax(sc, dim=1).unsqueeze(2)\n                parts.append((att * up).sum(1))\n            hh = F.relu(self.mix[i](torch.cat(parts, 1)) + ctx[:, i])\n            res.append(self.outs[i](hh))\n        place = torch.cat(res, 1) + self.type_bias\n        if LOCAL3 > 0:\n            place = place + self.loc2(F.relu(self.loc1(p)))\n        place = place.flatten(1)\n        if FLATD > 0:\n            place = place + self.flat_out(F.relu(self.flat_in(p)).flatten(1))\n        logits = torch.cat([place, self.done_head(g)], 1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 87286,
+    "fb_ms": 89.47,
+    "flops_per_sample": 25922304,
+    "flops_ratio": 1.42,
+    "sha": "b0057fcdf131724f",
+    "recipe": {
+     "lr": 0.001,
+     "n_envs": 256,
+     "rollout_len": 32,
+     "n_minibatches": 32,
+     "ppo_epochs": 1,
+     "ent_coef": 0.05,
+     "gamma": 0.995,
+     "gae_lambda": 0.99,
+     "clip_eps": 0.3
+    },
+    "recipe_from_file": {
+     "lr": 0.001,
+     "n_envs": 256,
+     "rollout_len": 32,
+     "n_minibatches": 32,
+     "ppo_epochs": 1,
+     "ent_coef": 0.05,
+     "gamma": 0.995,
+     "gae_lambda": 0.99,
+     "clip_eps": 0.3
+    },
+    "budget": {
+     "allowed_steps": 300484,
+     "n_updates": 36,
+     "batch": 8192,
+     "steps": 294912,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.009
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 5
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 87286,
+    "flops_ratio": 1.42,
+    "train_steps": 294912,
+    "wall_s": 126.5,
+    "sha": "b0057fcdf131724f",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r3c4",
+   "round": 3,
+   "name": "myopic credit, landing attention",
+   "hypothesis": "Uses the same network as the landing-attention stack, with an untried short-horizon recipe: gamma 0.9 and lambda 0.8, 2 epochs. The shaped reward per placement already scores most of the correctness of each placement, so near-myopic, low-variance advantages should teach exact per-step placement faster. Exact builds should then follow. Refuted if it scores 0 while the long-horizon versions of the same network score.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {'lr': 0.001, 'n_envs': 256, 'rollout_len': 16, 'n_minibatches': 16, 'ppo_epochs': 2, 'ent_coef': 0.01, 'gamma': 0.9, 'gae_lambda': 0.8, 'clip_eps': 0.2}\n\nW = 48\nCOORD = True\nINLN = True\nUSE_C0 = True\nNB = 0\nP = 24\nK = 16\nHID = 16\nLOCAL3 = 16\nFLATD = 0\nGLOB = 64\nGROUPS = 8\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    nn.init.zeros_(m.bias)\n    return m\n\n\nclass CellLN(nn.Module):\n    def __init__(self, c):\n        super().__init__()\n        self.ln = nn.LayerNorm(c)\n\n    def forward(self, x):\n        return self.ln(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)\n\n\ndef fpool(q, dy, dx):\n    if dy * dx == 1:\n        return q, q, q\n    r = F.pad(q, (0, dx - 1, 0, dy - 1))\n    mx = F.max_pool2d(r, (dy, dx), stride=1)\n    mn = -F.max_pool2d(-r, (dy, dx), stride=1)\n    av = F.avg_pool2d(r, (dy, dx), stride=1)\n    return mx, mn, av\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.X = int(spec.X)\n        self.Y = int(spec.Y)\n        self.Z = int(spec.Z)\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        nt = len(self.fps)\n        self.nt = nt\n        cin = int(spec.in_channels) + (2 if COORD else 0)\n        g = math.sqrt(2.0)\n        self.s1 = ortho(nn.Conv2d(cin, W, 1), g)\n        self.ln1 = CellLN(W) if INLN else nn.Identity()\n        self.s2 = ortho(nn.Conv2d(W, W, 1), g)\n        if USE_C0:\n            self.c0 = ortho(nn.Conv2d(W, W, 3, padding=1), g)\n            self.n0 = nn.GroupNorm(GROUPS, W)\n        self.blocks = nn.ModuleList([ortho(nn.Conv2d(W, W, 3, padding=1), g) for _ in range(NB)])\n        self.norms = nn.ModuleList([nn.GroupNorm(GROUPS, W) for _ in range(NB)])\n        self.proj = ortho(nn.Conv2d(W, P, 1), g)\n        self.skip = ortho(nn.Conv2d(cin, P, 1), g)\n        PP = 2 * P\n        hin = 3 * PP\n        gin = 2 * W + 2 * PP\n        self.KK = 2 * K\n        if K > 0:\n            self.l1 = ortho(nn.Conv2d(8, K, 1), g)\n            self.l2 = ortho(nn.Conv2d(K, K, 1), g)\n            self.land = nn.ModuleList([ortho(nn.Linear(3 * self.KK, 1), 1.0) for _ in self.fps])\n            hin += 3 * self.KK\n            gin += 2 * K\n        self.mix = nn.ModuleList([ortho(nn.Conv2d(hin, HID, 1), g) for _ in self.fps])\n        self.outs = nn.ModuleList([ortho(nn.Conv2d(HID, 1, 1), 0.01) for _ in self.fps])\n        self.type_bias = nn.Parameter(torch.zeros(1, nt, 1, 1))\n        if LOCAL3 > 0:\n            self.loc1 = ortho(nn.Conv2d(PP, LOCAL3, 3, padding=1), g)\n            self.loc2 = ortho(nn.Conv2d(LOCAL3, nt, 1), 0.01)\n        if FLATD > 0:\n            N = self.Y * self.X\n            self.flat_in = ortho(nn.Conv2d(PP, FLATD, 1), g)\n            self.flat_out = ortho(nn.Linear(FLATD * N, nt * N), 0.01)\n        self.glob = nn.Sequential(ortho(nn.Linear(gin, GLOB), g), nn.ReLU())\n        self.ctx = ortho(nn.Linear(GLOB, nt * HID), 1.0)\n        self.done_head = ortho(nn.Linear(GLOB, 1), 0.01)\n        self.value_head = ortho(nn.Linear(GLOB, 1), 1.0)\n\n    def forward(self, obs, mask):\n        B = obs.shape[0]\n        Y, X, Z = self.Y, self.X, self.Z\n        KK = self.KK\n        if COORD:\n            yy = torch.linspace(-1.0, 1.0, Y, device=obs.device, dtype=obs.dtype).view(1, 1, Y, 1).expand(B, 1, Y, X)\n            xx = torch.linspace(-1.0, 1.0, X, device=obs.device, dtype=obs.dtype).view(1, 1, 1, X).expand(B, 1, Y, X)\n            x0 = torch.cat([obs, yy, xx], 1)\n        else:\n            x0 = obs\n        h = F.relu(self.ln1(self.s1(x0)))\n        h = F.relu(self.s2(h))\n        f = h\n        if USE_C0:\n            f = F.relu(self.n0(self.c0(f)))\n        for conv, nrm in zip(self.blocks, self.norms):\n            f = F.relu(f + nrm(conv(f)))\n        p = torch.cat([F.relu(self.proj(f)), F.relu(self.skip(x0))], 1)\n        gparts = [f.mean((2, 3)), f.amax((2, 3)), p.mean((2, 3)), p.amax((2, 3))]\n        v = None\n        if K > 0:\n            lay = obs[:, :4 * Z].reshape(B, 4, Z, Y, X)\n            below = torch.cat([torch.zeros_like(obs[:, :1]), obs[:, :Z - 1]], 1).unsqueeze(1)\n            hts = obs[:, 4 * Z:4 * Z + 2].unsqueeze(2).expand(B, 2, Z, Y, X)\n            zc = torch.linspace(0.0, 1.0, Z, device=obs.device, dtype=obs.dtype).view(1, 1, Z, 1, 1).expand(B, 1, Z, Y, X)\n            per = torch.cat([lay, below, hts, zc], 1)\n            per = per.permute(0, 2, 1, 3, 4).reshape(B * Z, 8, Y, X)\n            u = F.relu(self.l2(F.relu(self.l1(per)))).reshape(B, Z, K, Y, X)\n            cm = torch.cummax(u, dim=1).values\n            cb = torch.cat([torch.zeros_like(cm[:, :1]), cm[:, :-1]], 1)\n            feats = torch.cat([u, cb], 2)\n            v = feats.reshape(B, Z * KK, Y, X)\n            gparts += [u.mean((1, 3, 4)), u.amax((1, 3, 4))]\n        g = self.glob(torch.cat(gparts, 1))\n        ctx = self.ctx(g).view(B, self.nt, HID, 1, 1)\n        res = []\n        for i, (dy, dx) in enumerate(self.fps):\n            mx, mn, av = fpool(p, dy, dx)\n            parts = [mx, mn, av]\n            if K > 0:\n                a1, a2, a3 = fpool(v, dy, dx)\n                up = torch.cat([a1.reshape(B, Z, KK, Y, X), a2.reshape(B, Z, KK, Y, X), a3.reshape(B, Z, KK, Y, X)], 2)\n                sc = self.land[i](up.permute(0, 1, 3, 4, 2)).squeeze(-1)\n                att = torch.softmax(sc, dim=1).unsqueeze(2)\n                parts.append((att * up).sum(1))\n            hh = F.relu(self.mix[i](torch.cat(parts, 1)) + ctx[:, i])\n            res.append(self.outs[i](hh))\n        place = torch.cat(res, 1) + self.type_bias\n        if LOCAL3 > 0:\n            place = place + self.loc2(F.relu(self.loc1(p)))\n        place = place.flatten(1)\n        if FLATD > 0:\n            place = place + self.flat_out(F.relu(self.flat_in(p)).flatten(1))\n        logits = torch.cat([place, self.done_head(g)], 1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 68650,
+    "fb_ms": 236.21,
+    "flops_per_sample": 20208384,
+    "flops_ratio": 1.11,
+    "sha": "aec3fc25698fad6a",
+    "recipe": {
+     "lr": 0.001,
+     "n_envs": 256,
+     "rollout_len": 16,
+     "n_minibatches": 16,
+     "ppo_epochs": 2,
+     "ent_coef": 0.01,
+     "gamma": 0.9,
+     "gae_lambda": 0.8,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "lr": 0.001,
+     "n_envs": 256,
+     "rollout_len": 16,
+     "n_minibatches": 16,
+     "ppo_epochs": 2,
+     "ent_coef": 0.01,
+     "gamma": 0.9,
+     "gae_lambda": 0.8,
+     "clip_eps": 0.2
+    },
+    "budget": {
+     "allowed_steps": 220255,
+     "n_updates": 53,
+     "batch": 4096,
+     "steps": 217088,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0105
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 7
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 68650,
+    "flops_ratio": 1.11,
+    "train_steps": 217088,
+    "wall_s": 497.5,
+    "sha": "aec3fc25698fad6a",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r3c5",
+   "round": 3,
+   "name": "landing + flat head, lr 3e-3",
+   "hypothesis": "Stacks the landing attention, the 3x3 local head and a flattened cell-to-action head (8 channels). Together these cover aligned, near-aligned and arbitrary action layouts. Recipe: the untried extreme lr 3e-3 with 128 envs x 32 steps, 16 minibatches of 256, 1 epoch, gamma 0.995, lambda 0.99, clip 0.3, entropy 0.02. Fast, frequent updates may get the agent out of the zero plateau sooner. Refuted if it scores 0 while the lower-lr landing variants score.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {'lr': 0.003, 'n_envs': 128, 'rollout_len': 32, 'n_minibatches': 16, 'ppo_epochs': 1, 'ent_coef': 0.02, 'gamma': 0.995, 'gae_lambda': 0.99, 'clip_eps': 0.3}\n\nW = 48\nCOORD = True\nINLN = True\nUSE_C0 = True\nNB = 0\nP = 24\nK = 16\nHID = 16\nLOCAL3 = 16\nFLATD = 8\nGLOB = 64\nGROUPS = 8\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    nn.init.zeros_(m.bias)\n    return m\n\n\nclass CellLN(nn.Module):\n    def __init__(self, c):\n        super().__init__()\n        self.ln = nn.LayerNorm(c)\n\n    def forward(self, x):\n        return self.ln(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)\n\n\ndef fpool(q, dy, dx):\n    if dy * dx == 1:\n        return q, q, q\n    r = F.pad(q, (0, dx - 1, 0, dy - 1))\n    mx = F.max_pool2d(r, (dy, dx), stride=1)\n    mn = -F.max_pool2d(-r, (dy, dx), stride=1)\n    av = F.avg_pool2d(r, (dy, dx), stride=1)\n    return mx, mn, av\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.X = int(spec.X)\n        self.Y = int(spec.Y)\n        self.Z = int(spec.Z)\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        nt = len(self.fps)\n        self.nt = nt\n        cin = int(spec.in_channels) + (2 if COORD else 0)\n        g = math.sqrt(2.0)\n        self.s1 = ortho(nn.Conv2d(cin, W, 1), g)\n        self.ln1 = CellLN(W) if INLN else nn.Identity()\n        self.s2 = ortho(nn.Conv2d(W, W, 1), g)\n        if USE_C0:\n            self.c0 = ortho(nn.Conv2d(W, W, 3, padding=1), g)\n            self.n0 = nn.GroupNorm(GROUPS, W)\n        self.blocks = nn.ModuleList([ortho(nn.Conv2d(W, W, 3, padding=1), g) for _ in range(NB)])\n        self.norms = nn.ModuleList([nn.GroupNorm(GROUPS, W) for _ in range(NB)])\n        self.proj = ortho(nn.Conv2d(W, P, 1), g)\n        self.skip = ortho(nn.Conv2d(cin, P, 1), g)\n        PP = 2 * P\n        hin = 3 * PP\n        gin = 2 * W + 2 * PP\n        self.KK = 2 * K\n        if K > 0:\n            self.l1 = ortho(nn.Conv2d(8, K, 1), g)\n            self.l2 = ortho(nn.Conv2d(K, K, 1), g)\n            self.land = nn.ModuleList([ortho(nn.Linear(3 * self.KK, 1), 1.0) for _ in self.fps])\n            hin += 3 * self.KK\n            gin += 2 * K\n        self.mix = nn.ModuleList([ortho(nn.Conv2d(hin, HID, 1), g) for _ in self.fps])\n        self.outs = nn.ModuleList([ortho(nn.Conv2d(HID, 1, 1), 0.01) for _ in self.fps])\n        self.type_bias = nn.Parameter(torch.zeros(1, nt, 1, 1))\n        if LOCAL3 > 0:\n            self.loc1 = ortho(nn.Conv2d(PP, LOCAL3, 3, padding=1), g)\n            self.loc2 = ortho(nn.Conv2d(LOCAL3, nt, 1), 0.01)\n        if FLATD > 0:\n            N = self.Y * self.X\n            self.flat_in = ortho(nn.Conv2d(PP, FLATD, 1), g)\n            self.flat_out = ortho(nn.Linear(FLATD * N, nt * N), 0.01)\n        self.glob = nn.Sequential(ortho(nn.Linear(gin, GLOB), g), nn.ReLU())\n        self.ctx = ortho(nn.Linear(GLOB, nt * HID), 1.0)\n        self.done_head = ortho(nn.Linear(GLOB, 1), 0.01)\n        self.value_head = ortho(nn.Linear(GLOB, 1), 1.0)\n\n    def forward(self, obs, mask):\n        B = obs.shape[0]\n        Y, X, Z = self.Y, self.X, self.Z\n        KK = self.KK\n        if COORD:\n            yy = torch.linspace(-1.0, 1.0, Y, device=obs.device, dtype=obs.dtype).view(1, 1, Y, 1).expand(B, 1, Y, X)\n            xx = torch.linspace(-1.0, 1.0, X, device=obs.device, dtype=obs.dtype).view(1, 1, 1, X).expand(B, 1, Y, X)\n            x0 = torch.cat([obs, yy, xx], 1)\n        else:\n            x0 = obs\n        h = F.relu(self.ln1(self.s1(x0)))\n        h = F.relu(self.s2(h))\n        f = h\n        if USE_C0:\n            f = F.relu(self.n0(self.c0(f)))\n        for conv, nrm in zip(self.blocks, self.norms):\n            f = F.relu(f + nrm(conv(f)))\n        p = torch.cat([F.relu(self.proj(f)), F.relu(self.skip(x0))], 1)\n        gparts = [f.mean((2, 3)), f.amax((2, 3)), p.mean((2, 3)), p.amax((2, 3))]\n        v = None\n        if K > 0:\n            lay = obs[:, :4 * Z].reshape(B, 4, Z, Y, X)\n            below = torch.cat([torch.zeros_like(obs[:, :1]), obs[:, :Z - 1]], 1).unsqueeze(1)\n            hts = obs[:, 4 * Z:4 * Z + 2].unsqueeze(2).expand(B, 2, Z, Y, X)\n            zc = torch.linspace(0.0, 1.0, Z, device=obs.device, dtype=obs.dtype).view(1, 1, Z, 1, 1).expand(B, 1, Z, Y, X)\n            per = torch.cat([lay, below, hts, zc], 1)\n            per = per.permute(0, 2, 1, 3, 4).reshape(B * Z, 8, Y, X)\n            u = F.relu(self.l2(F.relu(self.l1(per)))).reshape(B, Z, K, Y, X)\n            cm = torch.cummax(u, dim=1).values\n            cb = torch.cat([torch.zeros_like(cm[:, :1]), cm[:, :-1]], 1)\n            feats = torch.cat([u, cb], 2)\n            v = feats.reshape(B, Z * KK, Y, X)\n            gparts += [u.mean((1, 3, 4)), u.amax((1, 3, 4))]\n        g = self.glob(torch.cat(gparts, 1))\n        ctx = self.ctx(g).view(B, self.nt, HID, 1, 1)\n        res = []\n        for i, (dy, dx) in enumerate(self.fps):\n            mx, mn, av = fpool(p, dy, dx)\n            parts = [mx, mn, av]\n            if K > 0:\n                a1, a2, a3 = fpool(v, dy, dx)\n                up = torch.cat([a1.reshape(B, Z, KK, Y, X), a2.reshape(B, Z, KK, Y, X), a3.reshape(B, Z, KK, Y, X)], 2)\n                sc = self.land[i](up.permute(0, 1, 3, 4, 2)).squeeze(-1)\n                att = torch.softmax(sc, dim=1).unsqueeze(2)\n                parts.append((att * up).sum(1))\n            hh = F.relu(self.mix[i](torch.cat(parts, 1)) + ctx[:, i])\n            res.append(self.outs[i](hh))\n        place = torch.cat(res, 1) + self.type_bias\n        if LOCAL3 > 0:\n            place = place + self.loc2(F.relu(self.loc1(p)))\n        place = place.flatten(1)\n        if FLATD > 0:\n            place = place + self.flat_out(F.relu(self.flat_in(p)).flatten(1))\n        logits = torch.cat([place, self.done_head(g)], 1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 200370,
+    "fb_ms": 243.98,
+    "flops_per_sample": 21142272,
+    "flops_ratio": 1.16,
+    "sha": "6c3c08754feb0d2b",
+    "recipe": {
+     "lr": 0.003,
+     "n_envs": 128,
+     "rollout_len": 32,
+     "n_minibatches": 16,
+     "ppo_epochs": 1,
+     "ent_coef": 0.02,
+     "gamma": 0.995,
+     "gae_lambda": 0.99,
+     "clip_eps": 0.3
+    },
+    "recipe_from_file": {
+     "lr": 0.003,
+     "n_envs": 128,
+     "rollout_len": 32,
+     "n_minibatches": 16,
+     "ppo_epochs": 1,
+     "ent_coef": 0.02,
+     "gamma": 0.995,
+     "gae_lambda": 0.99,
+     "clip_eps": 0.3
+    },
+    "budget": {
+     "allowed_steps": 368420,
+     "n_updates": 89,
+     "batch": 4096,
+     "steps": 364544,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0157
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.002,
+     "short_run_updates": 6
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 200370,
+    "flops_ratio": 1.16,
+    "train_steps": 364544,
+    "wall_s": 337.3,
+    "sha": "6c3c08754feb0d2b",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r3c6",
+   "round": 3,
+   "name": "wide landing, clip 0.1",
+   "hypothesis": "Uses a wider per-layer encoder (K 32) with landing attention, the local head and the LayerNorm stem. Recipe: the untried conservative clip 0.1, 2 epochs, lr 7e-4, gamma 0.99, lambda 0.95. If large policy jumps destroy the fragile multi-step building behaviour before the exact-build bonus shows up, small trust-region steps should keep partial competence. Refuted if it stays at 0 while higher-clip versions of the same network score.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {'lr': 0.0007, 'n_envs': 256, 'rollout_len': 16, 'n_minibatches': 16, 'ppo_epochs': 2, 'ent_coef': 0.01, 'gamma': 0.99, 'gae_lambda': 0.95, 'clip_eps': 0.1}\n\nW = 48\nCOORD = True\nINLN = True\nUSE_C0 = True\nNB = 0\nP = 24\nK = 32\nHID = 16\nLOCAL3 = 16\nFLATD = 0\nGLOB = 64\nGROUPS = 8\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    nn.init.zeros_(m.bias)\n    return m\n\n\nclass CellLN(nn.Module):\n    def __init__(self, c):\n        super().__init__()\n        self.ln = nn.LayerNorm(c)\n\n    def forward(self, x):\n        return self.ln(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)\n\n\ndef fpool(q, dy, dx):\n    if dy * dx == 1:\n        return q, q, q\n    r = F.pad(q, (0, dx - 1, 0, dy - 1))\n    mx = F.max_pool2d(r, (dy, dx), stride=1)\n    mn = -F.max_pool2d(-r, (dy, dx), stride=1)\n    av = F.avg_pool2d(r, (dy, dx), stride=1)\n    return mx, mn, av\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.X = int(spec.X)\n        self.Y = int(spec.Y)\n        self.Z = int(spec.Z)\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        nt = len(self.fps)\n        self.nt = nt\n        cin = int(spec.in_channels) + (2 if COORD else 0)\n        g = math.sqrt(2.0)\n        self.s1 = ortho(nn.Conv2d(cin, W, 1), g)\n        self.ln1 = CellLN(W) if INLN else nn.Identity()\n        self.s2 = ortho(nn.Conv2d(W, W, 1), g)\n        if USE_C0:\n            self.c0 = ortho(nn.Conv2d(W, W, 3, padding=1), g)\n            self.n0 = nn.GroupNorm(GROUPS, W)\n        self.blocks = nn.ModuleList([ortho(nn.Conv2d(W, W, 3, padding=1), g) for _ in range(NB)])\n        self.norms = nn.ModuleList([nn.GroupNorm(GROUPS, W) for _ in range(NB)])\n        self.proj = ortho(nn.Conv2d(W, P, 1), g)\n        self.skip = ortho(nn.Conv2d(cin, P, 1), g)\n        PP = 2 * P\n        hin = 3 * PP\n        gin = 2 * W + 2 * PP\n        self.KK = 2 * K\n        if K > 0:\n            self.l1 = ortho(nn.Conv2d(8, K, 1), g)\n            self.l2 = ortho(nn.Conv2d(K, K, 1), g)\n            self.land = nn.ModuleList([ortho(nn.Linear(3 * self.KK, 1), 1.0) for _ in self.fps])\n            hin += 3 * self.KK\n            gin += 2 * K\n        self.mix = nn.ModuleList([ortho(nn.Conv2d(hin, HID, 1), g) for _ in self.fps])\n        self.outs = nn.ModuleList([ortho(nn.Conv2d(HID, 1, 1), 0.01) for _ in self.fps])\n        self.type_bias = nn.Parameter(torch.zeros(1, nt, 1, 1))\n        if LOCAL3 > 0:\n            self.loc1 = ortho(nn.Conv2d(PP, LOCAL3, 3, padding=1), g)\n            self.loc2 = ortho(nn.Conv2d(LOCAL3, nt, 1), 0.01)\n        if FLATD > 0:\n            N = self.Y * self.X\n            self.flat_in = ortho(nn.Conv2d(PP, FLATD, 1), g)\n            self.flat_out = ortho(nn.Linear(FLATD * N, nt * N), 0.01)\n        self.glob = nn.Sequential(ortho(nn.Linear(gin, GLOB), g), nn.ReLU())\n        self.ctx = ortho(nn.Linear(GLOB, nt * HID), 1.0)\n        self.done_head = ortho(nn.Linear(GLOB, 1), 0.01)\n        self.value_head = ortho(nn.Linear(GLOB, 1), 1.0)\n\n    def forward(self, obs, mask):\n        B = obs.shape[0]\n        Y, X, Z = self.Y, self.X, self.Z\n        KK = self.KK\n        if COORD:\n            yy = torch.linspace(-1.0, 1.0, Y, device=obs.device, dtype=obs.dtype).view(1, 1, Y, 1).expand(B, 1, Y, X)\n            xx = torch.linspace(-1.0, 1.0, X, device=obs.device, dtype=obs.dtype).view(1, 1, 1, X).expand(B, 1, Y, X)\n            x0 = torch.cat([obs, yy, xx], 1)\n        else:\n            x0 = obs\n        h = F.relu(self.ln1(self.s1(x0)))\n        h = F.relu(self.s2(h))\n        f = h\n        if USE_C0:\n            f = F.relu(self.n0(self.c0(f)))\n        for conv, nrm in zip(self.blocks, self.norms):\n            f = F.relu(f + nrm(conv(f)))\n        p = torch.cat([F.relu(self.proj(f)), F.relu(self.skip(x0))], 1)\n        gparts = [f.mean((2, 3)), f.amax((2, 3)), p.mean((2, 3)), p.amax((2, 3))]\n        v = None\n        if K > 0:\n            lay = obs[:, :4 * Z].reshape(B, 4, Z, Y, X)\n            below = torch.cat([torch.zeros_like(obs[:, :1]), obs[:, :Z - 1]], 1).unsqueeze(1)\n            hts = obs[:, 4 * Z:4 * Z + 2].unsqueeze(2).expand(B, 2, Z, Y, X)\n            zc = torch.linspace(0.0, 1.0, Z, device=obs.device, dtype=obs.dtype).view(1, 1, Z, 1, 1).expand(B, 1, Z, Y, X)\n            per = torch.cat([lay, below, hts, zc], 1)\n            per = per.permute(0, 2, 1, 3, 4).reshape(B * Z, 8, Y, X)\n            u = F.relu(self.l2(F.relu(self.l1(per)))).reshape(B, Z, K, Y, X)\n            cm = torch.cummax(u, dim=1).values\n            cb = torch.cat([torch.zeros_like(cm[:, :1]), cm[:, :-1]], 1)\n            feats = torch.cat([u, cb], 2)\n            v = feats.reshape(B, Z * KK, Y, X)\n            gparts += [u.mean((1, 3, 4)), u.amax((1, 3, 4))]\n        g = self.glob(torch.cat(gparts, 1))\n        ctx = self.ctx(g).view(B, self.nt, HID, 1, 1)\n        res = []\n        for i, (dy, dx) in enumerate(self.fps):\n            mx, mn, av = fpool(p, dy, dx)\n            parts = [mx, mn, av]\n            if K > 0:\n                a1, a2, a3 = fpool(v, dy, dx)\n                up = torch.cat([a1.reshape(B, Z, KK, Y, X), a2.reshape(B, Z, KK, Y, X), a3.reshape(B, Z, KK, Y, X)], 2)\n                sc = self.land[i](up.permute(0, 1, 3, 4, 2)).squeeze(-1)\n                att = torch.softmax(sc, dim=1).unsqueeze(2)\n                parts.append((att * up).sum(1))\n            hh = F.relu(self.mix[i](torch.cat(parts, 1)) + ctx[:, i])\n            res.append(self.outs[i](hh))\n        place = torch.cat(res, 1) + self.type_bias\n        if LOCAL3 > 0:\n            place = place + self.loc2(F.relu(self.loc1(p)))\n        place = place.flatten(1)\n        if FLATD > 0:\n            place = place + self.flat_out(F.relu(self.flat_in(p)).flatten(1))\n        logits = torch.cat([place, self.done_head(g)], 1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 78154,
+    "fb_ms": 394.47,
+    "flops_per_sample": 25430784,
+    "flops_ratio": 1.39,
+    "sha": "1779c8dcde63817b",
+    "recipe": {
+     "lr": 0.0007,
+     "n_envs": 256,
+     "rollout_len": 16,
+     "n_minibatches": 16,
+     "ppo_epochs": 2,
+     "ent_coef": 0.01,
+     "gamma": 0.99,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.1
+    },
+    "recipe_from_file": {
+     "lr": 0.0007,
+     "n_envs": 256,
+     "rollout_len": 16,
+     "n_minibatches": 16,
+     "ppo_epochs": 2,
+     "ent_coef": 0.01,
+     "gamma": 0.99,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.1
+    },
+    "budget": {
+     "allowed_steps": 175024,
+     "n_updates": 42,
+     "batch": 4096,
+     "steps": 172032,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0139
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 5
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 78154,
+    "flops_ratio": 1.39,
+    "train_steps": 172032,
+    "wall_s": 520.6,
+    "sha": "1779c8dcde63817b",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r4c1",
+   "round": 4,
+   "name": "exact-footprint bilinear, max samples",
+   "hypothesis": "Each brick type gets a learned conv whose kernel equals its footprint, so the head knows which input cell is which. Earlier heads blurred this with min/max/avg pooling. A bilinear stem (product of two learned projections) gives AND-like logic, e.g. 'missing at this layer' and 'the column top is here'. r is about 0.7, so it gets about 426k samples with 1 epoch, gamma 0.99. Refuted if training success stays 0.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {'lr': 0.002, 'n_envs': 256, 'rollout_len': 32, 'n_minibatches': 32, 'ppo_epochs': 1, 'ent_coef': 0.01, 'gamma': 0.99, 'gae_lambda': 0.95, 'clip_eps': 0.2}\n\nW = 64\nBIL = 32\nNRES = 0\nTRUNK = 0\nTW = 32\nPROJ = 24\nSKIP = 8\nMARG = 0\nHID = 48\nHID2 = True\nLOCAL3 = 0\nFLATD = 0\nMASKIN = False\nGLOB = 64\nGROUPS = 8\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    if m.bias is not None:\n        nn.init.zeros_(m.bias)\n    return m\n\n\nclass CellLN(nn.Module):\n    def __init__(self, c):\n        super().__init__()\n        self.ln = nn.LayerNorm(c)\n\n    def forward(self, x):\n        return self.ln(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)\n\n\nclass ResMLP(nn.Module):\n    def __init__(self, c):\n        super().__init__()\n        self.ln = CellLN(c)\n        self.a = ortho(nn.Conv2d(c, 2 * c, 1), math.sqrt(2.0))\n        self.b = ortho(nn.Conv2d(2 * c, c, 1), 1.0)\n\n    def forward(self, x):\n        return x + self.b(F.relu(self.a(self.ln(x))))\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        nt = len(self.fps)\n        self.nt = nt\n        self.nplace = int(spec.n_place)\n        cin = int(spec.in_channels) + 2 + (nt if MASKIN else 0)\n        g = math.sqrt(2.0)\n        self.s1 = ortho(nn.Conv2d(cin, W, 1), g)\n        self.ln1 = CellLN(W)\n        self.s2 = ortho(nn.Conv2d(W, W, 1), g)\n        self.res = nn.ModuleList([ResMLP(W) for _ in range(NRES)])\n        fw = W\n        if BIL > 0:\n            self.ba = ortho(nn.Conv2d(W, BIL, 1), 1.0)\n            self.bb = ortho(nn.Conv2d(W, BIL, 1), 1.0)\n            fw = W + BIL\n        if TRUNK > 0:\n            self.t0 = ortho(nn.Conv2d(fw, TW, 3, padding=1), g)\n            self.tn0 = nn.GroupNorm(GROUPS, TW)\n            self.tb = nn.ModuleList([ortho(nn.Conv2d(TW, TW, 3, padding=1), g) for _ in range(TRUNK - 1)])\n            self.tn = nn.ModuleList([nn.GroupNorm(GROUPS, TW) for _ in range(TRUNK - 1)])\n            fw = fw + TW\n        self.fw = fw\n        self.proj = ortho(nn.Conv2d(fw, PROJ, 1), g)\n        self.skip = ortho(nn.Conv2d(cin, SKIP, 1), g)\n        P = PROJ + SKIP\n        self.heads = nn.ModuleList()\n        self.h2 = nn.ModuleList()\n        self.outs = nn.ModuleList()\n        for (dy, dx) in self.fps:\n            self.heads.append(ortho(nn.Conv2d(P, HID, (dy + 2 * MARG, dx + 2 * MARG)), g))\n            if HID2:\n                self.h2.append(ortho(nn.Conv2d(HID, HID, 1), g))\n            self.outs.append(ortho(nn.Conv2d(HID, 1, 1), 0.01))\n        self.anchor = ortho(nn.Conv2d(P, 1, 1), 0.01)\n        self.type_bias = nn.Parameter(torch.zeros(1, nt, 1, 1))\n        if LOCAL3 > 0:\n            self.loc1 = ortho(nn.Conv2d(P, LOCAL3, 3, padding=1), g)\n            self.loc2 = ortho(nn.Conv2d(LOCAL3, nt, 1), 0.01)\n        if FLATD > 0:\n            N = self.Y * self.X\n            self.flat_in = ortho(nn.Conv2d(P, FLATD, 1), g)\n            self.flat_out = ortho(nn.Linear(FLATD * N, nt * N), 0.01)\n        gin = 2 * fw + 2 * P\n        self.glob = nn.Sequential(ortho(nn.Linear(gin, GLOB), g), nn.ReLU(), ortho(nn.Linear(GLOB, GLOB), g), nn.ReLU())\n        self.ctx = ortho(nn.Linear(GLOB, nt * HID), 1.0)\n        self.done_head = ortho(nn.Linear(GLOB, 1), 0.01)\n        self.value_head = ortho(nn.Linear(GLOB, 1), 1.0)\n\n    def forward(self, obs, mask):\n        B = obs.shape[0]\n        Y, X = self.Y, self.X\n        yy = torch.linspace(-1.0, 1.0, Y, device=obs.device, dtype=obs.dtype).view(1, 1, Y, 1).expand(B, 1, Y, X)\n        xx = torch.linspace(-1.0, 1.0, X, device=obs.device, dtype=obs.dtype).view(1, 1, 1, X).expand(B, 1, Y, X)\n        parts = [obs, yy, xx]\n        if MASKIN:\n            parts.append(mask[:, :self.nplace].to(obs.dtype).reshape(B, self.nt, Y, X))\n        x0 = torch.cat(parts, 1)\n        h = F.relu(self.ln1(self.s1(x0)))\n        h = F.relu(self.s2(h))\n        for blk in self.res:\n            h = blk(h)\n        f = h\n        if BIL > 0:\n            f = torch.cat([h, self.ba(h) * self.bb(h)], 1)\n        if TRUNK > 0:\n            t = F.relu(self.tn0(self.t0(f)))\n            for conv, nrm in zip(self.tb, self.tn):\n                t = F.relu(t + nrm(conv(t)))\n            f = torch.cat([f, t], 1)\n        p = torch.cat([F.relu(self.proj(f)), F.relu(self.skip(x0))], 1)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3)), p.mean((2, 3)), p.amax((2, 3))], 1))\n        ctx = self.ctx(g).view(B, self.nt, HID, 1, 1)\n        res = []\n        for i, (dy, dx) in enumerate(self.fps):\n            q = F.pad(p, (MARG, dx - 1 + MARG, MARG, dy - 1 + MARG))\n            hh = F.relu(self.heads[i](q) + ctx[:, i])\n            if HID2:\n                hh = F.relu(self.h2[i](hh))\n            res.append(self.outs[i](hh))\n        place = torch.cat(res, 1) + self.anchor(p) + self.type_bias\n        if LOCAL3 > 0:\n            place = place + self.loc2(F.relu(self.loc1(p)))\n        place = place.flatten(1)\n        if FLATD > 0:\n            place = place + self.flat_out(F.relu(self.flat_in(p)).flatten(1))\n        logits = torch.cat([place, self.done_head(g)], 1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 69811,
+    "fb_ms": 51.09,
+    "flops_per_sample": 13695744,
+    "flops_ratio": 0.75,
+    "sha": "42e9088817851323",
+    "recipe": {
+     "lr": 0.002,
+     "n_envs": 256,
+     "rollout_len": 32,
+     "n_minibatches": 32,
+     "ppo_epochs": 1,
+     "ent_coef": 0.01,
+     "gamma": 0.99,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "lr": 0.002,
+     "n_envs": 256,
+     "rollout_len": 32,
+     "n_minibatches": 32,
+     "ppo_epochs": 1,
+     "ent_coef": 0.01,
+     "gamma": 0.99,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.2
+    },
+    "budget": {
+     "allowed_steps": 425984,
+     "n_updates": 52,
+     "batch": 8192,
+     "steps": 425984,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 8
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 69811,
+    "flops_ratio": 0.75,
+    "train_steps": 425984,
+    "wall_s": 101.3,
+    "sha": "42e9088817851323",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r4c2",
+   "round": 4,
+   "name": "margin footprint conv + 3x3 trunk",
+   "hypothesis": "Each type's head kernel covers the footprint plus a 1-cell margin, so it sees the neighbouring columns (where overhangs and sealing happen) and copes with an offset anchor convention. A 32-wide GroupNorm 3x3 trunk is concatenated with the exact cell features rather than replacing them. Recipe: 2 epochs, default gamma 0.95 and lambda 0.9. Refuted if training success stays 0.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {'lr': 0.001, 'n_envs': 256, 'rollout_len': 16, 'n_minibatches': 16, 'ppo_epochs': 2, 'ent_coef': 0.01, 'gamma': 0.95, 'gae_lambda': 0.9, 'clip_eps': 0.2}\n\nW = 64\nBIL = 0\nNRES = 0\nTRUNK = 1\nTW = 32\nPROJ = 16\nSKIP = 8\nMARG = 1\nHID = 32\nHID2 = False\nLOCAL3 = 0\nFLATD = 0\nMASKIN = False\nGLOB = 64\nGROUPS = 8\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    if m.bias is not None:\n        nn.init.zeros_(m.bias)\n    return m\n\n\nclass CellLN(nn.Module):\n    def __init__(self, c):\n        super().__init__()\n        self.ln = nn.LayerNorm(c)\n\n    def forward(self, x):\n        return self.ln(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)\n\n\nclass ResMLP(nn.Module):\n    def __init__(self, c):\n        super().__init__()\n        self.ln = CellLN(c)\n        self.a = ortho(nn.Conv2d(c, 2 * c, 1), math.sqrt(2.0))\n        self.b = ortho(nn.Conv2d(2 * c, c, 1), 1.0)\n\n    def forward(self, x):\n        return x + self.b(F.relu(self.a(self.ln(x))))\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        nt = len(self.fps)\n        self.nt = nt\n        self.nplace = int(spec.n_place)\n        cin = int(spec.in_channels) + 2 + (nt if MASKIN else 0)\n        g = math.sqrt(2.0)\n        self.s1 = ortho(nn.Conv2d(cin, W, 1), g)\n        self.ln1 = CellLN(W)\n        self.s2 = ortho(nn.Conv2d(W, W, 1), g)\n        self.res = nn.ModuleList([ResMLP(W) for _ in range(NRES)])\n        fw = W\n        if BIL > 0:\n            self.ba = ortho(nn.Conv2d(W, BIL, 1), 1.0)\n            self.bb = ortho(nn.Conv2d(W, BIL, 1), 1.0)\n            fw = W + BIL\n        if TRUNK > 0:\n            self.t0 = ortho(nn.Conv2d(fw, TW, 3, padding=1), g)\n            self.tn0 = nn.GroupNorm(GROUPS, TW)\n            self.tb = nn.ModuleList([ortho(nn.Conv2d(TW, TW, 3, padding=1), g) for _ in range(TRUNK - 1)])\n            self.tn = nn.ModuleList([nn.GroupNorm(GROUPS, TW) for _ in range(TRUNK - 1)])\n            fw = fw + TW\n        self.fw = fw\n        self.proj = ortho(nn.Conv2d(fw, PROJ, 1), g)\n        self.skip = ortho(nn.Conv2d(cin, SKIP, 1), g)\n        P = PROJ + SKIP\n        self.heads = nn.ModuleList()\n        self.h2 = nn.ModuleList()\n        self.outs = nn.ModuleList()\n        for (dy, dx) in self.fps:\n            self.heads.append(ortho(nn.Conv2d(P, HID, (dy + 2 * MARG, dx + 2 * MARG)), g))\n            if HID2:\n                self.h2.append(ortho(nn.Conv2d(HID, HID, 1), g))\n            self.outs.append(ortho(nn.Conv2d(HID, 1, 1), 0.01))\n        self.anchor = ortho(nn.Conv2d(P, 1, 1), 0.01)\n        self.type_bias = nn.Parameter(torch.zeros(1, nt, 1, 1))\n        if LOCAL3 > 0:\n            self.loc1 = ortho(nn.Conv2d(P, LOCAL3, 3, padding=1), g)\n            self.loc2 = ortho(nn.Conv2d(LOCAL3, nt, 1), 0.01)\n        if FLATD > 0:\n            N = self.Y * self.X\n            self.flat_in = ortho(nn.Conv2d(P, FLATD, 1), g)\n            self.flat_out = ortho(nn.Linear(FLATD * N, nt * N), 0.01)\n        gin = 2 * fw + 2 * P\n        self.glob = nn.Sequential(ortho(nn.Linear(gin, GLOB), g), nn.ReLU(), ortho(nn.Linear(GLOB, GLOB), g), nn.ReLU())\n        self.ctx = ortho(nn.Linear(GLOB, nt * HID), 1.0)\n        self.done_head = ortho(nn.Linear(GLOB, 1), 0.01)\n        self.value_head = ortho(nn.Linear(GLOB, 1), 1.0)\n\n    def forward(self, obs, mask):\n        B = obs.shape[0]\n        Y, X = self.Y, self.X\n        yy = torch.linspace(-1.0, 1.0, Y, device=obs.device, dtype=obs.dtype).view(1, 1, Y, 1).expand(B, 1, Y, X)\n        xx = torch.linspace(-1.0, 1.0, X, device=obs.device, dtype=obs.dtype).view(1, 1, 1, X).expand(B, 1, Y, X)\n        parts = [obs, yy, xx]\n        if MASKIN:\n            parts.append(mask[:, :self.nplace].to(obs.dtype).reshape(B, self.nt, Y, X))\n        x0 = torch.cat(parts, 1)\n        h = F.relu(self.ln1(self.s1(x0)))\n        h = F.relu(self.s2(h))\n        for blk in self.res:\n            h = blk(h)\n        f = h\n        if BIL > 0:\n            f = torch.cat([h, self.ba(h) * self.bb(h)], 1)\n        if TRUNK > 0:\n            t = F.relu(self.tn0(self.t0(f)))\n            for conv, nrm in zip(self.tb, self.tn):\n                t = F.relu(t + nrm(conv(t)))\n            f = torch.cat([f, t], 1)\n        p = torch.cat([F.relu(self.proj(f)), F.relu(self.skip(x0))], 1)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3)), p.mean((2, 3)), p.amax((2, 3))], 1))\n        ctx = self.ctx(g).view(B, self.nt, HID, 1, 1)\n        res = []\n        for i, (dy, dx) in enumerate(self.fps):\n            q = F.pad(p, (MARG, dx - 1 + MARG, MARG, dy - 1 + MARG))\n            hh = F.relu(self.heads[i](q) + ctx[:, i])\n            if HID2:\n                hh = F.relu(self.h2[i](hh))\n            res.append(self.outs[i](hh))\n        place = torch.cat(res, 1) + self.anchor(p) + self.type_bias\n        if LOCAL3 > 0:\n            place = place + self.loc2(F.relu(self.loc1(p)))\n        place = place.flatten(1)\n        if FLATD > 0:\n            place = place + self.flat_out(F.relu(self.flat_in(p)).flatten(1))\n        logits = torch.cat([place, self.done_head(g)], 1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 92483,
+    "fb_ms": 56.56,
+    "flops_per_sample": 24450816,
+    "flops_ratio": 1.34,
+    "sha": "03d5f964f77bc177",
+    "recipe": {
+     "lr": 0.001,
+     "n_envs": 256,
+     "rollout_len": 16,
+     "n_minibatches": 16,
+     "ppo_epochs": 2,
+     "ent_coef": 0.01,
+     "gamma": 0.95,
+     "gae_lambda": 0.9,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "lr": 0.001,
+     "n_envs": 256,
+     "rollout_len": 16,
+     "n_minibatches": 16,
+     "ppo_epochs": 2,
+     "ent_coef": 0.01,
+     "gamma": 0.95,
+     "gae_lambda": 0.9,
+     "clip_eps": 0.2
+    },
+    "budget": {
+     "allowed_steps": 182038,
+     "n_updates": 44,
+     "batch": 4096,
+     "steps": 180224,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0101
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0136,
+     "short_run_updates": 5
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 92483,
+    "flops_ratio": 1.34,
+    "train_steps": 180224,
+    "wall_s": 74.4,
+    "sha": "03d5f964f77bc177",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r4c3",
+   "round": 4,
+   "name": "everything: bilinear, trunk, mask, heads",
+   "hypothesis": "The 'everything plausible' stack: a bilinear stem, a GroupNorm 3x3 trunk concatenated with the cell features, the legal mask as learned input channels, exact-footprint conv heads with 2 hidden layers, a 3x3 local head, a flat head, factorised anchor and type terms, and init hygiene. 1 epoch, gamma 0.99, about 355k samples. Refuted if training success stays 0.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {'lr': 0.0015, 'n_envs': 256, 'rollout_len': 32, 'n_minibatches': 32, 'ppo_epochs': 1, 'ent_coef': 0.01, 'gamma': 0.99, 'gae_lambda': 0.95, 'clip_eps': 0.2}\n\nW = 64\nBIL = 32\nNRES = 0\nTRUNK = 1\nTW = 32\nPROJ = 24\nSKIP = 8\nMARG = 0\nHID = 32\nHID2 = True\nLOCAL3 = 16\nFLATD = 8\nMASKIN = True\nGLOB = 64\nGROUPS = 8\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    if m.bias is not None:\n        nn.init.zeros_(m.bias)\n    return m\n\n\nclass CellLN(nn.Module):\n    def __init__(self, c):\n        super().__init__()\n        self.ln = nn.LayerNorm(c)\n\n    def forward(self, x):\n        return self.ln(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)\n\n\nclass ResMLP(nn.Module):\n    def __init__(self, c):\n        super().__init__()\n        self.ln = CellLN(c)\n        self.a = ortho(nn.Conv2d(c, 2 * c, 1), math.sqrt(2.0))\n        self.b = ortho(nn.Conv2d(2 * c, c, 1), 1.0)\n\n    def forward(self, x):\n        return x + self.b(F.relu(self.a(self.ln(x))))\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        nt = len(self.fps)\n        self.nt = nt\n        self.nplace = int(spec.n_place)\n        cin = int(spec.in_channels) + 2 + (nt if MASKIN else 0)\n        g = math.sqrt(2.0)\n        self.s1 = ortho(nn.Conv2d(cin, W, 1), g)\n        self.ln1 = CellLN(W)\n        self.s2 = ortho(nn.Conv2d(W, W, 1), g)\n        self.res = nn.ModuleList([ResMLP(W) for _ in range(NRES)])\n        fw = W\n        if BIL > 0:\n            self.ba = ortho(nn.Conv2d(W, BIL, 1), 1.0)\n            self.bb = ortho(nn.Conv2d(W, BIL, 1), 1.0)\n            fw = W + BIL\n        if TRUNK > 0:\n            self.t0 = ortho(nn.Conv2d(fw, TW, 3, padding=1), g)\n            self.tn0 = nn.GroupNorm(GROUPS, TW)\n            self.tb = nn.ModuleList([ortho(nn.Conv2d(TW, TW, 3, padding=1), g) for _ in range(TRUNK - 1)])\n            self.tn = nn.ModuleList([nn.GroupNorm(GROUPS, TW) for _ in range(TRUNK - 1)])\n            fw = fw + TW\n        self.fw = fw\n        self.proj = ortho(nn.Conv2d(fw, PROJ, 1), g)\n        self.skip = ortho(nn.Conv2d(cin, SKIP, 1), g)\n        P = PROJ + SKIP\n        self.heads = nn.ModuleList()\n        self.h2 = nn.ModuleList()\n        self.outs = nn.ModuleList()\n        for (dy, dx) in self.fps:\n            self.heads.append(ortho(nn.Conv2d(P, HID, (dy + 2 * MARG, dx + 2 * MARG)), g))\n            if HID2:\n                self.h2.append(ortho(nn.Conv2d(HID, HID, 1), g))\n            self.outs.append(ortho(nn.Conv2d(HID, 1, 1), 0.01))\n        self.anchor = ortho(nn.Conv2d(P, 1, 1), 0.01)\n        self.type_bias = nn.Parameter(torch.zeros(1, nt, 1, 1))\n        if LOCAL3 > 0:\n            self.loc1 = ortho(nn.Conv2d(P, LOCAL3, 3, padding=1), g)\n            self.loc2 = ortho(nn.Conv2d(LOCAL3, nt, 1), 0.01)\n        if FLATD > 0:\n            N = self.Y * self.X\n            self.flat_in = ortho(nn.Conv2d(P, FLATD, 1), g)\n            self.flat_out = ortho(nn.Linear(FLATD * N, nt * N), 0.01)\n        gin = 2 * fw + 2 * P\n        self.glob = nn.Sequential(ortho(nn.Linear(gin, GLOB), g), nn.ReLU(), ortho(nn.Linear(GLOB, GLOB), g), nn.ReLU())\n        self.ctx = ortho(nn.Linear(GLOB, nt * HID), 1.0)\n        self.done_head = ortho(nn.Linear(GLOB, 1), 0.01)\n        self.value_head = ortho(nn.Linear(GLOB, 1), 1.0)\n\n    def forward(self, obs, mask):\n        B = obs.shape[0]\n        Y, X = self.Y, self.X\n        yy = torch.linspace(-1.0, 1.0, Y, device=obs.device, dtype=obs.dtype).view(1, 1, Y, 1).expand(B, 1, Y, X)\n        xx = torch.linspace(-1.0, 1.0, X, device=obs.device, dtype=obs.dtype).view(1, 1, 1, X).expand(B, 1, Y, X)\n        parts = [obs, yy, xx]\n        if MASKIN:\n            parts.append(mask[:, :self.nplace].to(obs.dtype).reshape(B, self.nt, Y, X))\n        x0 = torch.cat(parts, 1)\n        h = F.relu(self.ln1(self.s1(x0)))\n        h = F.relu(self.s2(h))\n        for blk in self.res:\n            h = blk(h)\n        f = h\n        if BIL > 0:\n            f = torch.cat([h, self.ba(h) * self.bb(h)], 1)\n        if TRUNK > 0:\n            t = F.relu(self.tn0(self.t0(f)))\n            for conv, nrm in zip(self.tb, self.tn):\n                t = F.relu(t + nrm(conv(t)))\n            f = torch.cat([f, t], 1)\n        p = torch.cat([F.relu(self.proj(f)), F.relu(self.skip(x0))], 1)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3)), p.mean((2, 3)), p.amax((2, 3))], 1))\n        ctx = self.ctx(g).view(B, self.nt, HID, 1, 1)\n        res = []\n        for i, (dy, dx) in enumerate(self.fps):\n            q = F.pad(p, (MARG, dx - 1 + MARG, MARG, dy - 1 + MARG))\n            hh = F.relu(self.heads[i](q) + ctx[:, i])\n            if HID2:\n                hh = F.relu(self.h2[i](hh))\n            res.append(self.outs[i](hh))\n        place = torch.cat(res, 1) + self.anchor(p) + self.type_bias\n        if LOCAL3 > 0:\n            place = place + self.loc2(F.relu(self.loc1(p)))\n        place = place.flatten(1)\n        if FLATD > 0:\n            place = place + self.flat_out(F.relu(self.flat_in(p)).flatten(1))\n        logits = torch.cat([place, self.done_head(g)], 1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 224911,
+    "fb_ms": 64.2,
+    "flops_per_sample": 23599872,
+    "flops_ratio": 1.29,
+    "sha": "5b1ba8e1c1c58070",
+    "recipe": {
+     "lr": 0.0015,
+     "n_envs": 256,
+     "rollout_len": 32,
+     "n_minibatches": 32,
+     "ppo_epochs": 1,
+     "ent_coef": 0.01,
+     "gamma": 0.99,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "lr": 0.0015,
+     "n_envs": 256,
+     "rollout_len": 32,
+     "n_minibatches": 32,
+     "ppo_epochs": 1,
+     "ent_coef": 0.01,
+     "gamma": 0.99,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.2
+    },
+    "budget": {
+     "allowed_steps": 330054,
+     "n_updates": 40,
+     "batch": 8192,
+     "steps": 327680,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0082
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 6
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 224911,
+    "flops_ratio": 1.29,
+    "train_steps": 327680,
+    "wall_s": 91.3,
+    "sha": "5b1ba8e1c1c58070",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r4c4",
+   "round": 4,
+   "name": "margin heads, 1024 envs x 8 steps, myopic",
+   "hypothesis": "Untried recipe: 1,024 parallel worlds with 8-step rollouts, so each update sees very diverse designs. Low-variance, near-myopic credit (gamma 0.9, lambda 0.8), 1 epoch, lr 2e-3, about 426k samples. The network is a small bilinear stem with margin-1 exact-footprint heads (r about 0.95). The shaped per-placement reward should teach correct placements before exact builds appear. Refuted if training success stays 0.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {'lr': 0.002, 'n_envs': 1024, 'rollout_len': 8, 'n_minibatches': 32, 'ppo_epochs': 1, 'ent_coef': 0.01, 'gamma': 0.9, 'gae_lambda': 0.8, 'clip_eps': 0.2}\n\nW = 64\nBIL = 16\nNRES = 0\nTRUNK = 0\nTW = 32\nPROJ = 16\nSKIP = 8\nMARG = 1\nHID = 32\nHID2 = False\nLOCAL3 = 0\nFLATD = 0\nMASKIN = False\nGLOB = 64\nGROUPS = 8\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    if m.bias is not None:\n        nn.init.zeros_(m.bias)\n    return m\n\n\nclass CellLN(nn.Module):\n    def __init__(self, c):\n        super().__init__()\n        self.ln = nn.LayerNorm(c)\n\n    def forward(self, x):\n        return self.ln(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)\n\n\nclass ResMLP(nn.Module):\n    def __init__(self, c):\n        super().__init__()\n        self.ln = CellLN(c)\n        self.a = ortho(nn.Conv2d(c, 2 * c, 1), math.sqrt(2.0))\n        self.b = ortho(nn.Conv2d(2 * c, c, 1), 1.0)\n\n    def forward(self, x):\n        return x + self.b(F.relu(self.a(self.ln(x))))\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        nt = len(self.fps)\n        self.nt = nt\n        self.nplace = int(spec.n_place)\n        cin = int(spec.in_channels) + 2 + (nt if MASKIN else 0)\n        g = math.sqrt(2.0)\n        self.s1 = ortho(nn.Conv2d(cin, W, 1), g)\n        self.ln1 = CellLN(W)\n        self.s2 = ortho(nn.Conv2d(W, W, 1), g)\n        self.res = nn.ModuleList([ResMLP(W) for _ in range(NRES)])\n        fw = W\n        if BIL > 0:\n            self.ba = ortho(nn.Conv2d(W, BIL, 1), 1.0)\n            self.bb = ortho(nn.Conv2d(W, BIL, 1), 1.0)\n            fw = W + BIL\n        if TRUNK > 0:\n            self.t0 = ortho(nn.Conv2d(fw, TW, 3, padding=1), g)\n            self.tn0 = nn.GroupNorm(GROUPS, TW)\n            self.tb = nn.ModuleList([ortho(nn.Conv2d(TW, TW, 3, padding=1), g) for _ in range(TRUNK - 1)])\n            self.tn = nn.ModuleList([nn.GroupNorm(GROUPS, TW) for _ in range(TRUNK - 1)])\n            fw = fw + TW\n        self.fw = fw\n        self.proj = ortho(nn.Conv2d(fw, PROJ, 1), g)\n        self.skip = ortho(nn.Conv2d(cin, SKIP, 1), g)\n        P = PROJ + SKIP\n        self.heads = nn.ModuleList()\n        self.h2 = nn.ModuleList()\n        self.outs = nn.ModuleList()\n        for (dy, dx) in self.fps:\n            self.heads.append(ortho(nn.Conv2d(P, HID, (dy + 2 * MARG, dx + 2 * MARG)), g))\n            if HID2:\n                self.h2.append(ortho(nn.Conv2d(HID, HID, 1), g))\n            self.outs.append(ortho(nn.Conv2d(HID, 1, 1), 0.01))\n        self.anchor = ortho(nn.Conv2d(P, 1, 1), 0.01)\n        self.type_bias = nn.Parameter(torch.zeros(1, nt, 1, 1))\n        if LOCAL3 > 0:\n            self.loc1 = ortho(nn.Conv2d(P, LOCAL3, 3, padding=1), g)\n            self.loc2 = ortho(nn.Conv2d(LOCAL3, nt, 1), 0.01)\n        if FLATD > 0:\n            N = self.Y * self.X\n            self.flat_in = ortho(nn.Conv2d(P, FLATD, 1), g)\n            self.flat_out = ortho(nn.Linear(FLATD * N, nt * N), 0.01)\n        gin = 2 * fw + 2 * P\n        self.glob = nn.Sequential(ortho(nn.Linear(gin, GLOB), g), nn.ReLU(), ortho(nn.Linear(GLOB, GLOB), g), nn.ReLU())\n        self.ctx = ortho(nn.Linear(GLOB, nt * HID), 1.0)\n        self.done_head = ortho(nn.Linear(GLOB, 1), 0.01)\n        self.value_head = ortho(nn.Linear(GLOB, 1), 1.0)\n\n    def forward(self, obs, mask):\n        B = obs.shape[0]\n        Y, X = self.Y, self.X\n        yy = torch.linspace(-1.0, 1.0, Y, device=obs.device, dtype=obs.dtype).view(1, 1, Y, 1).expand(B, 1, Y, X)\n        xx = torch.linspace(-1.0, 1.0, X, device=obs.device, dtype=obs.dtype).view(1, 1, 1, X).expand(B, 1, Y, X)\n        parts = [obs, yy, xx]\n        if MASKIN:\n            parts.append(mask[:, :self.nplace].to(obs.dtype).reshape(B, self.nt, Y, X))\n        x0 = torch.cat(parts, 1)\n        h = F.relu(self.ln1(self.s1(x0)))\n        h = F.relu(self.s2(h))\n        for blk in self.res:\n            h = blk(h)\n        f = h\n        if BIL > 0:\n            f = torch.cat([h, self.ba(h) * self.bb(h)], 1)\n        if TRUNK > 0:\n            t = F.relu(self.tn0(self.t0(f)))\n            for conv, nrm in zip(self.tb, self.tn):\n                t = F.relu(t + nrm(conv(t)))\n            f = torch.cat([f, t], 1)\n        p = torch.cat([F.relu(self.proj(f)), F.relu(self.skip(x0))], 1)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3)), p.mean((2, 3)), p.amax((2, 3))], 1))\n        ctx = self.ctx(g).view(B, self.nt, HID, 1, 1)\n        res = []\n        for i, (dy, dx) in enumerate(self.fps):\n            q = F.pad(p, (MARG, dx - 1 + MARG, MARG, dy - 1 + MARG))\n            hh = F.relu(self.heads[i](q) + ctx[:, i])\n            if HID2:\n                hh = F.relu(self.h2[i](hh))\n            res.append(self.outs[i](hh))\n        place = torch.cat(res, 1) + self.anchor(p) + self.type_bias\n        if LOCAL3 > 0:\n            place = place + self.loc2(F.relu(self.loc1(p)))\n        place = place.flatten(1)\n        if FLATD > 0:\n            place = place + self.flat_out(F.relu(self.flat_in(p)).flatten(1))\n        logits = torch.cat([place, self.done_head(g)], 1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 73731,
+    "fb_ms": 41.7,
+    "flops_per_sample": 18048768,
+    "flops_ratio": 0.99,
+    "sha": "a6f83df53f12a214",
+    "recipe": {
+     "lr": 0.002,
+     "n_envs": 1024,
+     "rollout_len": 8,
+     "n_minibatches": 32,
+     "ppo_epochs": 1,
+     "ent_coef": 0.01,
+     "gamma": 0.9,
+     "gae_lambda": 0.8,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "lr": 0.002,
+     "n_envs": 1024,
+     "rollout_len": 8,
+     "n_minibatches": 32,
+     "ppo_epochs": 1,
+     "ent_coef": 0.01,
+     "gamma": 0.9,
+     "gae_lambda": 0.8,
+     "clip_eps": 0.2
+    },
+    "budget": {
+     "allowed_steps": 425984,
+     "n_updates": 52,
+     "batch": 8192,
+     "steps": 425984,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0108
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 8
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 73731,
+    "flops_ratio": 0.99,
+    "train_steps": 425984,
+    "wall_s": 79.1,
+    "sha": "a6f83df53f12a214",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r4c5",
+   "round": 4,
+   "name": "deep residual cell MLP, low lr",
+   "hypothesis": "Deciding the landing layer means comparing column height with 6 per-layer target and missing bits. That is a deep per-cell logical function, so this candidate uses two pre-LayerNorm residual cell MLP blocks (no spatial blur) and exact-footprint heads with 2 hidden layers. Recipe: low lr 7e-4, 2 epochs, low entropy 0.003, so the slow, stable updates don't wreck partial competence. Refuted if training success stays 0.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {'lr': 0.0007, 'n_envs': 256, 'rollout_len': 16, 'n_minibatches': 16, 'ppo_epochs': 2, 'ent_coef': 0.003, 'gamma': 0.95, 'gae_lambda': 0.9, 'clip_eps': 0.2}\n\nW = 64\nBIL = 0\nNRES = 2\nTRUNK = 0\nTW = 32\nPROJ = 24\nSKIP = 8\nMARG = 0\nHID = 48\nHID2 = True\nLOCAL3 = 0\nFLATD = 0\nMASKIN = False\nGLOB = 64\nGROUPS = 8\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    if m.bias is not None:\n        nn.init.zeros_(m.bias)\n    return m\n\n\nclass CellLN(nn.Module):\n    def __init__(self, c):\n        super().__init__()\n        self.ln = nn.LayerNorm(c)\n\n    def forward(self, x):\n        return self.ln(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)\n\n\nclass ResMLP(nn.Module):\n    def __init__(self, c):\n        super().__init__()\n        self.ln = CellLN(c)\n        self.a = ortho(nn.Conv2d(c, 2 * c, 1), math.sqrt(2.0))\n        self.b = ortho(nn.Conv2d(2 * c, c, 1), 1.0)\n\n    def forward(self, x):\n        return x + self.b(F.relu(self.a(self.ln(x))))\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        nt = len(self.fps)\n        self.nt = nt\n        self.nplace = int(spec.n_place)\n        cin = int(spec.in_channels) + 2 + (nt if MASKIN else 0)\n        g = math.sqrt(2.0)\n        self.s1 = ortho(nn.Conv2d(cin, W, 1), g)\n        self.ln1 = CellLN(W)\n        self.s2 = ortho(nn.Conv2d(W, W, 1), g)\n        self.res = nn.ModuleList([ResMLP(W) for _ in range(NRES)])\n        fw = W\n        if BIL > 0:\n            self.ba = ortho(nn.Conv2d(W, BIL, 1), 1.0)\n            self.bb = ortho(nn.Conv2d(W, BIL, 1), 1.0)\n            fw = W + BIL\n        if TRUNK > 0:\n            self.t0 = ortho(nn.Conv2d(fw, TW, 3, padding=1), g)\n            self.tn0 = nn.GroupNorm(GROUPS, TW)\n            self.tb = nn.ModuleList([ortho(nn.Conv2d(TW, TW, 3, padding=1), g) for _ in range(TRUNK - 1)])\n            self.tn = nn.ModuleList([nn.GroupNorm(GROUPS, TW) for _ in range(TRUNK - 1)])\n            fw = fw + TW\n        self.fw = fw\n        self.proj = ortho(nn.Conv2d(fw, PROJ, 1), g)\n        self.skip = ortho(nn.Conv2d(cin, SKIP, 1), g)\n        P = PROJ + SKIP\n        self.heads = nn.ModuleList()\n        self.h2 = nn.ModuleList()\n        self.outs = nn.ModuleList()\n        for (dy, dx) in self.fps:\n            self.heads.append(ortho(nn.Conv2d(P, HID, (dy + 2 * MARG, dx + 2 * MARG)), g))\n            if HID2:\n                self.h2.append(ortho(nn.Conv2d(HID, HID, 1), g))\n            self.outs.append(ortho(nn.Conv2d(HID, 1, 1), 0.01))\n        self.anchor = ortho(nn.Conv2d(P, 1, 1), 0.01)\n        self.type_bias = nn.Parameter(torch.zeros(1, nt, 1, 1))\n        if LOCAL3 > 0:\n            self.loc1 = ortho(nn.Conv2d(P, LOCAL3, 3, padding=1), g)\n            self.loc2 = ortho(nn.Conv2d(LOCAL3, nt, 1), 0.01)\n        if FLATD > 0:\n            N = self.Y * self.X\n            self.flat_in = ortho(nn.Conv2d(P, FLATD, 1), g)\n            self.flat_out = ortho(nn.Linear(FLATD * N, nt * N), 0.01)\n        gin = 2 * fw + 2 * P\n        self.glob = nn.Sequential(ortho(nn.Linear(gin, GLOB), g), nn.ReLU(), ortho(nn.Linear(GLOB, GLOB), g), nn.ReLU())\n        self.ctx = ortho(nn.Linear(GLOB, nt * HID), 1.0)\n        self.done_head = ortho(nn.Linear(GLOB, 1), 0.01)\n        self.value_head = ortho(nn.Linear(GLOB, 1), 1.0)\n\n    def forward(self, obs, mask):\n        B = obs.shape[0]\n        Y, X = self.Y, self.X\n        yy = torch.linspace(-1.0, 1.0, Y, device=obs.device, dtype=obs.dtype).view(1, 1, Y, 1).expand(B, 1, Y, X)\n        xx = torch.linspace(-1.0, 1.0, X, device=obs.device, dtype=obs.dtype).view(1, 1, 1, X).expand(B, 1, Y, X)\n        parts = [obs, yy, xx]\n        if MASKIN:\n            parts.append(mask[:, :self.nplace].to(obs.dtype).reshape(B, self.nt, Y, X))\n        x0 = torch.cat(parts, 1)\n        h = F.relu(self.ln1(self.s1(x0)))\n        h = F.relu(self.s2(h))\n        for blk in self.res:\n            h = blk(h)\n        f = h\n        if BIL > 0:\n            f = torch.cat([h, self.ba(h) * self.bb(h)], 1)\n        if TRUNK > 0:\n            t = F.relu(self.tn0(self.t0(f)))\n            for conv, nrm in zip(self.tb, self.tn):\n                t = F.relu(t + nrm(conv(t)))\n            f = torch.cat([f, t], 1)\n        p = torch.cat([F.relu(self.proj(f)), F.relu(self.skip(x0))], 1)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3)), p.mean((2, 3)), p.amax((2, 3))], 1))\n        ctx = self.ctx(g).view(B, self.nt, HID, 1, 1)\n        res = []\n        for i, (dy, dx) in enumerate(self.fps):\n            q = F.pad(p, (MARG, dx - 1 + MARG, MARG, dy - 1 + MARG))\n            hh = F.relu(self.heads[i](q) + ctx[:, i])\n            if HID2:\n                hh = F.relu(self.h2[i](hh))\n            res.append(self.outs[i](hh))\n        place = torch.cat(res, 1) + self.anchor(p) + self.type_bias\n        if LOCAL3 > 0:\n            place = place + self.loc2(F.relu(self.loc1(p)))\n        place = place.flatten(1)\n        if FLATD > 0:\n            place = place + self.flat_out(F.relu(self.flat_in(p)).flatten(1))\n        logits = torch.cat([place, self.done_head(g)], 1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 94195,
+    "fb_ms": 74.51,
+    "flops_per_sample": 24386304,
+    "flops_ratio": 1.33,
+    "sha": "b7226626e6da3d44",
+    "recipe": {
+     "lr": 0.0007,
+     "n_envs": 256,
+     "rollout_len": 16,
+     "n_minibatches": 16,
+     "ppo_epochs": 2,
+     "ent_coef": 0.003,
+     "gamma": 0.95,
+     "gae_lambda": 0.9,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "lr": 0.0007,
+     "n_envs": 256,
+     "rollout_len": 16,
+     "n_minibatches": 16,
+     "ppo_epochs": 2,
+     "ent_coef": 0.003,
+     "gamma": 0.95,
+     "gae_lambda": 0.9,
+     "clip_eps": 0.2
+    },
+    "budget": {
+     "allowed_steps": 182520,
+     "n_updates": 44,
+     "batch": 4096,
+     "steps": 180224,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.01
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0149,
+     "short_run_updates": 5
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 94195,
+    "flops_ratio": 1.33,
+    "train_steps": 180224,
+    "wall_s": 83.4,
+    "sha": "b7226626e6da3d44",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r4c6",
+   "round": 4,
+   "name": "near-zero entropy, big minibatches, lr 3e-3",
+   "hypothesis": "Untried exploit-heavy recipe: entropy 0.002, lr 3e-3, clip 0.3 and 1,024-sample minibatches from 512 worlds \u00d7 32 steps, 1 epoch. A policy that turns deterministic quickly can chain correct placements, and evaluation is greedy anyway. Network: bilinear exact-footprint heads plus 3x3 local and flat heads, which cover other anchor layouts. Refuted if training success stays 0.",
+   "code": "import math\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nRECIPE = {'lr': 0.003, 'n_envs': 512, 'rollout_len': 32, 'n_minibatches': 16, 'ppo_epochs': 1, 'ent_coef': 0.002, 'gamma': 0.99, 'gae_lambda': 0.95, 'clip_eps': 0.3}\n\nW = 64\nBIL = 32\nNRES = 0\nTRUNK = 0\nTW = 32\nPROJ = 24\nSKIP = 8\nMARG = 0\nHID = 48\nHID2 = True\nLOCAL3 = 16\nFLATD = 8\nMASKIN = False\nGLOB = 64\nGROUPS = 8\n\n\ndef ortho(m, gain):\n    nn.init.orthogonal_(m.weight, gain)\n    if m.bias is not None:\n        nn.init.zeros_(m.bias)\n    return m\n\n\nclass CellLN(nn.Module):\n    def __init__(self, c):\n        super().__init__()\n        self.ln = nn.LayerNorm(c)\n\n    def forward(self, x):\n        return self.ln(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)\n\n\nclass ResMLP(nn.Module):\n    def __init__(self, c):\n        super().__init__()\n        self.ln = CellLN(c)\n        self.a = ortho(nn.Conv2d(c, 2 * c, 1), math.sqrt(2.0))\n        self.b = ortho(nn.Conv2d(2 * c, c, 1), 1.0)\n\n    def forward(self, x):\n        return x + self.b(F.relu(self.a(self.ln(x))))\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        self.fps = [(int(a), int(b)) for a, b in spec.footprints]\n        nt = len(self.fps)\n        self.nt = nt\n        self.nplace = int(spec.n_place)\n        cin = int(spec.in_channels) + 2 + (nt if MASKIN else 0)\n        g = math.sqrt(2.0)\n        self.s1 = ortho(nn.Conv2d(cin, W, 1), g)\n        self.ln1 = CellLN(W)\n        self.s2 = ortho(nn.Conv2d(W, W, 1), g)\n        self.res = nn.ModuleList([ResMLP(W) for _ in range(NRES)])\n        fw = W\n        if BIL > 0:\n            self.ba = ortho(nn.Conv2d(W, BIL, 1), 1.0)\n            self.bb = ortho(nn.Conv2d(W, BIL, 1), 1.0)\n            fw = W + BIL\n        if TRUNK > 0:\n            self.t0 = ortho(nn.Conv2d(fw, TW, 3, padding=1), g)\n            self.tn0 = nn.GroupNorm(GROUPS, TW)\n            self.tb = nn.ModuleList([ortho(nn.Conv2d(TW, TW, 3, padding=1), g) for _ in range(TRUNK - 1)])\n            self.tn = nn.ModuleList([nn.GroupNorm(GROUPS, TW) for _ in range(TRUNK - 1)])\n            fw = fw + TW\n        self.fw = fw\n        self.proj = ortho(nn.Conv2d(fw, PROJ, 1), g)\n        self.skip = ortho(nn.Conv2d(cin, SKIP, 1), g)\n        P = PROJ + SKIP\n        self.heads = nn.ModuleList()\n        self.h2 = nn.ModuleList()\n        self.outs = nn.ModuleList()\n        for (dy, dx) in self.fps:\n            self.heads.append(ortho(nn.Conv2d(P, HID, (dy + 2 * MARG, dx + 2 * MARG)), g))\n            if HID2:\n                self.h2.append(ortho(nn.Conv2d(HID, HID, 1), g))\n            self.outs.append(ortho(nn.Conv2d(HID, 1, 1), 0.01))\n        self.anchor = ortho(nn.Conv2d(P, 1, 1), 0.01)\n        self.type_bias = nn.Parameter(torch.zeros(1, nt, 1, 1))\n        if LOCAL3 > 0:\n            self.loc1 = ortho(nn.Conv2d(P, LOCAL3, 3, padding=1), g)\n            self.loc2 = ortho(nn.Conv2d(LOCAL3, nt, 1), 0.01)\n        if FLATD > 0:\n            N = self.Y * self.X\n            self.flat_in = ortho(nn.Conv2d(P, FLATD, 1), g)\n            self.flat_out = ortho(nn.Linear(FLATD * N, nt * N), 0.01)\n        gin = 2 * fw + 2 * P\n        self.glob = nn.Sequential(ortho(nn.Linear(gin, GLOB), g), nn.ReLU(), ortho(nn.Linear(GLOB, GLOB), g), nn.ReLU())\n        self.ctx = ortho(nn.Linear(GLOB, nt * HID), 1.0)\n        self.done_head = ortho(nn.Linear(GLOB, 1), 0.01)\n        self.value_head = ortho(nn.Linear(GLOB, 1), 1.0)\n\n    def forward(self, obs, mask):\n        B = obs.shape[0]\n        Y, X = self.Y, self.X\n        yy = torch.linspace(-1.0, 1.0, Y, device=obs.device, dtype=obs.dtype).view(1, 1, Y, 1).expand(B, 1, Y, X)\n        xx = torch.linspace(-1.0, 1.0, X, device=obs.device, dtype=obs.dtype).view(1, 1, 1, X).expand(B, 1, Y, X)\n        parts = [obs, yy, xx]\n        if MASKIN:\n            parts.append(mask[:, :self.nplace].to(obs.dtype).reshape(B, self.nt, Y, X))\n        x0 = torch.cat(parts, 1)\n        h = F.relu(self.ln1(self.s1(x0)))\n        h = F.relu(self.s2(h))\n        for blk in self.res:\n            h = blk(h)\n        f = h\n        if BIL > 0:\n            f = torch.cat([h, self.ba(h) * self.bb(h)], 1)\n        if TRUNK > 0:\n            t = F.relu(self.tn0(self.t0(f)))\n            for conv, nrm in zip(self.tb, self.tn):\n                t = F.relu(t + nrm(conv(t)))\n            f = torch.cat([f, t], 1)\n        p = torch.cat([F.relu(self.proj(f)), F.relu(self.skip(x0))], 1)\n        g = self.glob(torch.cat([f.mean((2, 3)), f.amax((2, 3)), p.mean((2, 3)), p.amax((2, 3))], 1))\n        ctx = self.ctx(g).view(B, self.nt, HID, 1, 1)\n        res = []\n        for i, (dy, dx) in enumerate(self.fps):\n            q = F.pad(p, (MARG, dx - 1 + MARG, MARG, dy - 1 + MARG))\n            hh = F.relu(self.heads[i](q) + ctx[:, i])\n            if HID2:\n                hh = F.relu(self.h2[i](hh))\n            res.append(self.outs[i](hh))\n        place = torch.cat(res, 1) + self.anchor(p) + self.type_bias\n        if LOCAL3 > 0:\n            place = place + self.loc2(F.relu(self.loc1(p)))\n        place = place.flatten(1)\n        if FLATD > 0:\n            place = place + self.flat_out(F.relu(self.flat_in(p)).flatten(1))\n        logits = torch.cat([place, self.done_head(g)], 1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 206095,
+    "fb_ms": 62.2,
+    "flops_per_sample": 16374528,
+    "flops_ratio": 0.9,
+    "sha": "add7a22cb5fbd72d",
+    "recipe": {
+     "lr": 0.003,
+     "n_envs": 512,
+     "rollout_len": 32,
+     "n_minibatches": 16,
+     "ppo_epochs": 1,
+     "ent_coef": 0.002,
+     "gamma": 0.99,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.3
+    },
+    "recipe_from_file": {
+     "lr": 0.003,
+     "n_envs": 512,
+     "rollout_len": 32,
+     "n_minibatches": 16,
+     "ppo_epochs": 1,
+     "ent_coef": 0.002,
+     "gamma": 0.99,
+     "gae_lambda": 0.95,
+     "clip_eps": 0.3
+    },
+    "budget": {
+     "allowed_steps": 425984,
+     "n_updates": 26,
+     "batch": 16384,
+     "steps": 425984,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0085
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0141,
+     "short_run_updates": 8
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 206095,
+    "flops_ratio": 0.9,
+    "train_steps": 425984,
+    "wall_s": 73.8,
+    "sha": "add7a22cb5fbd72d",
+    "readouts": null
+   }
+  }
+ ],
+ "rounds_done": 4,
+ "incumbent": null,
+ "analyses": {
+  "1": "There are no results in this search yet. Earlier searches ran 84 trials and every one scored 0 on dev and on training success. That means the agent never finishes an exact build, so the bottleneck is optimisation and inductive bias, not generalisation. In principle a footprint-local head can express whether a placement is correct: ReLU-linear functions of raw columns give 'missing cell at layer z with nothing missing below' and 'column height equals z', and min and max pooling over the footprint combines them. So round 1 stacks the untried generic fixes: orthogonal init with 0.01 policy-logit gain, GroupNorm, a raw-obs skip straight into the head, factorised logits, global context and dense heads that don't depend on anchor layout. The six candidates differ in trunk depth, how much they rely on dense heads, and recipe: epochs from 1 to 3, lr from 1e-3 to 3e-3, and gamma, lambda and clip extremes. Compute ratios run from about 1 to 2.2. None of these ideas has evidence yet. I expect zeros, and any nonzero score is the signal to follow.",
+  "2": "All 6 round-1 trials scored 0 on dev and 0 on training success. That adds to the earlier 84 zeros. None of these ideas raised training success above 0: initialisation hygiene, GroupNorm, raw skips, factorised, 3x3 and flattened heads, column MLPs and extreme recipes. Since training success is also 0, the agent never completes an exact build. The cause is optimisation or inductive bias, not generalisation. Aligned conv and footprint heads were correct in principle and still failed in every world. One possible explanation is that the changed world breaks spatial alignment: between the target and build channels, or between cells and actions (a transpose, flip or shift). If so, local convolutions cannot fix it, and plain flattened heads learn too slowly. This round tests a family not yet tried: MLP-Mixer networks with learned cell-mixing layers and a learned per-channel spatial remap. They can learn any fixed realignment from few samples because the weights are shared across channels. It also tests gated (GLU) multiplicative column features and new recipe corners.",
+  "3": "All 12 trials in this search scored 0, on dev and on training success. Earlier searches had 84 more zeros. So far the agent has never finished an exact build in training, not even by chance. No idea has evidence for or against it, so refining a best candidate makes no sense. The mixers, the per-channel spatial remap and the flat heads were meant to fix a possible misalignment, and they failed too. A simple misalignment is therefore not the whole explanation. This round uses six different architectures and recipes that have not been run before. The main new idea is a learned soft landing-layer attention. A shared per-layer encoder runs on 1x1 convolutions (costed per layer, Z times one cell), and a cumulative max over learned features (an operation the FLOP counter does not count) carries what lies beneath each layer. Each footprint then attends over layers with a softmax. Other new elements: a LayerNorm right after the first layer, coordinate channels, a 3x3 local head per type, entropy 0.05, clip 0.1, and lambda 0.8 with gamma 0.9.",
+  "4": "After 18 trials in this search and 84 before it, every dev score and every training-success score is exactly 0. That covers init hygiene, normalisation, skips, layout-free heads (flat, mixers, remaps), landing-layer attention and extreme recipes. Since the agent never finishes an exact build even in training, this is an optimisation and inductive-bias problem, not a generalisation one. The landing-attention nets ran 5 to 10 times slower without helping, so I avoid per-layer reshapes. This is the last round, so no ablations; each candidate stacks ideas that haven't been tried yet. The main new head is an exact-footprint conv per brick type: a kernel the size of the footprint, optionally with a 1-cell margin. It keeps which cell is which, unlike min/max/avg pooling. I add a bilinear stem (products of learned features, for AND-like checks), residual cell MLPs, the legal mask as input, and untried recipe combinations (1,024 envs \u00d7 8-step rollouts, entropy near 0). I expect most of these to score 0 as well. If all six do, the search falls back to the starting architecture."
+ }
+}

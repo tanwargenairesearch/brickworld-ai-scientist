@@ -1,0 +1,71 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+RECIPE = {"lr": 3e-3, "n_envs": 1024, "rollout_len": 8, "n_minibatches": 32, "ppo_epochs": 1, "gamma": 0.95, "gae_lambda": 0.8, "ent_coef": 0.005}
+
+STEM = 32
+COL = 24
+WIDTH = 24
+PROJ = 16
+HID = 16
+G = 32
+MD = 8
+
+
+class PoolHead(nn.Module):
+    def __init__(self, c, footprints, proj, hid):
+        super().__init__()
+        self.fps = [(int(a), int(b)) for a, b in footprints]
+        self.proj = nn.Conv2d(c, proj, 1)
+        self.mix = nn.ModuleList([nn.Conv2d(3 * proj, hid, 1) for _ in self.fps])
+        self.outs = nn.ModuleList([nn.Conv2d(hid, 1, 1) for _ in self.fps])
+
+    def forward(self, f):
+        p = self.proj(f)
+        res = []
+        for (dy, dx), mix, out in zip(self.fps, self.mix, self.outs):
+            if dy * dx == 1:
+                mx, mn, av = p, p, p
+            else:
+                q = F.pad(p, (0, dx - 1, 0, dy - 1))
+                mx = F.max_pool2d(q, (dy, dx), stride=1)
+                mn = -F.max_pool2d(-q, (dy, dx), stride=1)
+                av = F.avg_pool2d(q, (dy, dx), stride=1)
+            h = F.relu(mix(torch.cat([mx, mn, av], dim=1)))
+            res.append(out(h))
+        return torch.cat(res, dim=1).flatten(1)
+
+
+class Net(nn.Module):
+    def __init__(self, spec):
+        super().__init__()
+        self.Z = int(spec.Z)
+        self.stem = nn.Sequential(
+            nn.Conv2d(spec.in_channels, STEM, 1), nn.ReLU(),
+            nn.Conv2d(STEM, COL, 1), nn.ReLU())
+        self.c1 = nn.Conv2d(COL, WIDTH, 3, padding=1)
+        self.head = PoolHead(WIDTH + COL, spec.footprints, PROJ, HID)
+        self.glob = nn.Sequential(nn.Linear(2 * WIDTH, G), nn.ReLU())
+        self.mdet = nn.Conv2d(self.Z, MD, 1, bias=False)
+        self.dlin = nn.Linear(MD, 1)
+        self.vlin = nn.Linear(MD, 1)
+        self.done_head = nn.Linear(G, 1)
+        self.value_head = nn.Linear(G, 1)
+
+    def forward(self, obs, mask):
+        Z = self.Z
+        s = self.stem(obs)
+        x = F.relu(self.c1(s))
+        place = self.head(torch.cat([x, s], dim=1))
+        g = self.glob(torch.cat([x.mean((2, 3)), x.amax((2, 3))], dim=1))
+        m = self.mdet(obs[:, 2 * Z:3 * Z]).abs().sum((2, 3))
+        lc = torch.log(m + 0.05)
+        done = self.done_head(g) + self.dlin(lc)
+        value = self.value_head(g) + self.vlin(lc)
+        logits = torch.cat([place, done], dim=1)
+        return logits, value.squeeze(1)
+
+
+def build_policy(spec):
+    return Net(spec)

@@ -1,0 +1,1644 @@
+{
+ "trials": [
+  {
+   "label": "r1c1",
+   "round": 1,
+   "name": "set A layouts",
+   "hypothesis": "The reference net with four summed layout readings (identity, transpose, y-flip, x-flip) of the mask input and the logit output. It targets actions that are transposed or flipped relative to the obs. A nonzero score means one of these four layouts is right and should be split. A score of 0, while set B scores, points to a combined flip or transpose.",
+   "code": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nLAYOUTS = ((0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1))\nOBS_SYM = False\nUSE_LN = False\nSTEM = 64\nWIDTH = 40\nHEAD = 32\nGH = 64\n\nRECIPE = {\"lr\": 2e-3, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 8, \"ppo_epochs\": 2, \"ent_coef\": 0.005, \"gamma\": 0.9, \"gae_lambda\": 0.85}\n\n\ndef fwd_layout(t, lay):\n    tr, fy, fx = lay\n    if tr:\n        t = t.transpose(-1, -2)\n    if fy:\n        t = t.flip(-2)\n    if fx:\n        t = t.flip(-1)\n    return t\n\n\ndef inv_layout(t, lay):\n    tr, fy, fx = lay\n    if fx:\n        t = t.flip(-1)\n    if fy:\n        t = t.flip(-2)\n    if tr:\n        t = t.transpose(-1, -2)\n    return t\n\n\nclass ChanLN(nn.Module):\n    def __init__(self, c):\n        super().__init__()\n        self.ln = nn.LayerNorm(c)\n\n    def forward(self, x):\n        return self.ln(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        self.n_place = int(spec.n_place)\n        cells = self.Y * self.X\n        self.K = (self.n_place + cells - 1) // cells\n        sq = self.Y == self.X\n        lays = []\n        for l in LAYOUTS:\n            l2 = tuple(l) if sq else (0, l[1], l[2])\n            if l2 not in lays:\n                lays.append(l2)\n        self.lays = lays\n        if OBS_SYM:\n            syms = [(a, b, c) for a in (0, 1) for b in (0, 1) for c in (0, 1) if sq or a == 0]\n        else:\n            syms = [(0, 0, 0)]\n        self.syms = syms\n        c_obs = spec.in_channels * len(syms) + 2\n        c_mask = self.K * len(lays)\n        if USE_LN:\n            self.obs_stem = nn.Sequential(nn.Conv2d(c_obs, STEM, 1), ChanLN(STEM), nn.ReLU())\n            self.mask_stem = nn.Sequential(nn.Conv2d(c_mask, STEM, 1), ChanLN(STEM), nn.ReLU())\n            self.stem2 = nn.Sequential(nn.Conv2d(STEM, WIDTH, 1), ChanLN(WIDTH), nn.ReLU())\n            self.lns = nn.ModuleList([ChanLN(WIDTH) for _ in range(2)])\n        else:\n            self.stem1 = nn.Sequential(nn.Conv2d(c_obs + c_mask, STEM, 1), nn.ReLU())\n            self.stem2 = nn.Sequential(nn.Conv2d(STEM, WIDTH, 1), nn.ReLU())\n        self.res = nn.ModuleList([nn.Conv2d(WIDTH, WIDTH, 3, padding=1) for _ in range(2)])\n        self.h3 = nn.Conv2d(WIDTH, HEAD, 3, padding=1)\n        self.h1 = nn.Conv2d(WIDTH, HEAD, 1)\n        self.hout = nn.Conv2d(HEAD, self.K * len(lays), 1)\n        self.glob = nn.Sequential(nn.Linear(2 * WIDTH, GH), nn.ReLU())\n        self.done_head = nn.Linear(GH, 1)\n        self.value_head = nn.Linear(GH, 1)\n        if USE_LN:\n            for m in (self.hout, self.done_head):\n                nn.init.orthogonal_(m.weight, 0.01)\n                nn.init.zeros_(m.bias)\n            nn.init.orthogonal_(self.value_head.weight, 1.0)\n            nn.init.zeros_(self.value_head.bias)\n        ys = torch.linspace(-1.0, 1.0, self.Y).view(1, 1, self.Y, 1).expand(1, 1, self.Y, self.X)\n        xs = torch.linspace(-1.0, 1.0, self.X).view(1, 1, 1, self.X).expand(1, 1, self.Y, self.X)\n        self.register_buffer(\"coords\", torch.cat([ys, xs], dim=1).contiguous())\n\n    def forward(self, obs, mask):\n        B = obs.shape[0]\n        cells = self.Y * self.X\n        m = mask[:, :self.n_place].float()\n        pad = self.K * cells - self.n_place\n        if pad > 0:\n            m = F.pad(m, (0, pad))\n        m = m.view(B, self.K, self.Y, self.X)\n        mfeat = torch.cat([fwd_layout(m, l) for l in self.lays], dim=1)\n        ofeat = torch.cat([fwd_layout(obs, s) for s in self.syms] + [self.coords.expand(B, -1, -1, -1)], dim=1)\n        if USE_LN:\n            s = self.obs_stem(ofeat) + self.mask_stem(mfeat)\n        else:\n            s = self.stem1(torch.cat([ofeat, mfeat], dim=1))\n        x = self.stem2(s)\n        for i, conv in enumerate(self.res):\n            y = x + conv(x)\n            if USE_LN:\n                y = self.lns[i](y)\n            x = F.relu(y)\n        h = F.relu(self.h3(x) + self.h1(x))\n        o = self.hout(h).view(B, len(self.lays), self.K, self.Y, self.X)\n        place = 0\n        for i, l in enumerate(self.lays):\n            place = place + inv_layout(o[:, i], l)\n        place = place.reshape(B, -1)[:, :self.n_place]\n        g = self.glob(torch.cat([x.mean((2, 3)), x.amax((2, 3))], dim=1))\n        logits = torch.cat([place, self.done_head(g)], dim=1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 53130,
+    "fb_ms": 31.97,
+    "flops_per_sample": 17922816,
+    "flops_ratio": 0.98,
+    "sha": "542ca62737eab5ea",
+    "recipe": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 8,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.9,
+     "gae_lambda": 0.85,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 8,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.9,
+     "gae_lambda": 0.85
+    },
+    "budget": {
+     "allowed_steps": 243419,
+     "n_updates": 118,
+     "batch": 2048,
+     "steps": 241664,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0108
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 8
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 53130,
+    "flops_ratio": 0.98,
+    "train_steps": 241664,
+    "wall_s": 44.0,
+    "sha": "542ca62737eab5ea",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r1c2",
+   "round": 1,
+   "name": "set B layouts",
+   "hypothesis": "The same net with set B (y+x-flip, transpose+y-flip, transpose+x-flip, transpose+y+x-flip). It targets an action frame that is rotated or anti-transposed relative to the obs. A nonzero score where set A scores 0 points to a combined flip or transpose, which round 2 would split. A 0 here and on set A rules out a simple action-frame mismatch on its own.",
+   "code": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nLAYOUTS = ((0, 1, 1), (1, 1, 0), (1, 0, 1), (1, 1, 1))\nOBS_SYM = False\nUSE_LN = False\nSTEM = 64\nWIDTH = 40\nHEAD = 32\nGH = 64\n\nRECIPE = {\"lr\": 2e-3, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 8, \"ppo_epochs\": 2, \"ent_coef\": 0.005, \"gamma\": 0.9, \"gae_lambda\": 0.85}\n\n\ndef fwd_layout(t, lay):\n    tr, fy, fx = lay\n    if tr:\n        t = t.transpose(-1, -2)\n    if fy:\n        t = t.flip(-2)\n    if fx:\n        t = t.flip(-1)\n    return t\n\n\ndef inv_layout(t, lay):\n    tr, fy, fx = lay\n    if fx:\n        t = t.flip(-1)\n    if fy:\n        t = t.flip(-2)\n    if tr:\n        t = t.transpose(-1, -2)\n    return t\n\n\nclass ChanLN(nn.Module):\n    def __init__(self, c):\n        super().__init__()\n        self.ln = nn.LayerNorm(c)\n\n    def forward(self, x):\n        return self.ln(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        self.n_place = int(spec.n_place)\n        cells = self.Y * self.X\n        self.K = (self.n_place + cells - 1) // cells\n        sq = self.Y == self.X\n        lays = []\n        for l in LAYOUTS:\n            l2 = tuple(l) if sq else (0, l[1], l[2])\n            if l2 not in lays:\n                lays.append(l2)\n        self.lays = lays\n        if OBS_SYM:\n            syms = [(a, b, c) for a in (0, 1) for b in (0, 1) for c in (0, 1) if sq or a == 0]\n        else:\n            syms = [(0, 0, 0)]\n        self.syms = syms\n        c_obs = spec.in_channels * len(syms) + 2\n        c_mask = self.K * len(lays)\n        if USE_LN:\n            self.obs_stem = nn.Sequential(nn.Conv2d(c_obs, STEM, 1), ChanLN(STEM), nn.ReLU())\n            self.mask_stem = nn.Sequential(nn.Conv2d(c_mask, STEM, 1), ChanLN(STEM), nn.ReLU())\n            self.stem2 = nn.Sequential(nn.Conv2d(STEM, WIDTH, 1), ChanLN(WIDTH), nn.ReLU())\n            self.lns = nn.ModuleList([ChanLN(WIDTH) for _ in range(2)])\n        else:\n            self.stem1 = nn.Sequential(nn.Conv2d(c_obs + c_mask, STEM, 1), nn.ReLU())\n            self.stem2 = nn.Sequential(nn.Conv2d(STEM, WIDTH, 1), nn.ReLU())\n        self.res = nn.ModuleList([nn.Conv2d(WIDTH, WIDTH, 3, padding=1) for _ in range(2)])\n        self.h3 = nn.Conv2d(WIDTH, HEAD, 3, padding=1)\n        self.h1 = nn.Conv2d(WIDTH, HEAD, 1)\n        self.hout = nn.Conv2d(HEAD, self.K * len(lays), 1)\n        self.glob = nn.Sequential(nn.Linear(2 * WIDTH, GH), nn.ReLU())\n        self.done_head = nn.Linear(GH, 1)\n        self.value_head = nn.Linear(GH, 1)\n        if USE_LN:\n            for m in (self.hout, self.done_head):\n                nn.init.orthogonal_(m.weight, 0.01)\n                nn.init.zeros_(m.bias)\n            nn.init.orthogonal_(self.value_head.weight, 1.0)\n            nn.init.zeros_(self.value_head.bias)\n        ys = torch.linspace(-1.0, 1.0, self.Y).view(1, 1, self.Y, 1).expand(1, 1, self.Y, self.X)\n        xs = torch.linspace(-1.0, 1.0, self.X).view(1, 1, 1, self.X).expand(1, 1, self.Y, self.X)\n        self.register_buffer(\"coords\", torch.cat([ys, xs], dim=1).contiguous())\n\n    def forward(self, obs, mask):\n        B = obs.shape[0]\n        cells = self.Y * self.X\n        m = mask[:, :self.n_place].float()\n        pad = self.K * cells - self.n_place\n        if pad > 0:\n            m = F.pad(m, (0, pad))\n        m = m.view(B, self.K, self.Y, self.X)\n        mfeat = torch.cat([fwd_layout(m, l) for l in self.lays], dim=1)\n        ofeat = torch.cat([fwd_layout(obs, s) for s in self.syms] + [self.coords.expand(B, -1, -1, -1)], dim=1)\n        if USE_LN:\n            s = self.obs_stem(ofeat) + self.mask_stem(mfeat)\n        else:\n            s = self.stem1(torch.cat([ofeat, mfeat], dim=1))\n        x = self.stem2(s)\n        for i, conv in enumerate(self.res):\n            y = x + conv(x)\n            if USE_LN:\n                y = self.lns[i](y)\n            x = F.relu(y)\n        h = F.relu(self.h3(x) + self.h1(x))\n        o = self.hout(h).view(B, len(self.lays), self.K, self.Y, self.X)\n        place = 0\n        for i, l in enumerate(self.lays):\n            place = place + inv_layout(o[:, i], l)\n        place = place.reshape(B, -1)[:, :self.n_place]\n        g = self.glob(torch.cat([x.mean((2, 3)), x.amax((2, 3))], dim=1))\n        logits = torch.cat([place, self.done_head(g)], dim=1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 53130,
+    "fb_ms": 35.15,
+    "flops_per_sample": 17922816,
+    "flops_ratio": 0.98,
+    "sha": "2031e55b6fb75625",
+    "recipe": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 8,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.9,
+     "gae_lambda": 0.85,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 8,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.9,
+     "gae_lambda": 0.85
+    },
+    "budget": {
+     "allowed_steps": 243419,
+     "n_updates": 118,
+     "batch": 2048,
+     "steps": 241664,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0137
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 8
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 53130,
+    "flops_ratio": 0.98,
+    "train_steps": 241664,
+    "wall_s": 45.6,
+    "sha": "2031e55b6fb75625",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r1c3",
+   "round": 1,
+   "name": "set A + obs symmetries",
+   "hypothesis": "Set A, with the obs also fed into the 1x1 stem under all 8 grid symmetries (r\u22481.2). It targets an obs grid that is reoriented relative to both the actions and the mask, as in worlds 1 and 5. It is refuted if it scores no better than plain set A. If it scores while plain A is 0, an obs reorientation is confirmed and round 2 splits the obs views.",
+   "code": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nLAYOUTS = ((0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1))\nOBS_SYM = True\nUSE_LN = False\nSTEM = 64\nWIDTH = 40\nHEAD = 32\nGH = 64\n\nRECIPE = {\"lr\": 2e-3, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 8, \"ppo_epochs\": 2, \"ent_coef\": 0.005, \"gamma\": 0.9, \"gae_lambda\": 0.85}\n\n\ndef fwd_layout(t, lay):\n    tr, fy, fx = lay\n    if tr:\n        t = t.transpose(-1, -2)\n    if fy:\n        t = t.flip(-2)\n    if fx:\n        t = t.flip(-1)\n    return t\n\n\ndef inv_layout(t, lay):\n    tr, fy, fx = lay\n    if fx:\n        t = t.flip(-1)\n    if fy:\n        t = t.flip(-2)\n    if tr:\n        t = t.transpose(-1, -2)\n    return t\n\n\nclass ChanLN(nn.Module):\n    def __init__(self, c):\n        super().__init__()\n        self.ln = nn.LayerNorm(c)\n\n    def forward(self, x):\n        return self.ln(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        self.n_place = int(spec.n_place)\n        cells = self.Y * self.X\n        self.K = (self.n_place + cells - 1) // cells\n        sq = self.Y == self.X\n        lays = []\n        for l in LAYOUTS:\n            l2 = tuple(l) if sq else (0, l[1], l[2])\n            if l2 not in lays:\n                lays.append(l2)\n        self.lays = lays\n        if OBS_SYM:\n            syms = [(a, b, c) for a in (0, 1) for b in (0, 1) for c in (0, 1) if sq or a == 0]\n        else:\n            syms = [(0, 0, 0)]\n        self.syms = syms\n        c_obs = spec.in_channels * len(syms) + 2\n        c_mask = self.K * len(lays)\n        if USE_LN:\n            self.obs_stem = nn.Sequential(nn.Conv2d(c_obs, STEM, 1), ChanLN(STEM), nn.ReLU())\n            self.mask_stem = nn.Sequential(nn.Conv2d(c_mask, STEM, 1), ChanLN(STEM), nn.ReLU())\n            self.stem2 = nn.Sequential(nn.Conv2d(STEM, WIDTH, 1), ChanLN(WIDTH), nn.ReLU())\n            self.lns = nn.ModuleList([ChanLN(WIDTH) for _ in range(2)])\n        else:\n            self.stem1 = nn.Sequential(nn.Conv2d(c_obs + c_mask, STEM, 1), nn.ReLU())\n            self.stem2 = nn.Sequential(nn.Conv2d(STEM, WIDTH, 1), nn.ReLU())\n        self.res = nn.ModuleList([nn.Conv2d(WIDTH, WIDTH, 3, padding=1) for _ in range(2)])\n        self.h3 = nn.Conv2d(WIDTH, HEAD, 3, padding=1)\n        self.h1 = nn.Conv2d(WIDTH, HEAD, 1)\n        self.hout = nn.Conv2d(HEAD, self.K * len(lays), 1)\n        self.glob = nn.Sequential(nn.Linear(2 * WIDTH, GH), nn.ReLU())\n        self.done_head = nn.Linear(GH, 1)\n        self.value_head = nn.Linear(GH, 1)\n        if USE_LN:\n            for m in (self.hout, self.done_head):\n                nn.init.orthogonal_(m.weight, 0.01)\n                nn.init.zeros_(m.bias)\n            nn.init.orthogonal_(self.value_head.weight, 1.0)\n            nn.init.zeros_(self.value_head.bias)\n        ys = torch.linspace(-1.0, 1.0, self.Y).view(1, 1, self.Y, 1).expand(1, 1, self.Y, self.X)\n        xs = torch.linspace(-1.0, 1.0, self.X).view(1, 1, 1, self.X).expand(1, 1, self.Y, self.X)\n        self.register_buffer(\"coords\", torch.cat([ys, xs], dim=1).contiguous())\n\n    def forward(self, obs, mask):\n        B = obs.shape[0]\n        cells = self.Y * self.X\n        m = mask[:, :self.n_place].float()\n        pad = self.K * cells - self.n_place\n        if pad > 0:\n            m = F.pad(m, (0, pad))\n        m = m.view(B, self.K, self.Y, self.X)\n        mfeat = torch.cat([fwd_layout(m, l) for l in self.lays], dim=1)\n        ofeat = torch.cat([fwd_layout(obs, s) for s in self.syms] + [self.coords.expand(B, -1, -1, -1)], dim=1)\n        if USE_LN:\n            s = self.obs_stem(ofeat) + self.mask_stem(mfeat)\n        else:\n            s = self.stem1(torch.cat([ofeat, mfeat], dim=1))\n        x = self.stem2(s)\n        for i, conv in enumerate(self.res):\n            y = x + conv(x)\n            if USE_LN:\n                y = self.lns[i](y)\n            x = F.relu(y)\n        h = F.relu(self.h3(x) + self.h1(x))\n        o = self.hout(h).view(B, len(self.lays), self.K, self.Y, self.X)\n        place = 0\n        for i, l in enumerate(self.lays):\n            place = place + inv_layout(o[:, i], l)\n        place = place.reshape(B, -1)[:, :self.n_place]\n        g = self.glob(torch.cat([x.mean((2, 3)), x.amax((2, 3))], dim=1))\n        logits = torch.cat([place, self.done_head(g)], dim=1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 65226,
+    "fb_ms": 46.23,
+    "flops_per_sample": 21019392,
+    "flops_ratio": 1.15,
+    "sha": "03b187bc36f87e65",
+    "recipe": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 8,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.9,
+     "gae_lambda": 0.85,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 8,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.9,
+     "gae_lambda": 0.85
+    },
+    "budget": {
+     "allowed_steps": 211756,
+     "n_updates": 103,
+     "batch": 2048,
+     "steps": 210944,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0014
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 6
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 65226,
+    "flops_ratio": 1.15,
+    "train_steps": 210944,
+    "wall_s": 41.2,
+    "sha": "03b187bc36f87e65",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r1c4",
+   "round": 1,
+   "name": "set B + obs symmetries",
+   "hypothesis": "Set B layouts with the obs fed under all 8 grid symmetries. It covers worlds where the obs is reoriented and the action layout needs a combined flip or transpose. It is refuted if it scores 0 while set B alone scores, which would mean the extra views only dilute the stem. A score here alone would point to an obs reorientation combined with a set-B action frame.",
+   "code": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nLAYOUTS = ((0, 1, 1), (1, 1, 0), (1, 0, 1), (1, 1, 1))\nOBS_SYM = True\nUSE_LN = False\nSTEM = 64\nWIDTH = 40\nHEAD = 32\nGH = 64\n\nRECIPE = {\"lr\": 2e-3, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 8, \"ppo_epochs\": 2, \"ent_coef\": 0.005, \"gamma\": 0.9, \"gae_lambda\": 0.85}\n\n\ndef fwd_layout(t, lay):\n    tr, fy, fx = lay\n    if tr:\n        t = t.transpose(-1, -2)\n    if fy:\n        t = t.flip(-2)\n    if fx:\n        t = t.flip(-1)\n    return t\n\n\ndef inv_layout(t, lay):\n    tr, fy, fx = lay\n    if fx:\n        t = t.flip(-1)\n    if fy:\n        t = t.flip(-2)\n    if tr:\n        t = t.transpose(-1, -2)\n    return t\n\n\nclass ChanLN(nn.Module):\n    def __init__(self, c):\n        super().__init__()\n        self.ln = nn.LayerNorm(c)\n\n    def forward(self, x):\n        return self.ln(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        self.n_place = int(spec.n_place)\n        cells = self.Y * self.X\n        self.K = (self.n_place + cells - 1) // cells\n        sq = self.Y == self.X\n        lays = []\n        for l in LAYOUTS:\n            l2 = tuple(l) if sq else (0, l[1], l[2])\n            if l2 not in lays:\n                lays.append(l2)\n        self.lays = lays\n        if OBS_SYM:\n            syms = [(a, b, c) for a in (0, 1) for b in (0, 1) for c in (0, 1) if sq or a == 0]\n        else:\n            syms = [(0, 0, 0)]\n        self.syms = syms\n        c_obs = spec.in_channels * len(syms) + 2\n        c_mask = self.K * len(lays)\n        if USE_LN:\n            self.obs_stem = nn.Sequential(nn.Conv2d(c_obs, STEM, 1), ChanLN(STEM), nn.ReLU())\n            self.mask_stem = nn.Sequential(nn.Conv2d(c_mask, STEM, 1), ChanLN(STEM), nn.ReLU())\n            self.stem2 = nn.Sequential(nn.Conv2d(STEM, WIDTH, 1), ChanLN(WIDTH), nn.ReLU())\n            self.lns = nn.ModuleList([ChanLN(WIDTH) for _ in range(2)])\n        else:\n            self.stem1 = nn.Sequential(nn.Conv2d(c_obs + c_mask, STEM, 1), nn.ReLU())\n            self.stem2 = nn.Sequential(nn.Conv2d(STEM, WIDTH, 1), nn.ReLU())\n        self.res = nn.ModuleList([nn.Conv2d(WIDTH, WIDTH, 3, padding=1) for _ in range(2)])\n        self.h3 = nn.Conv2d(WIDTH, HEAD, 3, padding=1)\n        self.h1 = nn.Conv2d(WIDTH, HEAD, 1)\n        self.hout = nn.Conv2d(HEAD, self.K * len(lays), 1)\n        self.glob = nn.Sequential(nn.Linear(2 * WIDTH, GH), nn.ReLU())\n        self.done_head = nn.Linear(GH, 1)\n        self.value_head = nn.Linear(GH, 1)\n        if USE_LN:\n            for m in (self.hout, self.done_head):\n                nn.init.orthogonal_(m.weight, 0.01)\n                nn.init.zeros_(m.bias)\n            nn.init.orthogonal_(self.value_head.weight, 1.0)\n            nn.init.zeros_(self.value_head.bias)\n        ys = torch.linspace(-1.0, 1.0, self.Y).view(1, 1, self.Y, 1).expand(1, 1, self.Y, self.X)\n        xs = torch.linspace(-1.0, 1.0, self.X).view(1, 1, 1, self.X).expand(1, 1, self.Y, self.X)\n        self.register_buffer(\"coords\", torch.cat([ys, xs], dim=1).contiguous())\n\n    def forward(self, obs, mask):\n        B = obs.shape[0]\n        cells = self.Y * self.X\n        m = mask[:, :self.n_place].float()\n        pad = self.K * cells - self.n_place\n        if pad > 0:\n            m = F.pad(m, (0, pad))\n        m = m.view(B, self.K, self.Y, self.X)\n        mfeat = torch.cat([fwd_layout(m, l) for l in self.lays], dim=1)\n        ofeat = torch.cat([fwd_layout(obs, s) for s in self.syms] + [self.coords.expand(B, -1, -1, -1)], dim=1)\n        if USE_LN:\n            s = self.obs_stem(ofeat) + self.mask_stem(mfeat)\n        else:\n            s = self.stem1(torch.cat([ofeat, mfeat], dim=1))\n        x = self.stem2(s)\n        for i, conv in enumerate(self.res):\n            y = x + conv(x)\n            if USE_LN:\n                y = self.lns[i](y)\n            x = F.relu(y)\n        h = F.relu(self.h3(x) + self.h1(x))\n        o = self.hout(h).view(B, len(self.lays), self.K, self.Y, self.X)\n        place = 0\n        for i, l in enumerate(self.lays):\n            place = place + inv_layout(o[:, i], l)\n        place = place.reshape(B, -1)[:, :self.n_place]\n        g = self.glob(torch.cat([x.mean((2, 3)), x.amax((2, 3))], dim=1))\n        logits = torch.cat([place, self.done_head(g)], dim=1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 65226,
+    "fb_ms": 42.28,
+    "flops_per_sample": 21019392,
+    "flops_ratio": 1.15,
+    "sha": "8dbf6bb28e49a6c9",
+    "recipe": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 8,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.9,
+     "gae_lambda": 0.85,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 8,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.9,
+     "gae_lambda": 0.85
+    },
+    "budget": {
+     "allowed_steps": 211756,
+     "n_updates": 103,
+     "batch": 2048,
+     "steps": 210944,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0054
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 6
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 65226,
+    "flops_ratio": 1.15,
+    "train_steps": 210944,
+    "wall_s": 42.0,
+    "sha": "8dbf6bb28e49a6c9",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r1c5",
+   "round": 1,
+   "name": "set A + LayerNorm stems",
+   "hypothesis": "Set A with separate obs and mask 1x1 stems, each followed by per-cell LayerNorm, LayerNorm after every trunk block, and gain-0.01 policy outputs. It targets inputs on an unexpected scale, as in world 4, where only this escaped zero. It is refuted if it scores 0 while plain set A scores, or no better than plain set A. A score with plain A at 0 would point to scaled inputs.",
+   "code": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nLAYOUTS = ((0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1))\nOBS_SYM = False\nUSE_LN = True\nSTEM = 64\nWIDTH = 40\nHEAD = 32\nGH = 64\n\nRECIPE = {\"lr\": 2e-3, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 8, \"ppo_epochs\": 2, \"ent_coef\": 0.005, \"gamma\": 0.9, \"gae_lambda\": 0.85}\n\n\ndef fwd_layout(t, lay):\n    tr, fy, fx = lay\n    if tr:\n        t = t.transpose(-1, -2)\n    if fy:\n        t = t.flip(-2)\n    if fx:\n        t = t.flip(-1)\n    return t\n\n\ndef inv_layout(t, lay):\n    tr, fy, fx = lay\n    if fx:\n        t = t.flip(-1)\n    if fy:\n        t = t.flip(-2)\n    if tr:\n        t = t.transpose(-1, -2)\n    return t\n\n\nclass ChanLN(nn.Module):\n    def __init__(self, c):\n        super().__init__()\n        self.ln = nn.LayerNorm(c)\n\n    def forward(self, x):\n        return self.ln(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        self.n_place = int(spec.n_place)\n        cells = self.Y * self.X\n        self.K = (self.n_place + cells - 1) // cells\n        sq = self.Y == self.X\n        lays = []\n        for l in LAYOUTS:\n            l2 = tuple(l) if sq else (0, l[1], l[2])\n            if l2 not in lays:\n                lays.append(l2)\n        self.lays = lays\n        if OBS_SYM:\n            syms = [(a, b, c) for a in (0, 1) for b in (0, 1) for c in (0, 1) if sq or a == 0]\n        else:\n            syms = [(0, 0, 0)]\n        self.syms = syms\n        c_obs = spec.in_channels * len(syms) + 2\n        c_mask = self.K * len(lays)\n        if USE_LN:\n            self.obs_stem = nn.Sequential(nn.Conv2d(c_obs, STEM, 1), ChanLN(STEM), nn.ReLU())\n            self.mask_stem = nn.Sequential(nn.Conv2d(c_mask, STEM, 1), ChanLN(STEM), nn.ReLU())\n            self.stem2 = nn.Sequential(nn.Conv2d(STEM, WIDTH, 1), ChanLN(WIDTH), nn.ReLU())\n            self.lns = nn.ModuleList([ChanLN(WIDTH) for _ in range(2)])\n        else:\n            self.stem1 = nn.Sequential(nn.Conv2d(c_obs + c_mask, STEM, 1), nn.ReLU())\n            self.stem2 = nn.Sequential(nn.Conv2d(STEM, WIDTH, 1), nn.ReLU())\n        self.res = nn.ModuleList([nn.Conv2d(WIDTH, WIDTH, 3, padding=1) for _ in range(2)])\n        self.h3 = nn.Conv2d(WIDTH, HEAD, 3, padding=1)\n        self.h1 = nn.Conv2d(WIDTH, HEAD, 1)\n        self.hout = nn.Conv2d(HEAD, self.K * len(lays), 1)\n        self.glob = nn.Sequential(nn.Linear(2 * WIDTH, GH), nn.ReLU())\n        self.done_head = nn.Linear(GH, 1)\n        self.value_head = nn.Linear(GH, 1)\n        if USE_LN:\n            for m in (self.hout, self.done_head):\n                nn.init.orthogonal_(m.weight, 0.01)\n                nn.init.zeros_(m.bias)\n            nn.init.orthogonal_(self.value_head.weight, 1.0)\n            nn.init.zeros_(self.value_head.bias)\n        ys = torch.linspace(-1.0, 1.0, self.Y).view(1, 1, self.Y, 1).expand(1, 1, self.Y, self.X)\n        xs = torch.linspace(-1.0, 1.0, self.X).view(1, 1, 1, self.X).expand(1, 1, self.Y, self.X)\n        self.register_buffer(\"coords\", torch.cat([ys, xs], dim=1).contiguous())\n\n    def forward(self, obs, mask):\n        B = obs.shape[0]\n        cells = self.Y * self.X\n        m = mask[:, :self.n_place].float()\n        pad = self.K * cells - self.n_place\n        if pad > 0:\n            m = F.pad(m, (0, pad))\n        m = m.view(B, self.K, self.Y, self.X)\n        mfeat = torch.cat([fwd_layout(m, l) for l in self.lays], dim=1)\n        ofeat = torch.cat([fwd_layout(obs, s) for s in self.syms] + [self.coords.expand(B, -1, -1, -1)], dim=1)\n        if USE_LN:\n            s = self.obs_stem(ofeat) + self.mask_stem(mfeat)\n        else:\n            s = self.stem1(torch.cat([ofeat, mfeat], dim=1))\n        x = self.stem2(s)\n        for i, conv in enumerate(self.res):\n            y = x + conv(x)\n            if USE_LN:\n                y = self.lns[i](y)\n            x = F.relu(y)\n        h = F.relu(self.h3(x) + self.h1(x))\n        o = self.hout(h).view(B, len(self.lays), self.K, self.Y, self.X)\n        place = 0\n        for i, l in enumerate(self.lays):\n            place = place + inv_layout(o[:, i], l)\n        place = place.reshape(B, -1)[:, :self.n_place]\n        g = self.glob(torch.cat([x.mean((2, 3)), x.amax((2, 3))], dim=1))\n        logits = torch.cat([place, self.done_head(g)], dim=1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 53690,
+    "fb_ms": 37.85,
+    "flops_per_sample": 17922816,
+    "flops_ratio": 0.98,
+    "sha": "0be46fa72bc24cb8",
+    "recipe": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 8,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.9,
+     "gae_lambda": 0.85,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 8,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.9,
+     "gae_lambda": 0.85
+    },
+    "budget": {
+     "allowed_steps": 243419,
+     "n_updates": 118,
+     "batch": 2048,
+     "steps": 241664,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0208
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 8
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 53690,
+    "flops_ratio": 0.98,
+    "train_steps": 241664,
+    "wall_s": 77.8,
+    "sha": "0be46fa72bc24cb8",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r1c6",
+   "round": 1,
+   "name": "set A + obs sym + LayerNorm",
+   "hypothesis": "Set A with the obs under all 8 grid symmetries, LayerNorm stems and trunk, and gain-0.01 outputs. It hedges against a reoriented obs and an unexpected input scale at once. It is refuted if it scores no better than the LayerNorm-only and symmetry-only runs. If only this run scores, both deviations are present, and round 2 should split the layouts while keeping both components.",
+   "code": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nLAYOUTS = ((0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1))\nOBS_SYM = True\nUSE_LN = True\nSTEM = 64\nWIDTH = 40\nHEAD = 32\nGH = 64\n\nRECIPE = {\"lr\": 2e-3, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 8, \"ppo_epochs\": 2, \"ent_coef\": 0.005, \"gamma\": 0.9, \"gae_lambda\": 0.85}\n\n\ndef fwd_layout(t, lay):\n    tr, fy, fx = lay\n    if tr:\n        t = t.transpose(-1, -2)\n    if fy:\n        t = t.flip(-2)\n    if fx:\n        t = t.flip(-1)\n    return t\n\n\ndef inv_layout(t, lay):\n    tr, fy, fx = lay\n    if fx:\n        t = t.flip(-1)\n    if fy:\n        t = t.flip(-2)\n    if tr:\n        t = t.transpose(-1, -2)\n    return t\n\n\nclass ChanLN(nn.Module):\n    def __init__(self, c):\n        super().__init__()\n        self.ln = nn.LayerNorm(c)\n\n    def forward(self, x):\n        return self.ln(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        self.n_place = int(spec.n_place)\n        cells = self.Y * self.X\n        self.K = (self.n_place + cells - 1) // cells\n        sq = self.Y == self.X\n        lays = []\n        for l in LAYOUTS:\n            l2 = tuple(l) if sq else (0, l[1], l[2])\n            if l2 not in lays:\n                lays.append(l2)\n        self.lays = lays\n        if OBS_SYM:\n            syms = [(a, b, c) for a in (0, 1) for b in (0, 1) for c in (0, 1) if sq or a == 0]\n        else:\n            syms = [(0, 0, 0)]\n        self.syms = syms\n        c_obs = spec.in_channels * len(syms) + 2\n        c_mask = self.K * len(lays)\n        if USE_LN:\n            self.obs_stem = nn.Sequential(nn.Conv2d(c_obs, STEM, 1), ChanLN(STEM), nn.ReLU())\n            self.mask_stem = nn.Sequential(nn.Conv2d(c_mask, STEM, 1), ChanLN(STEM), nn.ReLU())\n            self.stem2 = nn.Sequential(nn.Conv2d(STEM, WIDTH, 1), ChanLN(WIDTH), nn.ReLU())\n            self.lns = nn.ModuleList([ChanLN(WIDTH) for _ in range(2)])\n        else:\n            self.stem1 = nn.Sequential(nn.Conv2d(c_obs + c_mask, STEM, 1), nn.ReLU())\n            self.stem2 = nn.Sequential(nn.Conv2d(STEM, WIDTH, 1), nn.ReLU())\n        self.res = nn.ModuleList([nn.Conv2d(WIDTH, WIDTH, 3, padding=1) for _ in range(2)])\n        self.h3 = nn.Conv2d(WIDTH, HEAD, 3, padding=1)\n        self.h1 = nn.Conv2d(WIDTH, HEAD, 1)\n        self.hout = nn.Conv2d(HEAD, self.K * len(lays), 1)\n        self.glob = nn.Sequential(nn.Linear(2 * WIDTH, GH), nn.ReLU())\n        self.done_head = nn.Linear(GH, 1)\n        self.value_head = nn.Linear(GH, 1)\n        if USE_LN:\n            for m in (self.hout, self.done_head):\n                nn.init.orthogonal_(m.weight, 0.01)\n                nn.init.zeros_(m.bias)\n            nn.init.orthogonal_(self.value_head.weight, 1.0)\n            nn.init.zeros_(self.value_head.bias)\n        ys = torch.linspace(-1.0, 1.0, self.Y).view(1, 1, self.Y, 1).expand(1, 1, self.Y, self.X)\n        xs = torch.linspace(-1.0, 1.0, self.X).view(1, 1, 1, self.X).expand(1, 1, self.Y, self.X)\n        self.register_buffer(\"coords\", torch.cat([ys, xs], dim=1).contiguous())\n\n    def forward(self, obs, mask):\n        B = obs.shape[0]\n        cells = self.Y * self.X\n        m = mask[:, :self.n_place].float()\n        pad = self.K * cells - self.n_place\n        if pad > 0:\n            m = F.pad(m, (0, pad))\n        m = m.view(B, self.K, self.Y, self.X)\n        mfeat = torch.cat([fwd_layout(m, l) for l in self.lays], dim=1)\n        ofeat = torch.cat([fwd_layout(obs, s) for s in self.syms] + [self.coords.expand(B, -1, -1, -1)], dim=1)\n        if USE_LN:\n            s = self.obs_stem(ofeat) + self.mask_stem(mfeat)\n        else:\n            s = self.stem1(torch.cat([ofeat, mfeat], dim=1))\n        x = self.stem2(s)\n        for i, conv in enumerate(self.res):\n            y = x + conv(x)\n            if USE_LN:\n                y = self.lns[i](y)\n            x = F.relu(y)\n        h = F.relu(self.h3(x) + self.h1(x))\n        o = self.hout(h).view(B, len(self.lays), self.K, self.Y, self.X)\n        place = 0\n        for i, l in enumerate(self.lays):\n            place = place + inv_layout(o[:, i], l)\n        place = place.reshape(B, -1)[:, :self.n_place]\n        g = self.glob(torch.cat([x.mean((2, 3)), x.amax((2, 3))], dim=1))\n        logits = torch.cat([place, self.done_head(g)], dim=1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 65786,
+    "fb_ms": 49.28,
+    "flops_per_sample": 21019392,
+    "flops_ratio": 1.15,
+    "sha": "195bb01b7cfb71ff",
+    "recipe": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 8,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.9,
+     "gae_lambda": 0.85,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 8,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.9,
+     "gae_lambda": 0.85
+    },
+    "budget": {
+     "allowed_steps": 211756,
+     "n_updates": 103,
+     "batch": 2048,
+     "steps": 210944,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0085
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 6
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 65786,
+    "flops_ratio": 1.15,
+    "train_steps": 210944,
+    "wall_s": 69.7,
+    "sha": "195bb01b7cfb71ff",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r2c1",
+   "round": 2,
+   "name": "combo set A",
+   "hypothesis": "Set A plus obs under 8 symmetries, LayerNorm stems and trunk, pooled global context added in each residual block, and a dilated block (r\u22481.35). It targets several deviations at once, as in world 3, where only such a combination escaped. Refuted if it scores 0 while the set B or type-minor combinations score. A score here would mean set A is right and round 3 should split its layouts while keeping the hedges.",
+   "code": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nLAYOUTS = ((0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1))\nOBS_SYM = True\nUSE_LN = True\nGCTX = True\nDILATED = True\nTYPE_MINOR = False\nSEP_CRITIC = False\nSTEM = 64\nWIDTH = 40\nHEAD = 32\nGH = 64\nCRIT = 32\n\nRECIPE = {\"lr\": 2e-3, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 8, \"ppo_epochs\": 2, \"ent_coef\": 0.005, \"gamma\": 0.9, \"gae_lambda\": 0.85}\n\n\ndef fwd_layout(t, lay):\n    tr, fy, fx = lay\n    if tr:\n        t = t.transpose(-1, -2)\n    if fy:\n        t = t.flip(-2)\n    if fx:\n        t = t.flip(-1)\n    return t\n\n\ndef inv_layout(t, lay):\n    tr, fy, fx = lay\n    if fx:\n        t = t.flip(-1)\n    if fy:\n        t = t.flip(-2)\n    if tr:\n        t = t.transpose(-1, -2)\n    return t\n\n\nclass ChanLN(nn.Module):\n    def __init__(self, c):\n        super().__init__()\n        self.ln = nn.LayerNorm(c)\n\n    def forward(self, x):\n        return self.ln(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        self.n_place = int(spec.n_place)\n        cells = self.Y * self.X\n        self.K = (self.n_place + cells - 1) // cells\n        sq = self.Y == self.X\n        lays = []\n        for l in LAYOUTS:\n            l2 = tuple(l) if sq else (0, l[1], l[2])\n            if l2 not in lays:\n                lays.append(l2)\n        self.lays = lays\n        if OBS_SYM:\n            syms = [(a, b, c) for a in (0, 1) for b in (0, 1) for c in (0, 1) if sq or a == 0]\n        else:\n            syms = [(0, 0, 0)]\n        self.syms = syms\n        c_obs = spec.in_channels * len(syms) + 2\n        c_mask = self.K * len(lays)\n        if USE_LN:\n            self.obs_stem = nn.Sequential(nn.Conv2d(c_obs, STEM, 1), ChanLN(STEM), nn.ReLU())\n            self.mask_stem = nn.Sequential(nn.Conv2d(c_mask, STEM, 1), ChanLN(STEM), nn.ReLU())\n            self.stem2 = nn.Sequential(nn.Conv2d(STEM, WIDTH, 1), ChanLN(WIDTH), nn.ReLU())\n        else:\n            self.stem1 = nn.Sequential(nn.Conv2d(c_obs + c_mask, STEM, 1), nn.ReLU())\n            self.stem2 = nn.Sequential(nn.Conv2d(STEM, WIDTH, 1), nn.ReLU())\n        dils = (1, 2, 1) if DILATED else (1, 1)\n        self.res = nn.ModuleList([nn.Conv2d(WIDTH, WIDTH, 3, padding=d, dilation=d) for d in dils])\n        if USE_LN:\n            self.lns = nn.ModuleList([ChanLN(WIDTH) for _ in dils])\n        if GCTX:\n            self.gctx = nn.ModuleList([nn.Linear(2 * WIDTH, WIDTH) for _ in dils])\n        self.h3 = nn.Conv2d(WIDTH, HEAD, 3, padding=1)\n        self.h1 = nn.Conv2d(WIDTH, HEAD, 1)\n        self.hout = nn.Conv2d(HEAD, self.K * len(lays), 1)\n        self.glob = nn.Sequential(nn.Linear(2 * WIDTH, GH), nn.ReLU())\n        self.done_head = nn.Linear(GH, 1)\n        self.value_head = nn.Linear(GH, 1)\n        if SEP_CRITIC:\n            c_raw = spec.in_channels + 2\n            if USE_LN:\n                self.crit = nn.Sequential(nn.Conv2d(c_raw, CRIT, 1), ChanLN(CRIT), nn.ReLU(), nn.Conv2d(CRIT, CRIT, 3, padding=1), nn.ReLU())\n            else:\n                self.crit = nn.Sequential(nn.Conv2d(c_raw, CRIT, 1), nn.ReLU(), nn.Conv2d(CRIT, CRIT, 3, padding=1), nn.ReLU())\n            self.crit_fc = nn.Sequential(nn.Linear(2 * CRIT, GH), nn.ReLU(), nn.Linear(GH, 1))\n        if USE_LN:\n            for m in (self.hout, self.done_head):\n                nn.init.orthogonal_(m.weight, 0.01)\n                nn.init.zeros_(m.bias)\n            nn.init.orthogonal_(self.value_head.weight, 1.0)\n            nn.init.zeros_(self.value_head.bias)\n        ys = torch.linspace(-1.0, 1.0, self.Y).view(1, 1, self.Y, 1).expand(1, 1, self.Y, self.X)\n        xs = torch.linspace(-1.0, 1.0, self.X).view(1, 1, 1, self.X).expand(1, 1, self.Y, self.X)\n        self.register_buffer(\"coords\", torch.cat([ys, xs], dim=1).contiguous())\n\n    def forward(self, obs, mask):\n        B = obs.shape[0]\n        cells = self.Y * self.X\n        m = mask[:, :self.n_place].float()\n        pad = self.K * cells - self.n_place\n        if pad > 0:\n            m = F.pad(m, (0, pad))\n        if TYPE_MINOR:\n            m = m.view(B, self.Y, self.X, self.K).permute(0, 3, 1, 2)\n        else:\n            m = m.view(B, self.K, self.Y, self.X)\n        mfeat = torch.cat([fwd_layout(m, l) for l in self.lays], dim=1)\n        crd = self.coords.expand(B, -1, -1, -1)\n        ofeat = torch.cat([fwd_layout(obs, s) for s in self.syms] + [crd], dim=1)\n        if USE_LN:\n            s = self.obs_stem(ofeat) + self.mask_stem(mfeat)\n        else:\n            s = self.stem1(torch.cat([ofeat, mfeat], dim=1))\n        x = self.stem2(s)\n        for i, conv in enumerate(self.res):\n            y = x + conv(x)\n            if GCTX:\n                g0 = torch.cat([x.mean((2, 3)), x.amax((2, 3))], dim=1)\n                y = y + self.gctx[i](g0)[:, :, None, None]\n            if USE_LN:\n                y = self.lns[i](y)\n            x = F.relu(y)\n        h = F.relu(self.h3(x) + self.h1(x))\n        o = self.hout(h).view(B, len(self.lays), self.K, self.Y, self.X)\n        place = 0\n        for i, l in enumerate(self.lays):\n            place = place + inv_layout(o[:, i], l)\n        if TYPE_MINOR:\n            place = place.permute(0, 2, 3, 1)\n        place = place.reshape(B, -1)[:, :self.n_place]\n        g = self.glob(torch.cat([x.mean((2, 3)), x.amax((2, 3))], dim=1))\n        logits = torch.cat([place, self.done_head(g)], dim=1)\n        if SEP_CRITIC:\n            c = self.crit(torch.cat([obs, crd], dim=1))\n            v = self.crit_fc(torch.cat([c.mean((2, 3)), c.amax((2, 3))], dim=1)).squeeze(1)\n        else:\n            v = self.value_head(g).squeeze(1)\n        return logits, v\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 90026,
+    "fb_ms": 63.77,
+    "flops_per_sample": 26606592,
+    "flops_ratio": 1.46,
+    "sha": "6a8d4922f5b936b6",
+    "recipe": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 8,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.9,
+     "gae_lambda": 0.85,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 8,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.9,
+     "gae_lambda": 0.85
+    },
+    "budget": {
+     "allowed_steps": 167289,
+     "n_updates": 81,
+     "batch": 2048,
+     "steps": 165888,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0115
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 5
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 90026,
+    "flops_ratio": 1.46,
+    "train_steps": 165888,
+    "wall_s": 72.0,
+    "sha": "6a8d4922f5b936b6",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r2c2",
+   "round": 2,
+   "name": "combo set B",
+   "hypothesis": "The same combined hedges (obs symmetries, LayerNorm, global context per block, dilated block) with set B layouts: the rotated and anti-transposed action frames. It targets a combined flip or transpose together with another deviation. Refuted if it scores 0 while the set A combination scores. A score here alone would point to a set-B action frame, and round 3 would split set B.",
+   "code": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nLAYOUTS = ((0, 1, 1), (1, 1, 0), (1, 0, 1), (1, 1, 1))\nOBS_SYM = True\nUSE_LN = True\nGCTX = True\nDILATED = True\nTYPE_MINOR = False\nSEP_CRITIC = False\nSTEM = 64\nWIDTH = 40\nHEAD = 32\nGH = 64\nCRIT = 32\n\nRECIPE = {\"lr\": 2e-3, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 8, \"ppo_epochs\": 2, \"ent_coef\": 0.005, \"gamma\": 0.9, \"gae_lambda\": 0.85}\n\n\ndef fwd_layout(t, lay):\n    tr, fy, fx = lay\n    if tr:\n        t = t.transpose(-1, -2)\n    if fy:\n        t = t.flip(-2)\n    if fx:\n        t = t.flip(-1)\n    return t\n\n\ndef inv_layout(t, lay):\n    tr, fy, fx = lay\n    if fx:\n        t = t.flip(-1)\n    if fy:\n        t = t.flip(-2)\n    if tr:\n        t = t.transpose(-1, -2)\n    return t\n\n\nclass ChanLN(nn.Module):\n    def __init__(self, c):\n        super().__init__()\n        self.ln = nn.LayerNorm(c)\n\n    def forward(self, x):\n        return self.ln(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        self.n_place = int(spec.n_place)\n        cells = self.Y * self.X\n        self.K = (self.n_place + cells - 1) // cells\n        sq = self.Y == self.X\n        lays = []\n        for l in LAYOUTS:\n            l2 = tuple(l) if sq else (0, l[1], l[2])\n            if l2 not in lays:\n                lays.append(l2)\n        self.lays = lays\n        if OBS_SYM:\n            syms = [(a, b, c) for a in (0, 1) for b in (0, 1) for c in (0, 1) if sq or a == 0]\n        else:\n            syms = [(0, 0, 0)]\n        self.syms = syms\n        c_obs = spec.in_channels * len(syms) + 2\n        c_mask = self.K * len(lays)\n        if USE_LN:\n            self.obs_stem = nn.Sequential(nn.Conv2d(c_obs, STEM, 1), ChanLN(STEM), nn.ReLU())\n            self.mask_stem = nn.Sequential(nn.Conv2d(c_mask, STEM, 1), ChanLN(STEM), nn.ReLU())\n            self.stem2 = nn.Sequential(nn.Conv2d(STEM, WIDTH, 1), ChanLN(WIDTH), nn.ReLU())\n        else:\n            self.stem1 = nn.Sequential(nn.Conv2d(c_obs + c_mask, STEM, 1), nn.ReLU())\n            self.stem2 = nn.Sequential(nn.Conv2d(STEM, WIDTH, 1), nn.ReLU())\n        dils = (1, 2, 1) if DILATED else (1, 1)\n        self.res = nn.ModuleList([nn.Conv2d(WIDTH, WIDTH, 3, padding=d, dilation=d) for d in dils])\n        if USE_LN:\n            self.lns = nn.ModuleList([ChanLN(WIDTH) for _ in dils])\n        if GCTX:\n            self.gctx = nn.ModuleList([nn.Linear(2 * WIDTH, WIDTH) for _ in dils])\n        self.h3 = nn.Conv2d(WIDTH, HEAD, 3, padding=1)\n        self.h1 = nn.Conv2d(WIDTH, HEAD, 1)\n        self.hout = nn.Conv2d(HEAD, self.K * len(lays), 1)\n        self.glob = nn.Sequential(nn.Linear(2 * WIDTH, GH), nn.ReLU())\n        self.done_head = nn.Linear(GH, 1)\n        self.value_head = nn.Linear(GH, 1)\n        if SEP_CRITIC:\n            c_raw = spec.in_channels + 2\n            if USE_LN:\n                self.crit = nn.Sequential(nn.Conv2d(c_raw, CRIT, 1), ChanLN(CRIT), nn.ReLU(), nn.Conv2d(CRIT, CRIT, 3, padding=1), nn.ReLU())\n            else:\n                self.crit = nn.Sequential(nn.Conv2d(c_raw, CRIT, 1), nn.ReLU(), nn.Conv2d(CRIT, CRIT, 3, padding=1), nn.ReLU())\n            self.crit_fc = nn.Sequential(nn.Linear(2 * CRIT, GH), nn.ReLU(), nn.Linear(GH, 1))\n        if USE_LN:\n            for m in (self.hout, self.done_head):\n                nn.init.orthogonal_(m.weight, 0.01)\n                nn.init.zeros_(m.bias)\n            nn.init.orthogonal_(self.value_head.weight, 1.0)\n            nn.init.zeros_(self.value_head.bias)\n        ys = torch.linspace(-1.0, 1.0, self.Y).view(1, 1, self.Y, 1).expand(1, 1, self.Y, self.X)\n        xs = torch.linspace(-1.0, 1.0, self.X).view(1, 1, 1, self.X).expand(1, 1, self.Y, self.X)\n        self.register_buffer(\"coords\", torch.cat([ys, xs], dim=1).contiguous())\n\n    def forward(self, obs, mask):\n        B = obs.shape[0]\n        cells = self.Y * self.X\n        m = mask[:, :self.n_place].float()\n        pad = self.K * cells - self.n_place\n        if pad > 0:\n            m = F.pad(m, (0, pad))\n        if TYPE_MINOR:\n            m = m.view(B, self.Y, self.X, self.K).permute(0, 3, 1, 2)\n        else:\n            m = m.view(B, self.K, self.Y, self.X)\n        mfeat = torch.cat([fwd_layout(m, l) for l in self.lays], dim=1)\n        crd = self.coords.expand(B, -1, -1, -1)\n        ofeat = torch.cat([fwd_layout(obs, s) for s in self.syms] + [crd], dim=1)\n        if USE_LN:\n            s = self.obs_stem(ofeat) + self.mask_stem(mfeat)\n        else:\n            s = self.stem1(torch.cat([ofeat, mfeat], dim=1))\n        x = self.stem2(s)\n        for i, conv in enumerate(self.res):\n            y = x + conv(x)\n            if GCTX:\n                g0 = torch.cat([x.mean((2, 3)), x.amax((2, 3))], dim=1)\n                y = y + self.gctx[i](g0)[:, :, None, None]\n            if USE_LN:\n                y = self.lns[i](y)\n            x = F.relu(y)\n        h = F.relu(self.h3(x) + self.h1(x))\n        o = self.hout(h).view(B, len(self.lays), self.K, self.Y, self.X)\n        place = 0\n        for i, l in enumerate(self.lays):\n            place = place + inv_layout(o[:, i], l)\n        if TYPE_MINOR:\n            place = place.permute(0, 2, 3, 1)\n        place = place.reshape(B, -1)[:, :self.n_place]\n        g = self.glob(torch.cat([x.mean((2, 3)), x.amax((2, 3))], dim=1))\n        logits = torch.cat([place, self.done_head(g)], dim=1)\n        if SEP_CRITIC:\n            c = self.crit(torch.cat([obs, crd], dim=1))\n            v = self.crit_fc(torch.cat([c.mean((2, 3)), c.amax((2, 3))], dim=1)).squeeze(1)\n        else:\n            v = self.value_head(g).squeeze(1)\n        return logits, v\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 90026,
+    "fb_ms": 63.33,
+    "flops_per_sample": 26606592,
+    "flops_ratio": 1.46,
+    "sha": "0bd259deabafa43a",
+    "recipe": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 8,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.9,
+     "gae_lambda": 0.85,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 8,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.9,
+     "gae_lambda": 0.85
+    },
+    "budget": {
+     "allowed_steps": 167289,
+     "n_updates": 81,
+     "batch": 2048,
+     "steps": 165888,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0127
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 5
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 90026,
+    "flops_ratio": 1.46,
+    "train_steps": 165888,
+    "wall_s": 73.3,
+    "sha": "0bd259deabafa43a",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r2c3",
+   "round": 2,
+   "name": "type-minor combo A",
+   "hypothesis": "The mask and the placement logits are read type-minor, a = (y*X+x)*K + t, under set A, with all the combined hedges. It targets an action index order with brick type innermost, where every type-major reading scrambles space; that would explain round 1 being all 0. Refuted if it scores 0 while the type-major combinations score. A score here or in the next two trials would confirm the type-minor order.",
+   "code": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nLAYOUTS = ((0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1))\nOBS_SYM = True\nUSE_LN = True\nGCTX = True\nDILATED = True\nTYPE_MINOR = True\nSEP_CRITIC = False\nSTEM = 64\nWIDTH = 40\nHEAD = 32\nGH = 64\nCRIT = 32\n\nRECIPE = {\"lr\": 2e-3, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 8, \"ppo_epochs\": 2, \"ent_coef\": 0.005, \"gamma\": 0.9, \"gae_lambda\": 0.85}\n\n\ndef fwd_layout(t, lay):\n    tr, fy, fx = lay\n    if tr:\n        t = t.transpose(-1, -2)\n    if fy:\n        t = t.flip(-2)\n    if fx:\n        t = t.flip(-1)\n    return t\n\n\ndef inv_layout(t, lay):\n    tr, fy, fx = lay\n    if fx:\n        t = t.flip(-1)\n    if fy:\n        t = t.flip(-2)\n    if tr:\n        t = t.transpose(-1, -2)\n    return t\n\n\nclass ChanLN(nn.Module):\n    def __init__(self, c):\n        super().__init__()\n        self.ln = nn.LayerNorm(c)\n\n    def forward(self, x):\n        return self.ln(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        self.n_place = int(spec.n_place)\n        cells = self.Y * self.X\n        self.K = (self.n_place + cells - 1) // cells\n        sq = self.Y == self.X\n        lays = []\n        for l in LAYOUTS:\n            l2 = tuple(l) if sq else (0, l[1], l[2])\n            if l2 not in lays:\n                lays.append(l2)\n        self.lays = lays\n        if OBS_SYM:\n            syms = [(a, b, c) for a in (0, 1) for b in (0, 1) for c in (0, 1) if sq or a == 0]\n        else:\n            syms = [(0, 0, 0)]\n        self.syms = syms\n        c_obs = spec.in_channels * len(syms) + 2\n        c_mask = self.K * len(lays)\n        if USE_LN:\n            self.obs_stem = nn.Sequential(nn.Conv2d(c_obs, STEM, 1), ChanLN(STEM), nn.ReLU())\n            self.mask_stem = nn.Sequential(nn.Conv2d(c_mask, STEM, 1), ChanLN(STEM), nn.ReLU())\n            self.stem2 = nn.Sequential(nn.Conv2d(STEM, WIDTH, 1), ChanLN(WIDTH), nn.ReLU())\n        else:\n            self.stem1 = nn.Sequential(nn.Conv2d(c_obs + c_mask, STEM, 1), nn.ReLU())\n            self.stem2 = nn.Sequential(nn.Conv2d(STEM, WIDTH, 1), nn.ReLU())\n        dils = (1, 2, 1) if DILATED else (1, 1)\n        self.res = nn.ModuleList([nn.Conv2d(WIDTH, WIDTH, 3, padding=d, dilation=d) for d in dils])\n        if USE_LN:\n            self.lns = nn.ModuleList([ChanLN(WIDTH) for _ in dils])\n        if GCTX:\n            self.gctx = nn.ModuleList([nn.Linear(2 * WIDTH, WIDTH) for _ in dils])\n        self.h3 = nn.Conv2d(WIDTH, HEAD, 3, padding=1)\n        self.h1 = nn.Conv2d(WIDTH, HEAD, 1)\n        self.hout = nn.Conv2d(HEAD, self.K * len(lays), 1)\n        self.glob = nn.Sequential(nn.Linear(2 * WIDTH, GH), nn.ReLU())\n        self.done_head = nn.Linear(GH, 1)\n        self.value_head = nn.Linear(GH, 1)\n        if SEP_CRITIC:\n            c_raw = spec.in_channels + 2\n            if USE_LN:\n                self.crit = nn.Sequential(nn.Conv2d(c_raw, CRIT, 1), ChanLN(CRIT), nn.ReLU(), nn.Conv2d(CRIT, CRIT, 3, padding=1), nn.ReLU())\n            else:\n                self.crit = nn.Sequential(nn.Conv2d(c_raw, CRIT, 1), nn.ReLU(), nn.Conv2d(CRIT, CRIT, 3, padding=1), nn.ReLU())\n            self.crit_fc = nn.Sequential(nn.Linear(2 * CRIT, GH), nn.ReLU(), nn.Linear(GH, 1))\n        if USE_LN:\n            for m in (self.hout, self.done_head):\n                nn.init.orthogonal_(m.weight, 0.01)\n                nn.init.zeros_(m.bias)\n            nn.init.orthogonal_(self.value_head.weight, 1.0)\n            nn.init.zeros_(self.value_head.bias)\n        ys = torch.linspace(-1.0, 1.0, self.Y).view(1, 1, self.Y, 1).expand(1, 1, self.Y, self.X)\n        xs = torch.linspace(-1.0, 1.0, self.X).view(1, 1, 1, self.X).expand(1, 1, self.Y, self.X)\n        self.register_buffer(\"coords\", torch.cat([ys, xs], dim=1).contiguous())\n\n    def forward(self, obs, mask):\n        B = obs.shape[0]\n        cells = self.Y * self.X\n        m = mask[:, :self.n_place].float()\n        pad = self.K * cells - self.n_place\n        if pad > 0:\n            m = F.pad(m, (0, pad))\n        if TYPE_MINOR:\n            m = m.view(B, self.Y, self.X, self.K).permute(0, 3, 1, 2)\n        else:\n            m = m.view(B, self.K, self.Y, self.X)\n        mfeat = torch.cat([fwd_layout(m, l) for l in self.lays], dim=1)\n        crd = self.coords.expand(B, -1, -1, -1)\n        ofeat = torch.cat([fwd_layout(obs, s) for s in self.syms] + [crd], dim=1)\n        if USE_LN:\n            s = self.obs_stem(ofeat) + self.mask_stem(mfeat)\n        else:\n            s = self.stem1(torch.cat([ofeat, mfeat], dim=1))\n        x = self.stem2(s)\n        for i, conv in enumerate(self.res):\n            y = x + conv(x)\n            if GCTX:\n                g0 = torch.cat([x.mean((2, 3)), x.amax((2, 3))], dim=1)\n                y = y + self.gctx[i](g0)[:, :, None, None]\n            if USE_LN:\n                y = self.lns[i](y)\n            x = F.relu(y)\n        h = F.relu(self.h3(x) + self.h1(x))\n        o = self.hout(h).view(B, len(self.lays), self.K, self.Y, self.X)\n        place = 0\n        for i, l in enumerate(self.lays):\n            place = place + inv_layout(o[:, i], l)\n        if TYPE_MINOR:\n            place = place.permute(0, 2, 3, 1)\n        place = place.reshape(B, -1)[:, :self.n_place]\n        g = self.glob(torch.cat([x.mean((2, 3)), x.amax((2, 3))], dim=1))\n        logits = torch.cat([place, self.done_head(g)], dim=1)\n        if SEP_CRITIC:\n            c = self.crit(torch.cat([obs, crd], dim=1))\n            v = self.crit_fc(torch.cat([c.mean((2, 3)), c.amax((2, 3))], dim=1)).squeeze(1)\n        else:\n            v = self.value_head(g).squeeze(1)\n        return logits, v\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 90026,
+    "fb_ms": 63.38,
+    "flops_per_sample": 26606592,
+    "flops_ratio": 1.46,
+    "sha": "4ed8e4cdc5fe8959",
+    "recipe": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 8,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.9,
+     "gae_lambda": 0.85,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 8,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.9,
+     "gae_lambda": 0.85
+    },
+    "budget": {
+     "allowed_steps": 167289,
+     "n_updates": 81,
+     "batch": 2048,
+     "steps": 165888,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0061
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 5
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 90026,
+    "flops_ratio": 1.46,
+    "train_steps": 165888,
+    "wall_s": 68.6,
+    "sha": "4ed8e4cdc5fe8959",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r2c4",
+   "round": 2,
+   "name": "type-minor combo B",
+   "hypothesis": "The type-minor reading of the mask and logits with set B layouts and all the combined hedges. It targets a type-innermost action order combined with a rotated or anti-transposed frame. Refuted if it scores 0 while type-minor A scores. A score here alone would point to a type-minor order with a set-B frame, and round 3 would split set B under the type-minor reading.",
+   "code": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nLAYOUTS = ((0, 1, 1), (1, 1, 0), (1, 0, 1), (1, 1, 1))\nOBS_SYM = True\nUSE_LN = True\nGCTX = True\nDILATED = True\nTYPE_MINOR = True\nSEP_CRITIC = False\nSTEM = 64\nWIDTH = 40\nHEAD = 32\nGH = 64\nCRIT = 32\n\nRECIPE = {\"lr\": 2e-3, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 8, \"ppo_epochs\": 2, \"ent_coef\": 0.005, \"gamma\": 0.9, \"gae_lambda\": 0.85}\n\n\ndef fwd_layout(t, lay):\n    tr, fy, fx = lay\n    if tr:\n        t = t.transpose(-1, -2)\n    if fy:\n        t = t.flip(-2)\n    if fx:\n        t = t.flip(-1)\n    return t\n\n\ndef inv_layout(t, lay):\n    tr, fy, fx = lay\n    if fx:\n        t = t.flip(-1)\n    if fy:\n        t = t.flip(-2)\n    if tr:\n        t = t.transpose(-1, -2)\n    return t\n\n\nclass ChanLN(nn.Module):\n    def __init__(self, c):\n        super().__init__()\n        self.ln = nn.LayerNorm(c)\n\n    def forward(self, x):\n        return self.ln(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        self.n_place = int(spec.n_place)\n        cells = self.Y * self.X\n        self.K = (self.n_place + cells - 1) // cells\n        sq = self.Y == self.X\n        lays = []\n        for l in LAYOUTS:\n            l2 = tuple(l) if sq else (0, l[1], l[2])\n            if l2 not in lays:\n                lays.append(l2)\n        self.lays = lays\n        if OBS_SYM:\n            syms = [(a, b, c) for a in (0, 1) for b in (0, 1) for c in (0, 1) if sq or a == 0]\n        else:\n            syms = [(0, 0, 0)]\n        self.syms = syms\n        c_obs = spec.in_channels * len(syms) + 2\n        c_mask = self.K * len(lays)\n        if USE_LN:\n            self.obs_stem = nn.Sequential(nn.Conv2d(c_obs, STEM, 1), ChanLN(STEM), nn.ReLU())\n            self.mask_stem = nn.Sequential(nn.Conv2d(c_mask, STEM, 1), ChanLN(STEM), nn.ReLU())\n            self.stem2 = nn.Sequential(nn.Conv2d(STEM, WIDTH, 1), ChanLN(WIDTH), nn.ReLU())\n        else:\n            self.stem1 = nn.Sequential(nn.Conv2d(c_obs + c_mask, STEM, 1), nn.ReLU())\n            self.stem2 = nn.Sequential(nn.Conv2d(STEM, WIDTH, 1), nn.ReLU())\n        dils = (1, 2, 1) if DILATED else (1, 1)\n        self.res = nn.ModuleList([nn.Conv2d(WIDTH, WIDTH, 3, padding=d, dilation=d) for d in dils])\n        if USE_LN:\n            self.lns = nn.ModuleList([ChanLN(WIDTH) for _ in dils])\n        if GCTX:\n            self.gctx = nn.ModuleList([nn.Linear(2 * WIDTH, WIDTH) for _ in dils])\n        self.h3 = nn.Conv2d(WIDTH, HEAD, 3, padding=1)\n        self.h1 = nn.Conv2d(WIDTH, HEAD, 1)\n        self.hout = nn.Conv2d(HEAD, self.K * len(lays), 1)\n        self.glob = nn.Sequential(nn.Linear(2 * WIDTH, GH), nn.ReLU())\n        self.done_head = nn.Linear(GH, 1)\n        self.value_head = nn.Linear(GH, 1)\n        if SEP_CRITIC:\n            c_raw = spec.in_channels + 2\n            if USE_LN:\n                self.crit = nn.Sequential(nn.Conv2d(c_raw, CRIT, 1), ChanLN(CRIT), nn.ReLU(), nn.Conv2d(CRIT, CRIT, 3, padding=1), nn.ReLU())\n            else:\n                self.crit = nn.Sequential(nn.Conv2d(c_raw, CRIT, 1), nn.ReLU(), nn.Conv2d(CRIT, CRIT, 3, padding=1), nn.ReLU())\n            self.crit_fc = nn.Sequential(nn.Linear(2 * CRIT, GH), nn.ReLU(), nn.Linear(GH, 1))\n        if USE_LN:\n            for m in (self.hout, self.done_head):\n                nn.init.orthogonal_(m.weight, 0.01)\n                nn.init.zeros_(m.bias)\n            nn.init.orthogonal_(self.value_head.weight, 1.0)\n            nn.init.zeros_(self.value_head.bias)\n        ys = torch.linspace(-1.0, 1.0, self.Y).view(1, 1, self.Y, 1).expand(1, 1, self.Y, self.X)\n        xs = torch.linspace(-1.0, 1.0, self.X).view(1, 1, 1, self.X).expand(1, 1, self.Y, self.X)\n        self.register_buffer(\"coords\", torch.cat([ys, xs], dim=1).contiguous())\n\n    def forward(self, obs, mask):\n        B = obs.shape[0]\n        cells = self.Y * self.X\n        m = mask[:, :self.n_place].float()\n        pad = self.K * cells - self.n_place\n        if pad > 0:\n            m = F.pad(m, (0, pad))\n        if TYPE_MINOR:\n            m = m.view(B, self.Y, self.X, self.K).permute(0, 3, 1, 2)\n        else:\n            m = m.view(B, self.K, self.Y, self.X)\n        mfeat = torch.cat([fwd_layout(m, l) for l in self.lays], dim=1)\n        crd = self.coords.expand(B, -1, -1, -1)\n        ofeat = torch.cat([fwd_layout(obs, s) for s in self.syms] + [crd], dim=1)\n        if USE_LN:\n            s = self.obs_stem(ofeat) + self.mask_stem(mfeat)\n        else:\n            s = self.stem1(torch.cat([ofeat, mfeat], dim=1))\n        x = self.stem2(s)\n        for i, conv in enumerate(self.res):\n            y = x + conv(x)\n            if GCTX:\n                g0 = torch.cat([x.mean((2, 3)), x.amax((2, 3))], dim=1)\n                y = y + self.gctx[i](g0)[:, :, None, None]\n            if USE_LN:\n                y = self.lns[i](y)\n            x = F.relu(y)\n        h = F.relu(self.h3(x) + self.h1(x))\n        o = self.hout(h).view(B, len(self.lays), self.K, self.Y, self.X)\n        place = 0\n        for i, l in enumerate(self.lays):\n            place = place + inv_layout(o[:, i], l)\n        if TYPE_MINOR:\n            place = place.permute(0, 2, 3, 1)\n        place = place.reshape(B, -1)[:, :self.n_place]\n        g = self.glob(torch.cat([x.mean((2, 3)), x.amax((2, 3))], dim=1))\n        logits = torch.cat([place, self.done_head(g)], dim=1)\n        if SEP_CRITIC:\n            c = self.crit(torch.cat([obs, crd], dim=1))\n            v = self.crit_fc(torch.cat([c.mean((2, 3)), c.amax((2, 3))], dim=1)).squeeze(1)\n        else:\n            v = self.value_head(g).squeeze(1)\n        return logits, v\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 90026,
+    "fb_ms": 61.74,
+    "flops_per_sample": 26606592,
+    "flops_ratio": 1.46,
+    "sha": "74940be64cc26d81",
+    "recipe": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 8,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.9,
+     "gae_lambda": 0.85,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 8,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.9,
+     "gae_lambda": 0.85
+    },
+    "budget": {
+     "allowed_steps": 167289,
+     "n_updates": 81,
+     "batch": 2048,
+     "steps": 165888,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0109
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 5
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 90026,
+    "flops_ratio": 1.46,
+    "train_steps": 165888,
+    "wall_s": 65.2,
+    "sha": "74940be64cc26d81",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r2c5",
+   "round": 2,
+   "name": "type-minor plain A",
+   "hypothesis": "Type-minor reading with set A on the plain reference net: no obs symmetries, no LayerNorm and no extra blocks (r\u22481). It gets about 25% more samples than the combined version. If type-minor order is the only deviation, this cheaper net should score. Refuted if it scores 0 while type-minor combo A scores, which would mean the other hedges are needed too.",
+   "code": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nLAYOUTS = ((0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1))\nOBS_SYM = False\nUSE_LN = False\nGCTX = False\nDILATED = False\nTYPE_MINOR = True\nSEP_CRITIC = False\nSTEM = 64\nWIDTH = 40\nHEAD = 32\nGH = 64\nCRIT = 32\n\nRECIPE = {\"lr\": 2e-3, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 8, \"ppo_epochs\": 2, \"ent_coef\": 0.005, \"gamma\": 0.9, \"gae_lambda\": 0.85}\n\n\ndef fwd_layout(t, lay):\n    tr, fy, fx = lay\n    if tr:\n        t = t.transpose(-1, -2)\n    if fy:\n        t = t.flip(-2)\n    if fx:\n        t = t.flip(-1)\n    return t\n\n\ndef inv_layout(t, lay):\n    tr, fy, fx = lay\n    if fx:\n        t = t.flip(-1)\n    if fy:\n        t = t.flip(-2)\n    if tr:\n        t = t.transpose(-1, -2)\n    return t\n\n\nclass ChanLN(nn.Module):\n    def __init__(self, c):\n        super().__init__()\n        self.ln = nn.LayerNorm(c)\n\n    def forward(self, x):\n        return self.ln(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        self.n_place = int(spec.n_place)\n        cells = self.Y * self.X\n        self.K = (self.n_place + cells - 1) // cells\n        sq = self.Y == self.X\n        lays = []\n        for l in LAYOUTS:\n            l2 = tuple(l) if sq else (0, l[1], l[2])\n            if l2 not in lays:\n                lays.append(l2)\n        self.lays = lays\n        if OBS_SYM:\n            syms = [(a, b, c) for a in (0, 1) for b in (0, 1) for c in (0, 1) if sq or a == 0]\n        else:\n            syms = [(0, 0, 0)]\n        self.syms = syms\n        c_obs = spec.in_channels * len(syms) + 2\n        c_mask = self.K * len(lays)\n        if USE_LN:\n            self.obs_stem = nn.Sequential(nn.Conv2d(c_obs, STEM, 1), ChanLN(STEM), nn.ReLU())\n            self.mask_stem = nn.Sequential(nn.Conv2d(c_mask, STEM, 1), ChanLN(STEM), nn.ReLU())\n            self.stem2 = nn.Sequential(nn.Conv2d(STEM, WIDTH, 1), ChanLN(WIDTH), nn.ReLU())\n        else:\n            self.stem1 = nn.Sequential(nn.Conv2d(c_obs + c_mask, STEM, 1), nn.ReLU())\n            self.stem2 = nn.Sequential(nn.Conv2d(STEM, WIDTH, 1), nn.ReLU())\n        dils = (1, 2, 1) if DILATED else (1, 1)\n        self.res = nn.ModuleList([nn.Conv2d(WIDTH, WIDTH, 3, padding=d, dilation=d) for d in dils])\n        if USE_LN:\n            self.lns = nn.ModuleList([ChanLN(WIDTH) for _ in dils])\n        if GCTX:\n            self.gctx = nn.ModuleList([nn.Linear(2 * WIDTH, WIDTH) for _ in dils])\n        self.h3 = nn.Conv2d(WIDTH, HEAD, 3, padding=1)\n        self.h1 = nn.Conv2d(WIDTH, HEAD, 1)\n        self.hout = nn.Conv2d(HEAD, self.K * len(lays), 1)\n        self.glob = nn.Sequential(nn.Linear(2 * WIDTH, GH), nn.ReLU())\n        self.done_head = nn.Linear(GH, 1)\n        self.value_head = nn.Linear(GH, 1)\n        if SEP_CRITIC:\n            c_raw = spec.in_channels + 2\n            if USE_LN:\n                self.crit = nn.Sequential(nn.Conv2d(c_raw, CRIT, 1), ChanLN(CRIT), nn.ReLU(), nn.Conv2d(CRIT, CRIT, 3, padding=1), nn.ReLU())\n            else:\n                self.crit = nn.Sequential(nn.Conv2d(c_raw, CRIT, 1), nn.ReLU(), nn.Conv2d(CRIT, CRIT, 3, padding=1), nn.ReLU())\n            self.crit_fc = nn.Sequential(nn.Linear(2 * CRIT, GH), nn.ReLU(), nn.Linear(GH, 1))\n        if USE_LN:\n            for m in (self.hout, self.done_head):\n                nn.init.orthogonal_(m.weight, 0.01)\n                nn.init.zeros_(m.bias)\n            nn.init.orthogonal_(self.value_head.weight, 1.0)\n            nn.init.zeros_(self.value_head.bias)\n        ys = torch.linspace(-1.0, 1.0, self.Y).view(1, 1, self.Y, 1).expand(1, 1, self.Y, self.X)\n        xs = torch.linspace(-1.0, 1.0, self.X).view(1, 1, 1, self.X).expand(1, 1, self.Y, self.X)\n        self.register_buffer(\"coords\", torch.cat([ys, xs], dim=1).contiguous())\n\n    def forward(self, obs, mask):\n        B = obs.shape[0]\n        cells = self.Y * self.X\n        m = mask[:, :self.n_place].float()\n        pad = self.K * cells - self.n_place\n        if pad > 0:\n            m = F.pad(m, (0, pad))\n        if TYPE_MINOR:\n            m = m.view(B, self.Y, self.X, self.K).permute(0, 3, 1, 2)\n        else:\n            m = m.view(B, self.K, self.Y, self.X)\n        mfeat = torch.cat([fwd_layout(m, l) for l in self.lays], dim=1)\n        crd = self.coords.expand(B, -1, -1, -1)\n        ofeat = torch.cat([fwd_layout(obs, s) for s in self.syms] + [crd], dim=1)\n        if USE_LN:\n            s = self.obs_stem(ofeat) + self.mask_stem(mfeat)\n        else:\n            s = self.stem1(torch.cat([ofeat, mfeat], dim=1))\n        x = self.stem2(s)\n        for i, conv in enumerate(self.res):\n            y = x + conv(x)\n            if GCTX:\n                g0 = torch.cat([x.mean((2, 3)), x.amax((2, 3))], dim=1)\n                y = y + self.gctx[i](g0)[:, :, None, None]\n            if USE_LN:\n                y = self.lns[i](y)\n            x = F.relu(y)\n        h = F.relu(self.h3(x) + self.h1(x))\n        o = self.hout(h).view(B, len(self.lays), self.K, self.Y, self.X)\n        place = 0\n        for i, l in enumerate(self.lays):\n            place = place + inv_layout(o[:, i], l)\n        if TYPE_MINOR:\n            place = place.permute(0, 2, 3, 1)\n        place = place.reshape(B, -1)[:, :self.n_place]\n        g = self.glob(torch.cat([x.mean((2, 3)), x.amax((2, 3))], dim=1))\n        logits = torch.cat([place, self.done_head(g)], dim=1)\n        if SEP_CRITIC:\n            c = self.crit(torch.cat([obs, crd], dim=1))\n            v = self.crit_fc(torch.cat([c.mean((2, 3)), c.amax((2, 3))], dim=1)).squeeze(1)\n        else:\n            v = self.value_head(g).squeeze(1)\n        return logits, v\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 53130,
+    "fb_ms": 36.12,
+    "flops_per_sample": 17922816,
+    "flops_ratio": 0.98,
+    "sha": "aea461b86cac32b4",
+    "recipe": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 8,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.9,
+     "gae_lambda": 0.85,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 8,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.9,
+     "gae_lambda": 0.85
+    },
+    "budget": {
+     "allowed_steps": 243419,
+     "n_updates": 118,
+     "batch": 2048,
+     "steps": 241664,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.014
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 8
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 53130,
+    "flops_ratio": 0.98,
+    "train_steps": 241664,
+    "wall_s": 41.6,
+    "sha": "aea461b86cac32b4",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r2c6",
+   "round": 2,
+   "name": "combo A + separate critic",
+   "hypothesis": "The set A combination plus a separate small critic on the raw obs, with gamma 0.99 and ent_coef 0.01. It targets a failure in credit assignment or exploration rather than layout, for example a world where reward arrives late. Refuted if it scores no better than combo A. If only this run scores, round 3 keeps the critic and recipe and splits the layouts. Gamma \u22650.97 hurt aligned nets, so this is a test only for a stuck world.",
+   "code": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nLAYOUTS = ((0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1))\nOBS_SYM = True\nUSE_LN = True\nGCTX = True\nDILATED = True\nTYPE_MINOR = False\nSEP_CRITIC = True\nSTEM = 64\nWIDTH = 40\nHEAD = 32\nGH = 64\nCRIT = 32\n\nRECIPE = {\"lr\": 2e-3, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 8, \"ppo_epochs\": 2, \"ent_coef\": 0.01, \"gamma\": 0.99, \"gae_lambda\": 0.85}\n\n\ndef fwd_layout(t, lay):\n    tr, fy, fx = lay\n    if tr:\n        t = t.transpose(-1, -2)\n    if fy:\n        t = t.flip(-2)\n    if fx:\n        t = t.flip(-1)\n    return t\n\n\ndef inv_layout(t, lay):\n    tr, fy, fx = lay\n    if fx:\n        t = t.flip(-1)\n    if fy:\n        t = t.flip(-2)\n    if tr:\n        t = t.transpose(-1, -2)\n    return t\n\n\nclass ChanLN(nn.Module):\n    def __init__(self, c):\n        super().__init__()\n        self.ln = nn.LayerNorm(c)\n\n    def forward(self, x):\n        return self.ln(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        self.n_place = int(spec.n_place)\n        cells = self.Y * self.X\n        self.K = (self.n_place + cells - 1) // cells\n        sq = self.Y == self.X\n        lays = []\n        for l in LAYOUTS:\n            l2 = tuple(l) if sq else (0, l[1], l[2])\n            if l2 not in lays:\n                lays.append(l2)\n        self.lays = lays\n        if OBS_SYM:\n            syms = [(a, b, c) for a in (0, 1) for b in (0, 1) for c in (0, 1) if sq or a == 0]\n        else:\n            syms = [(0, 0, 0)]\n        self.syms = syms\n        c_obs = spec.in_channels * len(syms) + 2\n        c_mask = self.K * len(lays)\n        if USE_LN:\n            self.obs_stem = nn.Sequential(nn.Conv2d(c_obs, STEM, 1), ChanLN(STEM), nn.ReLU())\n            self.mask_stem = nn.Sequential(nn.Conv2d(c_mask, STEM, 1), ChanLN(STEM), nn.ReLU())\n            self.stem2 = nn.Sequential(nn.Conv2d(STEM, WIDTH, 1), ChanLN(WIDTH), nn.ReLU())\n        else:\n            self.stem1 = nn.Sequential(nn.Conv2d(c_obs + c_mask, STEM, 1), nn.ReLU())\n            self.stem2 = nn.Sequential(nn.Conv2d(STEM, WIDTH, 1), nn.ReLU())\n        dils = (1, 2, 1) if DILATED else (1, 1)\n        self.res = nn.ModuleList([nn.Conv2d(WIDTH, WIDTH, 3, padding=d, dilation=d) for d in dils])\n        if USE_LN:\n            self.lns = nn.ModuleList([ChanLN(WIDTH) for _ in dils])\n        if GCTX:\n            self.gctx = nn.ModuleList([nn.Linear(2 * WIDTH, WIDTH) for _ in dils])\n        self.h3 = nn.Conv2d(WIDTH, HEAD, 3, padding=1)\n        self.h1 = nn.Conv2d(WIDTH, HEAD, 1)\n        self.hout = nn.Conv2d(HEAD, self.K * len(lays), 1)\n        self.glob = nn.Sequential(nn.Linear(2 * WIDTH, GH), nn.ReLU())\n        self.done_head = nn.Linear(GH, 1)\n        self.value_head = nn.Linear(GH, 1)\n        if SEP_CRITIC:\n            c_raw = spec.in_channels + 2\n            if USE_LN:\n                self.crit = nn.Sequential(nn.Conv2d(c_raw, CRIT, 1), ChanLN(CRIT), nn.ReLU(), nn.Conv2d(CRIT, CRIT, 3, padding=1), nn.ReLU())\n            else:\n                self.crit = nn.Sequential(nn.Conv2d(c_raw, CRIT, 1), nn.ReLU(), nn.Conv2d(CRIT, CRIT, 3, padding=1), nn.ReLU())\n            self.crit_fc = nn.Sequential(nn.Linear(2 * CRIT, GH), nn.ReLU(), nn.Linear(GH, 1))\n        if USE_LN:\n            for m in (self.hout, self.done_head):\n                nn.init.orthogonal_(m.weight, 0.01)\n                nn.init.zeros_(m.bias)\n            nn.init.orthogonal_(self.value_head.weight, 1.0)\n            nn.init.zeros_(self.value_head.bias)\n        ys = torch.linspace(-1.0, 1.0, self.Y).view(1, 1, self.Y, 1).expand(1, 1, self.Y, self.X)\n        xs = torch.linspace(-1.0, 1.0, self.X).view(1, 1, 1, self.X).expand(1, 1, self.Y, self.X)\n        self.register_buffer(\"coords\", torch.cat([ys, xs], dim=1).contiguous())\n\n    def forward(self, obs, mask):\n        B = obs.shape[0]\n        cells = self.Y * self.X\n        m = mask[:, :self.n_place].float()\n        pad = self.K * cells - self.n_place\n        if pad > 0:\n            m = F.pad(m, (0, pad))\n        if TYPE_MINOR:\n            m = m.view(B, self.Y, self.X, self.K).permute(0, 3, 1, 2)\n        else:\n            m = m.view(B, self.K, self.Y, self.X)\n        mfeat = torch.cat([fwd_layout(m, l) for l in self.lays], dim=1)\n        crd = self.coords.expand(B, -1, -1, -1)\n        ofeat = torch.cat([fwd_layout(obs, s) for s in self.syms] + [crd], dim=1)\n        if USE_LN:\n            s = self.obs_stem(ofeat) + self.mask_stem(mfeat)\n        else:\n            s = self.stem1(torch.cat([ofeat, mfeat], dim=1))\n        x = self.stem2(s)\n        for i, conv in enumerate(self.res):\n            y = x + conv(x)\n            if GCTX:\n                g0 = torch.cat([x.mean((2, 3)), x.amax((2, 3))], dim=1)\n                y = y + self.gctx[i](g0)[:, :, None, None]\n            if USE_LN:\n                y = self.lns[i](y)\n            x = F.relu(y)\n        h = F.relu(self.h3(x) + self.h1(x))\n        o = self.hout(h).view(B, len(self.lays), self.K, self.Y, self.X)\n        place = 0\n        for i, l in enumerate(self.lays):\n            place = place + inv_layout(o[:, i], l)\n        if TYPE_MINOR:\n            place = place.permute(0, 2, 3, 1)\n        place = place.reshape(B, -1)[:, :self.n_place]\n        g = self.glob(torch.cat([x.mean((2, 3)), x.amax((2, 3))], dim=1))\n        logits = torch.cat([place, self.done_head(g)], dim=1)\n        if SEP_CRITIC:\n            c = self.crit(torch.cat([obs, crd], dim=1))\n            v = self.crit_fc(torch.cat([c.mean((2, 3)), c.amax((2, 3))], dim=1)).squeeze(1)\n        else:\n            v = self.value_head(g).squeeze(1)\n        return logits, v\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 104523,
+    "fb_ms": 70.19,
+    "flops_per_sample": 30407680,
+    "flops_ratio": 1.66,
+    "sha": "495070e32b998e64",
+    "recipe": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 8,
+     "ppo_epochs": 2,
+     "ent_coef": 0.01,
+     "gamma": 0.99,
+     "gae_lambda": 0.85,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 8,
+     "ppo_epochs": 2,
+     "ent_coef": 0.01,
+     "gamma": 0.99,
+     "gae_lambda": 0.85
+    },
+    "budget": {
+     "allowed_steps": 146377,
+     "n_updates": 71,
+     "batch": 2048,
+     "steps": 145408,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0135
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 4
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 104523,
+    "flops_ratio": 1.66,
+    "train_steps": 145408,
+    "wall_s": 66.5,
+    "sha": "495070e32b998e64",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r3c1",
+   "round": 3,
+   "name": "MLP per-cell LN",
+   "hypothesis": "A frame-agnostic MLP. A per-cell 1x1 conv to 16 channels with LayerNorm is flattened, then a Linear to 384, and the mask goes in through its own Linear. Two LayerNorm hidden layers feed one Linear over all actions, DONE included. This targets any scramble of obs cells or action indices that symmetries can't fix. Refuted if it scores 0 again, train success included.",
+   "code": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nCELL = 16\nHID = 384\n\nRECIPE = {\"lr\": 2e-3, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 8, \"ppo_epochs\": 2, \"ent_coef\": 0.005, \"gamma\": 0.9, \"gae_lambda\": 0.85}\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        self.n_actions = int(spec.n_actions)\n        cells = self.Y * self.X\n        self.cell = nn.Conv2d(spec.in_channels, CELL, 1)\n        self.cell_ln = nn.LayerNorm(CELL)\n        self.obs_fc = nn.Linear(CELL * cells, HID)\n        self.mask_fc = nn.Linear(self.n_actions, HID)\n        self.ln1 = nn.LayerNorm(HID)\n        self.fc2 = nn.Linear(HID, HID)\n        self.ln2 = nn.LayerNorm(HID)\n        self.pi = nn.Linear(HID, self.n_actions)\n        self.v = nn.Linear(HID, 1)\n        nn.init.orthogonal_(self.pi.weight, 0.01)\n        nn.init.zeros_(self.pi.bias)\n        nn.init.orthogonal_(self.v.weight, 1.0)\n        nn.init.zeros_(self.v.bias)\n\n    def forward(self, obs, mask):\n        B = obs.shape[0]\n        c = self.cell(obs).permute(0, 2, 3, 1)\n        c = F.relu(self.cell_ln(c)).reshape(B, -1)\n        h = self.obs_fc(c) + self.mask_fc(mask.float())\n        h = F.relu(self.ln1(h))\n        h = F.relu(self.ln2(h + self.fc2(h)))\n        return self.pi(h), self.v(h).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 741858,
+    "fb_ms": 2.71,
+    "flops_per_sample": 4343808,
+    "flops_ratio": 0.24,
+    "sha": "5be45e88c7a724e8",
+    "recipe": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 8,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.9,
+     "gae_lambda": 0.85,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 8,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.9,
+     "gae_lambda": 0.85
+    },
+    "budget": {
+     "allowed_steps": 243419,
+     "n_updates": 118,
+     "batch": 2048,
+     "steps": 241664,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.01
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 8
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 741858,
+    "flops_ratio": 0.24,
+    "train_steps": 241664,
+    "wall_s": 46.5,
+    "sha": "5be45e88c7a724e8",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r3c2",
+   "round": 3,
+   "name": "MLP raw flat",
+   "hypothesis": "An MLP on the raw flattened obs, with no per-cell grouping, so it also survives a channels-last or memory-order scramble that would break even 1x1 convs. Hidden size 352 with LayerNorm, the mask through a Linear, and ent_coef 0.01 for exploration. This is a second draw of the frame-agnostic test. Refuted if it scores 0 while the per-cell MLP scores, or if both score 0.",
+   "code": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nHID = 352\n\nRECIPE = {\"lr\": 2e-3, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 8, \"ppo_epochs\": 2, \"ent_coef\": 0.01, \"gamma\": 0.9, \"gae_lambda\": 0.85}\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        self.n_actions = int(spec.n_actions)\n        cells = self.Y * self.X\n        self.obs_fc = nn.Linear(spec.in_channels * cells, HID)\n        self.mask_fc = nn.Linear(self.n_actions, HID)\n        self.ln1 = nn.LayerNorm(HID)\n        self.fc2 = nn.Linear(HID, HID)\n        self.ln2 = nn.LayerNorm(HID)\n        self.pi = nn.Linear(HID, self.n_actions)\n        self.v = nn.Linear(HID, 1)\n        nn.init.orthogonal_(self.pi.weight, 0.01)\n        nn.init.zeros_(self.pi.bias)\n        nn.init.orthogonal_(self.v.weight, 1.0)\n        nn.init.zeros_(self.v.bias)\n\n    def forward(self, obs, mask):\n        B = obs.shape[0]\n        h = self.obs_fc(obs.reshape(B, -1)) + self.mask_fc(mask.float())\n        h = F.relu(self.ln1(h))\n        h = F.relu(self.ln2(h + self.fc2(h)))\n        return self.pi(h), self.v(h).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 916162,
+    "fb_ms": 1.13,
+    "flops_per_sample": 4083200,
+    "flops_ratio": 0.22,
+    "sha": "cf2e3db6ae4f0a5b",
+    "recipe": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 8,
+     "ppo_epochs": 2,
+     "ent_coef": 0.01,
+     "gamma": 0.9,
+     "gae_lambda": 0.85,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 8,
+     "ppo_epochs": 2,
+     "ent_coef": 0.01,
+     "gamma": 0.9,
+     "gae_lambda": 0.85
+    },
+    "budget": {
+     "allowed_steps": 243419,
+     "n_updates": 118,
+     "batch": 2048,
+     "steps": 241664,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0101
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 8
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 916162,
+    "flops_ratio": 0.22,
+    "train_steps": 241664,
+    "wall_s": 36.8,
+    "sha": "cf2e3db6ae4f0a5b",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r3c3",
+   "round": 3,
+   "name": "conv trunk + flat head",
+   "hypothesis": "The reference conv trunk (obs under 8 symmetries, LayerNorm) with a flat head. Cell features are compressed to 16 channels, flattened, concatenated with the pooled features, and passed through one Linear to all actions, DONE included. The mask enters as a Linear mapped into an 8-channel grid. This targets any action-index permutation, such as a shift, roll or DONE position, over a spatially coherent obs. Refuted if it scores 0.",
+   "code": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nLAYOUTS = ()\nSPATIAL = False\nOBS_SYM = True\nUSE_LN = True\nMASKC = 8\nSTEM = 64\nWIDTH = 40\nFC = 16\nHEAD = 32\nGH = 64\n\nRECIPE = {\"lr\": 2e-3, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 8, \"ppo_epochs\": 2, \"ent_coef\": 0.005, \"gamma\": 0.9, \"gae_lambda\": 0.85}\n\n\ndef fwd_layout(t, lay):\n    tr, fy, fx = lay\n    if tr:\n        t = t.transpose(-1, -2)\n    if fy:\n        t = t.flip(-2)\n    if fx:\n        t = t.flip(-1)\n    return t\n\n\ndef inv_layout(t, lay):\n    tr, fy, fx = lay\n    if fx:\n        t = t.flip(-1)\n    if fy:\n        t = t.flip(-2)\n    if tr:\n        t = t.transpose(-1, -2)\n    return t\n\n\nclass ChanLN(nn.Module):\n    def __init__(self, c):\n        super().__init__()\n        self.ln = nn.LayerNorm(c)\n\n    def forward(self, x):\n        return self.ln(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        self.n_place = int(spec.n_place)\n        self.n_actions = int(spec.n_actions)\n        cells = self.Y * self.X\n        self.K = (self.n_place + cells - 1) // cells\n        sq = self.Y == self.X\n        lays = []\n        for l in LAYOUTS:\n            l2 = tuple(l) if sq else (0, l[1], l[2])\n            if l2 not in lays:\n                lays.append(l2)\n        self.lays = lays\n        if OBS_SYM:\n            syms = [(a, b, c) for a in (0, 1) for b in (0, 1) for c in (0, 1) if sq or a == 0]\n        else:\n            syms = [(0, 0, 0)]\n        self.syms = syms\n        c_obs = spec.in_channels * len(syms) + 2\n        self.mask_fc = nn.Linear(self.n_actions, MASKC * cells)\n        if USE_LN:\n            self.obs_stem = nn.Sequential(nn.Conv2d(c_obs, STEM, 1), ChanLN(STEM), nn.ReLU())\n            self.mask_stem = nn.Sequential(nn.Conv2d(MASKC, STEM, 1), ChanLN(STEM), nn.ReLU())\n            self.stem2 = nn.Sequential(nn.Conv2d(STEM, WIDTH, 1), ChanLN(WIDTH), nn.ReLU())\n            self.lns = nn.ModuleList([ChanLN(WIDTH) for _ in range(2)])\n        else:\n            self.obs_stem = nn.Sequential(nn.Conv2d(c_obs, STEM, 1), nn.ReLU())\n            self.mask_stem = nn.Sequential(nn.Conv2d(MASKC, STEM, 1), nn.ReLU())\n            self.stem2 = nn.Sequential(nn.Conv2d(STEM, WIDTH, 1), nn.ReLU())\n        self.res = nn.ModuleList([nn.Conv2d(WIDTH, WIDTH, 3, padding=1) for _ in range(2)])\n        self.flat = nn.Conv2d(WIDTH, FC, 1)\n        self.glob = nn.Sequential(nn.Linear(2 * WIDTH, GH), nn.ReLU())\n        self.pi = nn.Linear(FC * cells + GH, self.n_actions)\n        self.value_head = nn.Linear(GH, 1)\n        if SPATIAL:\n            self.h3 = nn.Conv2d(WIDTH, HEAD, 3, padding=1)\n            self.h1 = nn.Conv2d(WIDTH, HEAD, 1)\n            self.hout = nn.Conv2d(HEAD, self.K * len(lays), 1)\n            nn.init.orthogonal_(self.hout.weight, 0.01)\n            nn.init.zeros_(self.hout.bias)\n        nn.init.orthogonal_(self.pi.weight, 0.01)\n        nn.init.zeros_(self.pi.bias)\n        nn.init.orthogonal_(self.value_head.weight, 1.0)\n        nn.init.zeros_(self.value_head.bias)\n        ys = torch.linspace(-1.0, 1.0, self.Y).view(1, 1, self.Y, 1).expand(1, 1, self.Y, self.X)\n        xs = torch.linspace(-1.0, 1.0, self.X).view(1, 1, 1, self.X).expand(1, 1, self.Y, self.X)\n        self.register_buffer(\"coords\", torch.cat([ys, xs], dim=1).contiguous())\n\n    def forward(self, obs, mask):\n        B = obs.shape[0]\n        mm = self.mask_fc(mask.float()).view(B, MASKC, self.Y, self.X)\n        crd = self.coords.expand(B, -1, -1, -1)\n        ofeat = torch.cat([fwd_layout(obs, s) for s in self.syms] + [crd], dim=1)\n        x = self.stem2(self.obs_stem(ofeat) + self.mask_stem(mm))\n        for i, conv in enumerate(self.res):\n            y = x + conv(x)\n            if USE_LN:\n                y = self.lns[i](y)\n            x = F.relu(y)\n        g = self.glob(torch.cat([x.mean((2, 3)), x.amax((2, 3))], dim=1))\n        f = F.relu(self.flat(x)).reshape(B, -1)\n        logits = self.pi(torch.cat([f, g], dim=1))\n        if SPATIAL:\n            h = F.relu(self.h3(x) + self.h1(x))\n            o = self.hout(h).view(B, len(self.lays), self.K, self.Y, self.X)\n            place = 0\n            for i, l in enumerate(self.lays):\n                place = place + inv_layout(o[:, i], l)\n            place = place.reshape(B, -1)[:, :self.n_place]\n            logits = torch.cat([logits[:, :self.n_place] + place, logits[:, self.n_place:]], dim=1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 464442,
+    "fb_ms": 42.35,
+    "flops_per_sample": 18291456,
+    "flops_ratio": 1.0,
+    "sha": "a2590e20aadc78bc",
+    "recipe": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 8,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.9,
+     "gae_lambda": 0.85,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 8,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.9,
+     "gae_lambda": 0.85
+    },
+    "budget": {
+     "allowed_steps": 243337,
+     "n_updates": 118,
+     "batch": 2048,
+     "steps": 241664,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0157
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0162,
+     "short_run_updates": 7
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 464442,
+    "flops_ratio": 1.0,
+    "train_steps": 241664,
+    "wall_s": 72.3,
+    "sha": "a2590e20aadc78bc",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r3c4",
+   "round": 3,
+   "name": "flat head, no LayerNorm",
+   "hypothesis": "The same conv trunk and flat action head, but without LayerNorm, to separate that component (LayerNorm runs also train about 1.7x slower). This is another draw of the action-permutation test. Refuted if it scores 0 while the LayerNorm version scores, which would mean LayerNorm is needed. If only this one scores, LayerNorm hurts here.",
+   "code": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nLAYOUTS = ()\nSPATIAL = False\nOBS_SYM = True\nUSE_LN = False\nMASKC = 8\nSTEM = 64\nWIDTH = 40\nFC = 16\nHEAD = 32\nGH = 64\n\nRECIPE = {\"lr\": 2e-3, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 8, \"ppo_epochs\": 2, \"ent_coef\": 0.005, \"gamma\": 0.9, \"gae_lambda\": 0.85}\n\n\ndef fwd_layout(t, lay):\n    tr, fy, fx = lay\n    if tr:\n        t = t.transpose(-1, -2)\n    if fy:\n        t = t.flip(-2)\n    if fx:\n        t = t.flip(-1)\n    return t\n\n\ndef inv_layout(t, lay):\n    tr, fy, fx = lay\n    if fx:\n        t = t.flip(-1)\n    if fy:\n        t = t.flip(-2)\n    if tr:\n        t = t.transpose(-1, -2)\n    return t\n\n\nclass ChanLN(nn.Module):\n    def __init__(self, c):\n        super().__init__()\n        self.ln = nn.LayerNorm(c)\n\n    def forward(self, x):\n        return self.ln(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        self.n_place = int(spec.n_place)\n        self.n_actions = int(spec.n_actions)\n        cells = self.Y * self.X\n        self.K = (self.n_place + cells - 1) // cells\n        sq = self.Y == self.X\n        lays = []\n        for l in LAYOUTS:\n            l2 = tuple(l) if sq else (0, l[1], l[2])\n            if l2 not in lays:\n                lays.append(l2)\n        self.lays = lays\n        if OBS_SYM:\n            syms = [(a, b, c) for a in (0, 1) for b in (0, 1) for c in (0, 1) if sq or a == 0]\n        else:\n            syms = [(0, 0, 0)]\n        self.syms = syms\n        c_obs = spec.in_channels * len(syms) + 2\n        self.mask_fc = nn.Linear(self.n_actions, MASKC * cells)\n        if USE_LN:\n            self.obs_stem = nn.Sequential(nn.Conv2d(c_obs, STEM, 1), ChanLN(STEM), nn.ReLU())\n            self.mask_stem = nn.Sequential(nn.Conv2d(MASKC, STEM, 1), ChanLN(STEM), nn.ReLU())\n            self.stem2 = nn.Sequential(nn.Conv2d(STEM, WIDTH, 1), ChanLN(WIDTH), nn.ReLU())\n            self.lns = nn.ModuleList([ChanLN(WIDTH) for _ in range(2)])\n        else:\n            self.obs_stem = nn.Sequential(nn.Conv2d(c_obs, STEM, 1), nn.ReLU())\n            self.mask_stem = nn.Sequential(nn.Conv2d(MASKC, STEM, 1), nn.ReLU())\n            self.stem2 = nn.Sequential(nn.Conv2d(STEM, WIDTH, 1), nn.ReLU())\n        self.res = nn.ModuleList([nn.Conv2d(WIDTH, WIDTH, 3, padding=1) for _ in range(2)])\n        self.flat = nn.Conv2d(WIDTH, FC, 1)\n        self.glob = nn.Sequential(nn.Linear(2 * WIDTH, GH), nn.ReLU())\n        self.pi = nn.Linear(FC * cells + GH, self.n_actions)\n        self.value_head = nn.Linear(GH, 1)\n        if SPATIAL:\n            self.h3 = nn.Conv2d(WIDTH, HEAD, 3, padding=1)\n            self.h1 = nn.Conv2d(WIDTH, HEAD, 1)\n            self.hout = nn.Conv2d(HEAD, self.K * len(lays), 1)\n            nn.init.orthogonal_(self.hout.weight, 0.01)\n            nn.init.zeros_(self.hout.bias)\n        nn.init.orthogonal_(self.pi.weight, 0.01)\n        nn.init.zeros_(self.pi.bias)\n        nn.init.orthogonal_(self.value_head.weight, 1.0)\n        nn.init.zeros_(self.value_head.bias)\n        ys = torch.linspace(-1.0, 1.0, self.Y).view(1, 1, self.Y, 1).expand(1, 1, self.Y, self.X)\n        xs = torch.linspace(-1.0, 1.0, self.X).view(1, 1, 1, self.X).expand(1, 1, self.Y, self.X)\n        self.register_buffer(\"coords\", torch.cat([ys, xs], dim=1).contiguous())\n\n    def forward(self, obs, mask):\n        B = obs.shape[0]\n        mm = self.mask_fc(mask.float()).view(B, MASKC, self.Y, self.X)\n        crd = self.coords.expand(B, -1, -1, -1)\n        ofeat = torch.cat([fwd_layout(obs, s) for s in self.syms] + [crd], dim=1)\n        x = self.stem2(self.obs_stem(ofeat) + self.mask_stem(mm))\n        for i, conv in enumerate(self.res):\n            y = x + conv(x)\n            if USE_LN:\n                y = self.lns[i](y)\n            x = F.relu(y)\n        g = self.glob(torch.cat([x.mean((2, 3)), x.amax((2, 3))], dim=1))\n        f = F.relu(self.flat(x)).reshape(B, -1)\n        logits = self.pi(torch.cat([f, g], dim=1))\n        if SPATIAL:\n            h = F.relu(self.h3(x) + self.h1(x))\n            o = self.hout(h).view(B, len(self.lays), self.K, self.Y, self.X)\n            place = 0\n            for i, l in enumerate(self.lays):\n                place = place + inv_layout(o[:, i], l)\n            place = place.reshape(B, -1)[:, :self.n_place]\n            logits = torch.cat([logits[:, :self.n_place] + place, logits[:, self.n_place:]], dim=1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 463946,
+    "fb_ms": 37.82,
+    "flops_per_sample": 18291456,
+    "flops_ratio": 1.0,
+    "sha": "645b36c3c2757cf3",
+    "recipe": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 8,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.9,
+     "gae_lambda": 0.85,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 8,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.9,
+     "gae_lambda": 0.85
+    },
+    "budget": {
+     "allowed_steps": 243337,
+     "n_updates": 118,
+     "batch": 2048,
+     "steps": 241664,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0146
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 7
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 463946,
+    "flops_ratio": 1.0,
+    "train_steps": 241664,
+    "wall_s": 48.8,
+    "sha": "645b36c3c2757cf3",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r3c5",
+   "round": 3,
+   "name": "flat head + set A spatial",
+   "hypothesis": "The LayerNorm, obs-symmetry flat-head hybrid, with the set A spatial layout head summed into the placement logits at full scale (r\u22481.3). The flat head covers arbitrary action indexing, and the spatial head speeds learning if a set A frame plus a small shift is right. Refuted if it scores no better than the plain flat-head hybrid. If it alone scores, set A should be split in round 4.",
+   "code": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nLAYOUTS = ((0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1))\nSPATIAL = True\nOBS_SYM = True\nUSE_LN = True\nMASKC = 8\nSTEM = 64\nWIDTH = 40\nFC = 16\nHEAD = 32\nGH = 64\n\nRECIPE = {\"lr\": 2e-3, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 8, \"ppo_epochs\": 2, \"ent_coef\": 0.005, \"gamma\": 0.9, \"gae_lambda\": 0.85}\n\n\ndef fwd_layout(t, lay):\n    tr, fy, fx = lay\n    if tr:\n        t = t.transpose(-1, -2)\n    if fy:\n        t = t.flip(-2)\n    if fx:\n        t = t.flip(-1)\n    return t\n\n\ndef inv_layout(t, lay):\n    tr, fy, fx = lay\n    if fx:\n        t = t.flip(-1)\n    if fy:\n        t = t.flip(-2)\n    if tr:\n        t = t.transpose(-1, -2)\n    return t\n\n\nclass ChanLN(nn.Module):\n    def __init__(self, c):\n        super().__init__()\n        self.ln = nn.LayerNorm(c)\n\n    def forward(self, x):\n        return self.ln(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        self.n_place = int(spec.n_place)\n        self.n_actions = int(spec.n_actions)\n        cells = self.Y * self.X\n        self.K = (self.n_place + cells - 1) // cells\n        sq = self.Y == self.X\n        lays = []\n        for l in LAYOUTS:\n            l2 = tuple(l) if sq else (0, l[1], l[2])\n            if l2 not in lays:\n                lays.append(l2)\n        self.lays = lays\n        if OBS_SYM:\n            syms = [(a, b, c) for a in (0, 1) for b in (0, 1) for c in (0, 1) if sq or a == 0]\n        else:\n            syms = [(0, 0, 0)]\n        self.syms = syms\n        c_obs = spec.in_channels * len(syms) + 2\n        self.mask_fc = nn.Linear(self.n_actions, MASKC * cells)\n        if USE_LN:\n            self.obs_stem = nn.Sequential(nn.Conv2d(c_obs, STEM, 1), ChanLN(STEM), nn.ReLU())\n            self.mask_stem = nn.Sequential(nn.Conv2d(MASKC, STEM, 1), ChanLN(STEM), nn.ReLU())\n            self.stem2 = nn.Sequential(nn.Conv2d(STEM, WIDTH, 1), ChanLN(WIDTH), nn.ReLU())\n            self.lns = nn.ModuleList([ChanLN(WIDTH) for _ in range(2)])\n        else:\n            self.obs_stem = nn.Sequential(nn.Conv2d(c_obs, STEM, 1), nn.ReLU())\n            self.mask_stem = nn.Sequential(nn.Conv2d(MASKC, STEM, 1), nn.ReLU())\n            self.stem2 = nn.Sequential(nn.Conv2d(STEM, WIDTH, 1), nn.ReLU())\n        self.res = nn.ModuleList([nn.Conv2d(WIDTH, WIDTH, 3, padding=1) for _ in range(2)])\n        self.flat = nn.Conv2d(WIDTH, FC, 1)\n        self.glob = nn.Sequential(nn.Linear(2 * WIDTH, GH), nn.ReLU())\n        self.pi = nn.Linear(FC * cells + GH, self.n_actions)\n        self.value_head = nn.Linear(GH, 1)\n        if SPATIAL:\n            self.h3 = nn.Conv2d(WIDTH, HEAD, 3, padding=1)\n            self.h1 = nn.Conv2d(WIDTH, HEAD, 1)\n            self.hout = nn.Conv2d(HEAD, self.K * len(lays), 1)\n            nn.init.orthogonal_(self.hout.weight, 0.01)\n            nn.init.zeros_(self.hout.bias)\n        nn.init.orthogonal_(self.pi.weight, 0.01)\n        nn.init.zeros_(self.pi.bias)\n        nn.init.orthogonal_(self.value_head.weight, 1.0)\n        nn.init.zeros_(self.value_head.bias)\n        ys = torch.linspace(-1.0, 1.0, self.Y).view(1, 1, self.Y, 1).expand(1, 1, self.Y, self.X)\n        xs = torch.linspace(-1.0, 1.0, self.X).view(1, 1, 1, self.X).expand(1, 1, self.Y, self.X)\n        self.register_buffer(\"coords\", torch.cat([ys, xs], dim=1).contiguous())\n\n    def forward(self, obs, mask):\n        B = obs.shape[0]\n        mm = self.mask_fc(mask.float()).view(B, MASKC, self.Y, self.X)\n        crd = self.coords.expand(B, -1, -1, -1)\n        ofeat = torch.cat([fwd_layout(obs, s) for s in self.syms] + [crd], dim=1)\n        x = self.stem2(self.obs_stem(ofeat) + self.mask_stem(mm))\n        for i, conv in enumerate(self.res):\n            y = x + conv(x)\n            if USE_LN:\n                y = self.lns[i](y)\n            x = F.relu(y)\n        g = self.glob(torch.cat([x.mean((2, 3)), x.amax((2, 3))], dim=1))\n        f = F.relu(self.flat(x)).reshape(B, -1)\n        logits = self.pi(torch.cat([f, g], dim=1))\n        if SPATIAL:\n            h = F.relu(self.h3(x) + self.h1(x))\n            o = self.hout(h).view(B, len(self.lays), self.K, self.Y, self.X)\n            place = 0\n            for i, l in enumerate(self.lays):\n                place = place + inv_layout(o[:, i], l)\n            place = place.reshape(B, -1)[:, :self.n_place]\n            logits = torch.cat([logits[:, :self.n_place] + place, logits[:, self.n_place:]], dim=1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 477834,
+    "fb_ms": 55.07,
+    "flops_per_sample": 23403264,
+    "flops_ratio": 1.28,
+    "sha": "89a954cc47f5be43",
+    "recipe": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 8,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.9,
+     "gae_lambda": 0.85,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 8,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.9,
+     "gae_lambda": 0.85
+    },
+    "budget": {
+     "allowed_steps": 190187,
+     "n_updates": 92,
+     "batch": 2048,
+     "steps": 188416,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0164
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0127,
+     "short_run_updates": 6
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 477834,
+    "flops_ratio": 1.28,
+    "train_steps": 188416,
+    "wall_s": 69.4,
+    "sha": "89a954cc47f5be43",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r3c6",
+   "round": 3,
+   "name": "flat head + set B spatial",
+   "hypothesis": "The same hybrid with the set B spatial layout head summed into the flat-head placement logits. It covers rotated or anti-transposed action frames that might also carry a shift. It is a third draw of the flat-head idea. Refuted if it scores no better than the plain flat-head hybrid. If it alone scores, set B should be split in round 4.",
+   "code": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nLAYOUTS = ((0, 1, 1), (1, 1, 0), (1, 0, 1), (1, 1, 1))\nSPATIAL = True\nOBS_SYM = True\nUSE_LN = True\nMASKC = 8\nSTEM = 64\nWIDTH = 40\nFC = 16\nHEAD = 32\nGH = 64\n\nRECIPE = {\"lr\": 2e-3, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 8, \"ppo_epochs\": 2, \"ent_coef\": 0.005, \"gamma\": 0.9, \"gae_lambda\": 0.85}\n\n\ndef fwd_layout(t, lay):\n    tr, fy, fx = lay\n    if tr:\n        t = t.transpose(-1, -2)\n    if fy:\n        t = t.flip(-2)\n    if fx:\n        t = t.flip(-1)\n    return t\n\n\ndef inv_layout(t, lay):\n    tr, fy, fx = lay\n    if fx:\n        t = t.flip(-1)\n    if fy:\n        t = t.flip(-2)\n    if tr:\n        t = t.transpose(-1, -2)\n    return t\n\n\nclass ChanLN(nn.Module):\n    def __init__(self, c):\n        super().__init__()\n        self.ln = nn.LayerNorm(c)\n\n    def forward(self, x):\n        return self.ln(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        self.n_place = int(spec.n_place)\n        self.n_actions = int(spec.n_actions)\n        cells = self.Y * self.X\n        self.K = (self.n_place + cells - 1) // cells\n        sq = self.Y == self.X\n        lays = []\n        for l in LAYOUTS:\n            l2 = tuple(l) if sq else (0, l[1], l[2])\n            if l2 not in lays:\n                lays.append(l2)\n        self.lays = lays\n        if OBS_SYM:\n            syms = [(a, b, c) for a in (0, 1) for b in (0, 1) for c in (0, 1) if sq or a == 0]\n        else:\n            syms = [(0, 0, 0)]\n        self.syms = syms\n        c_obs = spec.in_channels * len(syms) + 2\n        self.mask_fc = nn.Linear(self.n_actions, MASKC * cells)\n        if USE_LN:\n            self.obs_stem = nn.Sequential(nn.Conv2d(c_obs, STEM, 1), ChanLN(STEM), nn.ReLU())\n            self.mask_stem = nn.Sequential(nn.Conv2d(MASKC, STEM, 1), ChanLN(STEM), nn.ReLU())\n            self.stem2 = nn.Sequential(nn.Conv2d(STEM, WIDTH, 1), ChanLN(WIDTH), nn.ReLU())\n            self.lns = nn.ModuleList([ChanLN(WIDTH) for _ in range(2)])\n        else:\n            self.obs_stem = nn.Sequential(nn.Conv2d(c_obs, STEM, 1), nn.ReLU())\n            self.mask_stem = nn.Sequential(nn.Conv2d(MASKC, STEM, 1), nn.ReLU())\n            self.stem2 = nn.Sequential(nn.Conv2d(STEM, WIDTH, 1), nn.ReLU())\n        self.res = nn.ModuleList([nn.Conv2d(WIDTH, WIDTH, 3, padding=1) for _ in range(2)])\n        self.flat = nn.Conv2d(WIDTH, FC, 1)\n        self.glob = nn.Sequential(nn.Linear(2 * WIDTH, GH), nn.ReLU())\n        self.pi = nn.Linear(FC * cells + GH, self.n_actions)\n        self.value_head = nn.Linear(GH, 1)\n        if SPATIAL:\n            self.h3 = nn.Conv2d(WIDTH, HEAD, 3, padding=1)\n            self.h1 = nn.Conv2d(WIDTH, HEAD, 1)\n            self.hout = nn.Conv2d(HEAD, self.K * len(lays), 1)\n            nn.init.orthogonal_(self.hout.weight, 0.01)\n            nn.init.zeros_(self.hout.bias)\n        nn.init.orthogonal_(self.pi.weight, 0.01)\n        nn.init.zeros_(self.pi.bias)\n        nn.init.orthogonal_(self.value_head.weight, 1.0)\n        nn.init.zeros_(self.value_head.bias)\n        ys = torch.linspace(-1.0, 1.0, self.Y).view(1, 1, self.Y, 1).expand(1, 1, self.Y, self.X)\n        xs = torch.linspace(-1.0, 1.0, self.X).view(1, 1, 1, self.X).expand(1, 1, self.Y, self.X)\n        self.register_buffer(\"coords\", torch.cat([ys, xs], dim=1).contiguous())\n\n    def forward(self, obs, mask):\n        B = obs.shape[0]\n        mm = self.mask_fc(mask.float()).view(B, MASKC, self.Y, self.X)\n        crd = self.coords.expand(B, -1, -1, -1)\n        ofeat = torch.cat([fwd_layout(obs, s) for s in self.syms] + [crd], dim=1)\n        x = self.stem2(self.obs_stem(ofeat) + self.mask_stem(mm))\n        for i, conv in enumerate(self.res):\n            y = x + conv(x)\n            if USE_LN:\n                y = self.lns[i](y)\n            x = F.relu(y)\n        g = self.glob(torch.cat([x.mean((2, 3)), x.amax((2, 3))], dim=1))\n        f = F.relu(self.flat(x)).reshape(B, -1)\n        logits = self.pi(torch.cat([f, g], dim=1))\n        if SPATIAL:\n            h = F.relu(self.h3(x) + self.h1(x))\n            o = self.hout(h).view(B, len(self.lays), self.K, self.Y, self.X)\n            place = 0\n            for i, l in enumerate(self.lays):\n                place = place + inv_layout(o[:, i], l)\n            place = place.reshape(B, -1)[:, :self.n_place]\n            logits = torch.cat([logits[:, :self.n_place] + place, logits[:, self.n_place:]], dim=1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 477834,
+    "fb_ms": 52.95,
+    "flops_per_sample": 23403264,
+    "flops_ratio": 1.28,
+    "sha": "2766609b059d5b5d",
+    "recipe": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 8,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.9,
+     "gae_lambda": 0.85,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 8,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.9,
+     "gae_lambda": 0.85
+    },
+    "budget": {
+     "allowed_steps": 190187,
+     "n_updates": 92,
+     "batch": 2048,
+     "steps": 188416,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0079
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0112,
+     "short_run_updates": 6
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 477834,
+    "flops_ratio": 1.28,
+    "train_steps": 188416,
+    "wall_s": 68.8,
+    "sha": "2766609b059d5b5d",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r4c1",
+   "round": 4,
+   "name": "obs-sym + identity single",
+   "hypothesis": "Feeds the obs under all 8 grid symmetries into the 1x1 stem, with one identity layout reading the mask and logits (no 4-layout hedge). This covers every relative orientation of obs and actions without the dilution that may have zeroed the set-A/B hedges. If the deviation is a pure frame mismatch, this should score. Refuted by 0 while a raw single layout scores.",
+   "code": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nLAYOUT = (0, 0, 0)\nOBS_SYM = True\nTYPE_MINOR = False\nSTEM = 64\nWIDTH = 40\nHEAD = 32\nGH = 64\n\nRECIPE = {\"lr\": 2e-3, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 8, \"ppo_epochs\": 2, \"ent_coef\": 0.005, \"gamma\": 0.9, \"gae_lambda\": 0.85}\n\n\ndef fwd_layout(t, lay):\n    tr, fy, fx = lay\n    if tr:\n        t = t.transpose(-1, -2)\n    if fy:\n        t = t.flip(-2)\n    if fx:\n        t = t.flip(-1)\n    return t\n\n\ndef inv_layout(t, lay):\n    tr, fy, fx = lay\n    if fx:\n        t = t.flip(-1)\n    if fy:\n        t = t.flip(-2)\n    if tr:\n        t = t.transpose(-1, -2)\n    return t\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        self.n_place = int(spec.n_place)\n        cells = self.Y * self.X\n        self.K = (self.n_place + cells - 1) // cells\n        sq = self.Y == self.X\n        lay = tuple(LAYOUT)\n        if not sq:\n            lay = (0, lay[1], lay[2])\n        self.lay = lay\n        if OBS_SYM:\n            syms = [(a, b, c) for a in (0, 1) for b in (0, 1) for c in (0, 1) if sq or a == 0]\n        else:\n            syms = [(0, 0, 0)]\n        self.syms = syms\n        c_obs = spec.in_channels * len(syms) + 2\n        self.stem1 = nn.Sequential(nn.Conv2d(c_obs + self.K, STEM, 1), nn.ReLU())\n        self.stem2 = nn.Sequential(nn.Conv2d(STEM, WIDTH, 1), nn.ReLU())\n        self.res = nn.ModuleList([nn.Conv2d(WIDTH, WIDTH, 3, padding=1) for _ in range(2)])\n        self.h3 = nn.Conv2d(WIDTH, HEAD, 3, padding=1)\n        self.h1 = nn.Conv2d(WIDTH, HEAD, 1)\n        self.hout = nn.Conv2d(HEAD, self.K, 1)\n        self.glob = nn.Sequential(nn.Linear(2 * WIDTH, GH), nn.ReLU())\n        self.done_head = nn.Linear(GH, 1)\n        self.value_head = nn.Linear(GH, 1)\n        ys = torch.linspace(-1.0, 1.0, self.Y).view(1, 1, self.Y, 1).expand(1, 1, self.Y, self.X)\n        xs = torch.linspace(-1.0, 1.0, self.X).view(1, 1, 1, self.X).expand(1, 1, self.Y, self.X)\n        self.register_buffer(\"coords\", torch.cat([ys, xs], dim=1).contiguous())\n\n    def forward(self, obs, mask):\n        B = obs.shape[0]\n        cells = self.Y * self.X\n        m = mask[:, :self.n_place].float()\n        pad = self.K * cells - self.n_place\n        if pad > 0:\n            m = F.pad(m, (0, pad))\n        if TYPE_MINOR:\n            m = m.view(B, self.Y, self.X, self.K).permute(0, 3, 1, 2)\n        else:\n            m = m.view(B, self.K, self.Y, self.X)\n        mfeat = fwd_layout(m, self.lay)\n        crd = self.coords.expand(B, -1, -1, -1)\n        ofeat = torch.cat([fwd_layout(obs, s) for s in self.syms] + [crd], dim=1)\n        x = self.stem2(self.stem1(torch.cat([ofeat, mfeat], dim=1)))\n        for conv in self.res:\n            x = F.relu(x + conv(x))\n        h = F.relu(self.h3(x) + self.h1(x))\n        o = inv_layout(self.hout(h), self.lay)\n        if TYPE_MINOR:\n            o = o.permute(0, 2, 3, 1)\n        place = o.reshape(B, -1)[:, :self.n_place]\n        g = self.glob(torch.cat([x.mean((2, 3)), x.amax((2, 3))], dim=1))\n        logits = torch.cat([place, self.done_head(g)], dim=1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 64062,
+    "fb_ms": 46.26,
+    "flops_per_sample": 20675328,
+    "flops_ratio": 1.13,
+    "sha": "0b16d39ba0228785",
+    "recipe": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 8,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.9,
+     "gae_lambda": 0.85,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 8,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.9,
+     "gae_lambda": 0.85
+    },
+    "budget": {
+     "allowed_steps": 215280,
+     "n_updates": 105,
+     "batch": 2048,
+     "steps": 215040,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0129
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 7
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 64062,
+    "flops_ratio": 1.13,
+    "train_steps": 215040,
+    "wall_s": 39.6,
+    "sha": "0b16d39ba0228785",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r4c2",
+   "round": 4,
+   "name": "obs-sym + identity type-minor",
+   "hypothesis": "Same as the first candidate, but the mask and logits are read type-minor (a = (y*X+x)*K + t). With obs symmetries, one identity layout covers all 8 frames under a type-innermost action order. Earlier type-minor runs carried heavy hedges that may have hidden it. Refuted if it scores 0 while the type-major version scores. A score here alone confirms type-minor order.",
+   "code": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nLAYOUT = (0, 0, 0)\nOBS_SYM = True\nTYPE_MINOR = True\nSTEM = 64\nWIDTH = 40\nHEAD = 32\nGH = 64\n\nRECIPE = {\"lr\": 2e-3, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 8, \"ppo_epochs\": 2, \"ent_coef\": 0.005, \"gamma\": 0.9, \"gae_lambda\": 0.85}\n\n\ndef fwd_layout(t, lay):\n    tr, fy, fx = lay\n    if tr:\n        t = t.transpose(-1, -2)\n    if fy:\n        t = t.flip(-2)\n    if fx:\n        t = t.flip(-1)\n    return t\n\n\ndef inv_layout(t, lay):\n    tr, fy, fx = lay\n    if fx:\n        t = t.flip(-1)\n    if fy:\n        t = t.flip(-2)\n    if tr:\n        t = t.transpose(-1, -2)\n    return t\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        self.n_place = int(spec.n_place)\n        cells = self.Y * self.X\n        self.K = (self.n_place + cells - 1) // cells\n        sq = self.Y == self.X\n        lay = tuple(LAYOUT)\n        if not sq:\n            lay = (0, lay[1], lay[2])\n        self.lay = lay\n        if OBS_SYM:\n            syms = [(a, b, c) for a in (0, 1) for b in (0, 1) for c in (0, 1) if sq or a == 0]\n        else:\n            syms = [(0, 0, 0)]\n        self.syms = syms\n        c_obs = spec.in_channels * len(syms) + 2\n        self.stem1 = nn.Sequential(nn.Conv2d(c_obs + self.K, STEM, 1), nn.ReLU())\n        self.stem2 = nn.Sequential(nn.Conv2d(STEM, WIDTH, 1), nn.ReLU())\n        self.res = nn.ModuleList([nn.Conv2d(WIDTH, WIDTH, 3, padding=1) for _ in range(2)])\n        self.h3 = nn.Conv2d(WIDTH, HEAD, 3, padding=1)\n        self.h1 = nn.Conv2d(WIDTH, HEAD, 1)\n        self.hout = nn.Conv2d(HEAD, self.K, 1)\n        self.glob = nn.Sequential(nn.Linear(2 * WIDTH, GH), nn.ReLU())\n        self.done_head = nn.Linear(GH, 1)\n        self.value_head = nn.Linear(GH, 1)\n        ys = torch.linspace(-1.0, 1.0, self.Y).view(1, 1, self.Y, 1).expand(1, 1, self.Y, self.X)\n        xs = torch.linspace(-1.0, 1.0, self.X).view(1, 1, 1, self.X).expand(1, 1, self.Y, self.X)\n        self.register_buffer(\"coords\", torch.cat([ys, xs], dim=1).contiguous())\n\n    def forward(self, obs, mask):\n        B = obs.shape[0]\n        cells = self.Y * self.X\n        m = mask[:, :self.n_place].float()\n        pad = self.K * cells - self.n_place\n        if pad > 0:\n            m = F.pad(m, (0, pad))\n        if TYPE_MINOR:\n            m = m.view(B, self.Y, self.X, self.K).permute(0, 3, 1, 2)\n        else:\n            m = m.view(B, self.K, self.Y, self.X)\n        mfeat = fwd_layout(m, self.lay)\n        crd = self.coords.expand(B, -1, -1, -1)\n        ofeat = torch.cat([fwd_layout(obs, s) for s in self.syms] + [crd], dim=1)\n        x = self.stem2(self.stem1(torch.cat([ofeat, mfeat], dim=1)))\n        for conv in self.res:\n            x = F.relu(x + conv(x))\n        h = F.relu(self.h3(x) + self.h1(x))\n        o = inv_layout(self.hout(h), self.lay)\n        if TYPE_MINOR:\n            o = o.permute(0, 2, 3, 1)\n        place = o.reshape(B, -1)[:, :self.n_place]\n        g = self.glob(torch.cat([x.mean((2, 3)), x.amax((2, 3))], dim=1))\n        logits = torch.cat([place, self.done_head(g)], dim=1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 64062,
+    "fb_ms": 45.36,
+    "flops_per_sample": 20675328,
+    "flops_ratio": 1.13,
+    "sha": "64f553aef9be1f45",
+    "recipe": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 8,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.9,
+     "gae_lambda": 0.85,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 8,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.9,
+     "gae_lambda": 0.85
+    },
+    "budget": {
+     "allowed_steps": 215280,
+     "n_updates": 105,
+     "batch": 2048,
+     "steps": 215040,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0119
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 7
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 64062,
+    "flops_ratio": 1.13,
+    "train_steps": 215040,
+    "wall_s": 40.5,
+    "sha": "64f553aef9be1f45",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r4c3",
+   "round": 4,
+   "name": "obs-sym identity, high entropy",
+   "hypothesis": "The obs-symmetry single-identity net with ent_coef 0.02 and gamma 0.95. It guards against an early collapse onto DONE or a few placements, which would give exactly 0 training success. It also serves as a second draw of the first candidate. Refuted if it scores no better than the first candidate. If only this one scores, the world needs more exploration.",
+   "code": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nLAYOUT = (0, 0, 0)\nOBS_SYM = True\nTYPE_MINOR = False\nSTEM = 64\nWIDTH = 40\nHEAD = 32\nGH = 64\n\nRECIPE = {\"lr\": 2e-3, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 8, \"ppo_epochs\": 2, \"ent_coef\": 0.02, \"gamma\": 0.95, \"gae_lambda\": 0.85}\n\n\ndef fwd_layout(t, lay):\n    tr, fy, fx = lay\n    if tr:\n        t = t.transpose(-1, -2)\n    if fy:\n        t = t.flip(-2)\n    if fx:\n        t = t.flip(-1)\n    return t\n\n\ndef inv_layout(t, lay):\n    tr, fy, fx = lay\n    if fx:\n        t = t.flip(-1)\n    if fy:\n        t = t.flip(-2)\n    if tr:\n        t = t.transpose(-1, -2)\n    return t\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        self.n_place = int(spec.n_place)\n        cells = self.Y * self.X\n        self.K = (self.n_place + cells - 1) // cells\n        sq = self.Y == self.X\n        lay = tuple(LAYOUT)\n        if not sq:\n            lay = (0, lay[1], lay[2])\n        self.lay = lay\n        if OBS_SYM:\n            syms = [(a, b, c) for a in (0, 1) for b in (0, 1) for c in (0, 1) if sq or a == 0]\n        else:\n            syms = [(0, 0, 0)]\n        self.syms = syms\n        c_obs = spec.in_channels * len(syms) + 2\n        self.stem1 = nn.Sequential(nn.Conv2d(c_obs + self.K, STEM, 1), nn.ReLU())\n        self.stem2 = nn.Sequential(nn.Conv2d(STEM, WIDTH, 1), nn.ReLU())\n        self.res = nn.ModuleList([nn.Conv2d(WIDTH, WIDTH, 3, padding=1) for _ in range(2)])\n        self.h3 = nn.Conv2d(WIDTH, HEAD, 3, padding=1)\n        self.h1 = nn.Conv2d(WIDTH, HEAD, 1)\n        self.hout = nn.Conv2d(HEAD, self.K, 1)\n        self.glob = nn.Sequential(nn.Linear(2 * WIDTH, GH), nn.ReLU())\n        self.done_head = nn.Linear(GH, 1)\n        self.value_head = nn.Linear(GH, 1)\n        ys = torch.linspace(-1.0, 1.0, self.Y).view(1, 1, self.Y, 1).expand(1, 1, self.Y, self.X)\n        xs = torch.linspace(-1.0, 1.0, self.X).view(1, 1, 1, self.X).expand(1, 1, self.Y, self.X)\n        self.register_buffer(\"coords\", torch.cat([ys, xs], dim=1).contiguous())\n\n    def forward(self, obs, mask):\n        B = obs.shape[0]\n        cells = self.Y * self.X\n        m = mask[:, :self.n_place].float()\n        pad = self.K * cells - self.n_place\n        if pad > 0:\n            m = F.pad(m, (0, pad))\n        if TYPE_MINOR:\n            m = m.view(B, self.Y, self.X, self.K).permute(0, 3, 1, 2)\n        else:\n            m = m.view(B, self.K, self.Y, self.X)\n        mfeat = fwd_layout(m, self.lay)\n        crd = self.coords.expand(B, -1, -1, -1)\n        ofeat = torch.cat([fwd_layout(obs, s) for s in self.syms] + [crd], dim=1)\n        x = self.stem2(self.stem1(torch.cat([ofeat, mfeat], dim=1)))\n        for conv in self.res:\n            x = F.relu(x + conv(x))\n        h = F.relu(self.h3(x) + self.h1(x))\n        o = inv_layout(self.hout(h), self.lay)\n        if TYPE_MINOR:\n            o = o.permute(0, 2, 3, 1)\n        place = o.reshape(B, -1)[:, :self.n_place]\n        g = self.glob(torch.cat([x.mean((2, 3)), x.amax((2, 3))], dim=1))\n        logits = torch.cat([place, self.done_head(g)], dim=1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 64062,
+    "fb_ms": 45.34,
+    "flops_per_sample": 20675328,
+    "flops_ratio": 1.13,
+    "sha": "3ebcae03dceb7018",
+    "recipe": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 8,
+     "ppo_epochs": 2,
+     "ent_coef": 0.02,
+     "gamma": 0.95,
+     "gae_lambda": 0.85,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 8,
+     "ppo_epochs": 2,
+     "ent_coef": 0.02,
+     "gamma": 0.95,
+     "gae_lambda": 0.85
+    },
+    "budget": {
+     "allowed_steps": 215280,
+     "n_updates": 105,
+     "batch": 2048,
+     "steps": 215040,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0129
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 7
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 64062,
+    "flops_ratio": 1.13,
+    "train_steps": 215040,
+    "wall_s": 37.7,
+    "sha": "3ebcae03dceb7018",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r4c4",
+   "round": 4,
+   "name": "single transpose layout",
+   "hypothesis": "The reference net with only the transpose layout and no obs symmetries. This is the deviation found in world 2, where the single correct layout scored about 0.9 although its hedged set scored far less. Here the set-A hedge may have failed by seed luck. Refuted if it scores 0 while another single layout scores.",
+   "code": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nLAYOUT = (1, 0, 0)\nOBS_SYM = False\nTYPE_MINOR = False\nSTEM = 64\nWIDTH = 40\nHEAD = 32\nGH = 64\n\nRECIPE = {\"lr\": 2e-3, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 8, \"ppo_epochs\": 2, \"ent_coef\": 0.005, \"gamma\": 0.9, \"gae_lambda\": 0.85}\n\n\ndef fwd_layout(t, lay):\n    tr, fy, fx = lay\n    if tr:\n        t = t.transpose(-1, -2)\n    if fy:\n        t = t.flip(-2)\n    if fx:\n        t = t.flip(-1)\n    return t\n\n\ndef inv_layout(t, lay):\n    tr, fy, fx = lay\n    if fx:\n        t = t.flip(-1)\n    if fy:\n        t = t.flip(-2)\n    if tr:\n        t = t.transpose(-1, -2)\n    return t\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        self.n_place = int(spec.n_place)\n        cells = self.Y * self.X\n        self.K = (self.n_place + cells - 1) // cells\n        sq = self.Y == self.X\n        lay = tuple(LAYOUT)\n        if not sq:\n            lay = (0, lay[1], lay[2])\n        self.lay = lay\n        if OBS_SYM:\n            syms = [(a, b, c) for a in (0, 1) for b in (0, 1) for c in (0, 1) if sq or a == 0]\n        else:\n            syms = [(0, 0, 0)]\n        self.syms = syms\n        c_obs = spec.in_channels * len(syms) + 2\n        self.stem1 = nn.Sequential(nn.Conv2d(c_obs + self.K, STEM, 1), nn.ReLU())\n        self.stem2 = nn.Sequential(nn.Conv2d(STEM, WIDTH, 1), nn.ReLU())\n        self.res = nn.ModuleList([nn.Conv2d(WIDTH, WIDTH, 3, padding=1) for _ in range(2)])\n        self.h3 = nn.Conv2d(WIDTH, HEAD, 3, padding=1)\n        self.h1 = nn.Conv2d(WIDTH, HEAD, 1)\n        self.hout = nn.Conv2d(HEAD, self.K, 1)\n        self.glob = nn.Sequential(nn.Linear(2 * WIDTH, GH), nn.ReLU())\n        self.done_head = nn.Linear(GH, 1)\n        self.value_head = nn.Linear(GH, 1)\n        ys = torch.linspace(-1.0, 1.0, self.Y).view(1, 1, self.Y, 1).expand(1, 1, self.Y, self.X)\n        xs = torch.linspace(-1.0, 1.0, self.X).view(1, 1, 1, self.X).expand(1, 1, self.Y, self.X)\n        self.register_buffer(\"coords\", torch.cat([ys, xs], dim=1).contiguous())\n\n    def forward(self, obs, mask):\n        B = obs.shape[0]\n        cells = self.Y * self.X\n        m = mask[:, :self.n_place].float()\n        pad = self.K * cells - self.n_place\n        if pad > 0:\n            m = F.pad(m, (0, pad))\n        if TYPE_MINOR:\n            m = m.view(B, self.Y, self.X, self.K).permute(0, 3, 1, 2)\n        else:\n            m = m.view(B, self.K, self.Y, self.X)\n        mfeat = fwd_layout(m, self.lay)\n        crd = self.coords.expand(B, -1, -1, -1)\n        ofeat = torch.cat([fwd_layout(obs, s) for s in self.syms] + [crd], dim=1)\n        x = self.stem2(self.stem1(torch.cat([ofeat, mfeat], dim=1)))\n        for conv in self.res:\n            x = F.relu(x + conv(x))\n        h = F.relu(self.h3(x) + self.h1(x))\n        o = inv_layout(self.hout(h), self.lay)\n        if TYPE_MINOR:\n            o = o.permute(0, 2, 3, 1)\n        place = o.reshape(B, -1)[:, :self.n_place]\n        g = self.glob(torch.cat([x.mean((2, 3)), x.amax((2, 3))], dim=1))\n        logits = torch.cat([place, self.done_head(g)], dim=1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 51966,
+    "fb_ms": 34.36,
+    "flops_per_sample": 17578752,
+    "flops_ratio": 0.96,
+    "sha": "862a093e93f18de7",
+    "recipe": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 8,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.9,
+     "gae_lambda": 0.85,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 8,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.9,
+     "gae_lambda": 0.85
+    },
+    "budget": {
+     "allowed_steps": 243419,
+     "n_updates": 118,
+     "batch": 2048,
+     "steps": 241664,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0092
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 8
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 51966,
+    "flops_ratio": 0.96,
+    "train_steps": 241664,
+    "wall_s": 40.1,
+    "sha": "862a093e93f18de7",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r4c5",
+   "round": 4,
+   "name": "single x-flip layout",
+   "hypothesis": "The reference net with only the x-flip layout and no obs symmetries. This is the deviation found in world 6, where the single correct layout scored about 0.9. It tests whether the set-A hedge zero was a diluted or unlucky seed rather than a wrong frame. Refuted if it scores 0 while another single layout scores.",
+   "code": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nLAYOUT = (0, 0, 1)\nOBS_SYM = False\nTYPE_MINOR = False\nSTEM = 64\nWIDTH = 40\nHEAD = 32\nGH = 64\n\nRECIPE = {\"lr\": 2e-3, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 8, \"ppo_epochs\": 2, \"ent_coef\": 0.005, \"gamma\": 0.9, \"gae_lambda\": 0.85}\n\n\ndef fwd_layout(t, lay):\n    tr, fy, fx = lay\n    if tr:\n        t = t.transpose(-1, -2)\n    if fy:\n        t = t.flip(-2)\n    if fx:\n        t = t.flip(-1)\n    return t\n\n\ndef inv_layout(t, lay):\n    tr, fy, fx = lay\n    if fx:\n        t = t.flip(-1)\n    if fy:\n        t = t.flip(-2)\n    if tr:\n        t = t.transpose(-1, -2)\n    return t\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        self.n_place = int(spec.n_place)\n        cells = self.Y * self.X\n        self.K = (self.n_place + cells - 1) // cells\n        sq = self.Y == self.X\n        lay = tuple(LAYOUT)\n        if not sq:\n            lay = (0, lay[1], lay[2])\n        self.lay = lay\n        if OBS_SYM:\n            syms = [(a, b, c) for a in (0, 1) for b in (0, 1) for c in (0, 1) if sq or a == 0]\n        else:\n            syms = [(0, 0, 0)]\n        self.syms = syms\n        c_obs = spec.in_channels * len(syms) + 2\n        self.stem1 = nn.Sequential(nn.Conv2d(c_obs + self.K, STEM, 1), nn.ReLU())\n        self.stem2 = nn.Sequential(nn.Conv2d(STEM, WIDTH, 1), nn.ReLU())\n        self.res = nn.ModuleList([nn.Conv2d(WIDTH, WIDTH, 3, padding=1) for _ in range(2)])\n        self.h3 = nn.Conv2d(WIDTH, HEAD, 3, padding=1)\n        self.h1 = nn.Conv2d(WIDTH, HEAD, 1)\n        self.hout = nn.Conv2d(HEAD, self.K, 1)\n        self.glob = nn.Sequential(nn.Linear(2 * WIDTH, GH), nn.ReLU())\n        self.done_head = nn.Linear(GH, 1)\n        self.value_head = nn.Linear(GH, 1)\n        ys = torch.linspace(-1.0, 1.0, self.Y).view(1, 1, self.Y, 1).expand(1, 1, self.Y, self.X)\n        xs = torch.linspace(-1.0, 1.0, self.X).view(1, 1, 1, self.X).expand(1, 1, self.Y, self.X)\n        self.register_buffer(\"coords\", torch.cat([ys, xs], dim=1).contiguous())\n\n    def forward(self, obs, mask):\n        B = obs.shape[0]\n        cells = self.Y * self.X\n        m = mask[:, :self.n_place].float()\n        pad = self.K * cells - self.n_place\n        if pad > 0:\n            m = F.pad(m, (0, pad))\n        if TYPE_MINOR:\n            m = m.view(B, self.Y, self.X, self.K).permute(0, 3, 1, 2)\n        else:\n            m = m.view(B, self.K, self.Y, self.X)\n        mfeat = fwd_layout(m, self.lay)\n        crd = self.coords.expand(B, -1, -1, -1)\n        ofeat = torch.cat([fwd_layout(obs, s) for s in self.syms] + [crd], dim=1)\n        x = self.stem2(self.stem1(torch.cat([ofeat, mfeat], dim=1)))\n        for conv in self.res:\n            x = F.relu(x + conv(x))\n        h = F.relu(self.h3(x) + self.h1(x))\n        o = inv_layout(self.hout(h), self.lay)\n        if TYPE_MINOR:\n            o = o.permute(0, 2, 3, 1)\n        place = o.reshape(B, -1)[:, :self.n_place]\n        g = self.glob(torch.cat([x.mean((2, 3)), x.amax((2, 3))], dim=1))\n        logits = torch.cat([place, self.done_head(g)], dim=1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 51966,
+    "fb_ms": 34.89,
+    "flops_per_sample": 17578752,
+    "flops_ratio": 0.96,
+    "sha": "d01fb65a7dd07f75",
+    "recipe": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 8,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.9,
+     "gae_lambda": 0.85,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 8,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.9,
+     "gae_lambda": 0.85
+    },
+    "budget": {
+     "allowed_steps": 243419,
+     "n_updates": 118,
+     "batch": 2048,
+     "steps": 241664,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.007
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 8
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 51966,
+    "flops_ratio": 0.96,
+    "train_steps": 241664,
+    "wall_s": 36.2,
+    "sha": "d01fb65a7dd07f75",
+    "readouts": null
+   }
+  },
+  {
+   "label": "r4c6",
+   "round": 4,
+   "name": "single y-flip layout",
+   "hypothesis": "The reference net with only the y-flip layout and no obs symmetries. This is the deviation found in world 7, where the single correct layout scored about 0.9. It completes the split of the precedent frames from set A. Refuted if it scores 0 while another single layout scores. If all three singles and the obs-symmetry nets score 0, the deviation is not a grid frame mismatch.",
+   "code": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nLAYOUT = (0, 1, 0)\nOBS_SYM = False\nTYPE_MINOR = False\nSTEM = 64\nWIDTH = 40\nHEAD = 32\nGH = 64\n\nRECIPE = {\"lr\": 2e-3, \"n_envs\": 128, \"rollout_len\": 16, \"n_minibatches\": 8, \"ppo_epochs\": 2, \"ent_coef\": 0.005, \"gamma\": 0.9, \"gae_lambda\": 0.85}\n\n\ndef fwd_layout(t, lay):\n    tr, fy, fx = lay\n    if tr:\n        t = t.transpose(-1, -2)\n    if fy:\n        t = t.flip(-2)\n    if fx:\n        t = t.flip(-1)\n    return t\n\n\ndef inv_layout(t, lay):\n    tr, fy, fx = lay\n    if fx:\n        t = t.flip(-1)\n    if fy:\n        t = t.flip(-2)\n    if tr:\n        t = t.transpose(-1, -2)\n    return t\n\n\nclass Net(nn.Module):\n    def __init__(self, spec):\n        super().__init__()\n        self.Y = int(spec.Y)\n        self.X = int(spec.X)\n        self.n_place = int(spec.n_place)\n        cells = self.Y * self.X\n        self.K = (self.n_place + cells - 1) // cells\n        sq = self.Y == self.X\n        lay = tuple(LAYOUT)\n        if not sq:\n            lay = (0, lay[1], lay[2])\n        self.lay = lay\n        if OBS_SYM:\n            syms = [(a, b, c) for a in (0, 1) for b in (0, 1) for c in (0, 1) if sq or a == 0]\n        else:\n            syms = [(0, 0, 0)]\n        self.syms = syms\n        c_obs = spec.in_channels * len(syms) + 2\n        self.stem1 = nn.Sequential(nn.Conv2d(c_obs + self.K, STEM, 1), nn.ReLU())\n        self.stem2 = nn.Sequential(nn.Conv2d(STEM, WIDTH, 1), nn.ReLU())\n        self.res = nn.ModuleList([nn.Conv2d(WIDTH, WIDTH, 3, padding=1) for _ in range(2)])\n        self.h3 = nn.Conv2d(WIDTH, HEAD, 3, padding=1)\n        self.h1 = nn.Conv2d(WIDTH, HEAD, 1)\n        self.hout = nn.Conv2d(HEAD, self.K, 1)\n        self.glob = nn.Sequential(nn.Linear(2 * WIDTH, GH), nn.ReLU())\n        self.done_head = nn.Linear(GH, 1)\n        self.value_head = nn.Linear(GH, 1)\n        ys = torch.linspace(-1.0, 1.0, self.Y).view(1, 1, self.Y, 1).expand(1, 1, self.Y, self.X)\n        xs = torch.linspace(-1.0, 1.0, self.X).view(1, 1, 1, self.X).expand(1, 1, self.Y, self.X)\n        self.register_buffer(\"coords\", torch.cat([ys, xs], dim=1).contiguous())\n\n    def forward(self, obs, mask):\n        B = obs.shape[0]\n        cells = self.Y * self.X\n        m = mask[:, :self.n_place].float()\n        pad = self.K * cells - self.n_place\n        if pad > 0:\n            m = F.pad(m, (0, pad))\n        if TYPE_MINOR:\n            m = m.view(B, self.Y, self.X, self.K).permute(0, 3, 1, 2)\n        else:\n            m = m.view(B, self.K, self.Y, self.X)\n        mfeat = fwd_layout(m, self.lay)\n        crd = self.coords.expand(B, -1, -1, -1)\n        ofeat = torch.cat([fwd_layout(obs, s) for s in self.syms] + [crd], dim=1)\n        x = self.stem2(self.stem1(torch.cat([ofeat, mfeat], dim=1)))\n        for conv in self.res:\n            x = F.relu(x + conv(x))\n        h = F.relu(self.h3(x) + self.h1(x))\n        o = inv_layout(self.hout(h), self.lay)\n        if TYPE_MINOR:\n            o = o.permute(0, 2, 3, 1)\n        place = o.reshape(B, -1)[:, :self.n_place]\n        g = self.glob(torch.cat([x.mean((2, 3)), x.amax((2, 3))], dim=1))\n        logits = torch.cat([place, self.done_head(g)], dim=1)\n        return logits, self.value_head(g).squeeze(1)\n\n\ndef build_policy(spec):\n    return Net(spec)\n",
+   "check": {
+    "ok": true,
+    "params": 51966,
+    "fb_ms": 34.1,
+    "flops_per_sample": 17578752,
+    "flops_ratio": 0.96,
+    "sha": "539727a38e0551a9",
+    "recipe": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 8,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.9,
+     "gae_lambda": 0.85,
+     "clip_eps": 0.2
+    },
+    "recipe_from_file": {
+     "lr": 0.002,
+     "n_envs": 128,
+     "rollout_len": 16,
+     "n_minibatches": 8,
+     "ppo_epochs": 2,
+     "ent_coef": 0.005,
+     "gamma": 0.9,
+     "gae_lambda": 0.85
+    },
+    "budget": {
+     "allowed_steps": 243419,
+     "n_updates": 118,
+     "batch": 2048,
+     "steps": 241664,
+     "ok": true
+    },
+    "check_untrained": {
+     "exact": 0.0,
+     "clean_fill": 0.0091
+    },
+    "check_short_training": {
+     "exact": 0.0,
+     "clean_fill": 0.0,
+     "short_run_updates": 8
+    },
+    "rule": "handshift"
+   },
+   "result": {
+    "status": "ok",
+    "error": null,
+    "dev_exact": 0.0,
+    "dev_per_seed": [
+     0.0
+    ],
+    "train_exact": 0.0,
+    "params": 51966,
+    "flops_ratio": 0.96,
+    "train_steps": 241664,
+    "wall_s": 39.6,
+    "sha": "539727a38e0551a9",
+    "readouts": null
+   }
+  }
+ ],
+ "rounds_done": 4,
+ "incumbent": null,
+ "analyses": {
+  "1": "There are no trials yet. The starting net scores 0, which in past worlds usually meant the obs and the action/mask layout used different frames. Round 1 follows the program: two 4-layout hedges (A = identity/transpose/y-flip/x-flip, B = the combined flips and transposes). Each set also runs with the obs fed under all 8 grid symmetries, which targets obs reorientation. Two more runs add LayerNorm stems with gain-0.01 outputs, which targets inputs on an unexpected scale. All six use the reference recipe and r\u22480.95-1.2. Whichever hedge scores above 0 tells us which set to split in round 2. If every set scores 0, the round rules out these frame deviations, and round 2 should combine hedges (global context, a dilated block, type-minor layouts). With one seed, gaps under about 0.1 are noise, and a lone 0 can be a bad seed.",
+  "2": "All six round-1 nets scored 0 on dev and 0 in training. Sets A and B, with or without the 8 obs symmetries and with or without LayerNorm stems, never escaped. So a simple type-major action-frame mismatch is unlikely, alone or combined with obs reorientation or scaled inputs. A single seed per run could still hide a weak signal, but six zeros in a row is consistent. Following step 5, this round adds the hedges that only worked together in world 3: obs symmetries, LayerNorm, global context in each residual block and a dilated block, with set A and with set B. It also tests type-minor (K innermost) mask and logit layouts, once with the full combination and once plain, since a plain net gets more samples. The last slot tries a separate small critic with gamma 0.99 and ent_coef 0.01, in case the problem is exploration or credit assignment rather than layout. A nonzero score in any slot decides what round 3 splits.",
+  "3": "All 12 trials scored 0, and training success was also 0. Between them they covered all 8 action frames, all 8 obs frames (each channel group could pick its own view), both type-major and type-minor orders, LayerNorm for input scale, and a separate critic with gamma 0.99. So the problem is probably not a grid symmetry or an input-scale issue. Two explanations remain. One is an index mismatch that no symmetry captures: for example a roll or shift, DONE at a different index, or a memory-order scramble of the obs or of the actions. The other is a bad seed, though 12 straight zeros make that unlikely. Spatial frame hedges can't fix the first case, so this round tests nets whose mapping to actions is learned. The first kind is a flat MLP, which doesn't care about frames at all. The second is a conv trunk with a fully connected head over every action including DONE, plus a learned Linear that places the mask into the grid. If an MLP scores, the obs is scrambled in space. If a hybrid scores, only the action indexing is off.",
+  "4": "All 18 trials scored 0, with 0 training success too. The 4-layout sets A and B scored 0, with and without obs symmetries and LayerNorm. So did the type-minor combinations, a separate critic with gamma 0.99, flat MLPs and flat heads. One explanation is that stacking hedges diluted the signal: in earlier worlds, single layouts scored 0.8\u20130.9 where their 4-layout sets scored only 0.15\u20130.25. Another is that the deviation is not a frame mismatch at all. This is the last round, so I am testing undiluted nets with no layout hedge. Feeding the obs under all 8 symmetries, with the identity action reading, covers every relative orientation of obs and actions using one layout. I try this type-major, type-minor, and type-major with higher entropy, in case the policy collapses to DONE. Three single layouts without obs symmetries test the precedent frames directly: transpose (world 2), x-flip (world 6) and y-flip (world 7)."
+ }
+}
